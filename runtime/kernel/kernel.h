@@ -205,6 +205,14 @@ bool RunApcs(Thread& t);
 void QueueApc(Thread& t, uint32_t routine, uint32_t a1, uint32_t a2, uint32_t a3);
 std::vector<ThreadRef> Threads();
 
+// files: console paths to host folders or the mounted disc image
+void MountDefaults(const std::string& game_dir, const std::string& data_dir);
+bool CreateSymbolicLink(const std::string& link, const std::string& target);
+bool DeleteSymbolicLink(const std::string& link);
+std::string QuerySymbolicLink(const std::string& link);
+std::string ResolvePath(const std::string& console_path, uint32_t root_handle);  // host path or empty
+bool ReadGameFile(const std::string& console_path, std::vector<uint8_t>& out);  // from a host folder or the disc image
+
 // the guest call chain: each frame's back chain at 0(r1), the return address saved 8 bytes below the caller's r1
 void LogGuestStack(PPCContext& ctx, int frames);
 uint32_t CurrentProcessor();  // hardware thread 0 to 5 the current guest thread runs on

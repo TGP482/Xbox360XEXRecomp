@@ -261,3 +261,5 @@ inline void ppc_call(PPCContext& ctx, uint8_t* base, uint32_t target, uint32_t c
 }
 
 inline void ppc_import(PPCContext& ctx, uint8_t* base, uint32_t slot) { ctx.imports[slot](ctx, base); }
+
+#include "ppc_vmx.h"

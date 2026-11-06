@@ -120,6 +120,12 @@ private:
     void EmitFloatArith(const ppc::Insn& i, const char* expr, bool single);
     bool EmitFloatControl(const ppc::Insn& i);
     bool EmitVector(const ppc::Insn& i);
+    std::string VecExpr(const ppc::Insn& i, const char* expr, bool wide);
+    void EmitVectorAccess(const ppc::Insn& i, const char* expr, bool store, bool wide);
+    bool EmitVectorPermute(const ppc::Insn& i);
+    std::string ShiftDouble(const ppc::Insn& i);
+    std::string PermuteWords(const ppc::Insn& i);
+    std::string RotateInsert(const ppc::Insn& i);
     void RecordCr0(const std::string& value);
 };
 

@@ -1,5 +1,7 @@
 #include "xex/xex.h"
 
+#include "xex/lzx.h"
+
 #include <utility>
 
 namespace xex {
@@ -218,6 +220,33 @@ bool Unpack(const Reader& r, const FileFormat& ff, const std::vector<uint8_t>& d
     return true;
 }
 
+// Normal compression: a chain of blocks, each opening with the next block's size and hash, then chunks of LZX
+// data with a 16 bit size until a zero size. The chunks together are one LZX stream.
+bool Inflate(const Reader& r, const FileFormat& ff, const std::vector<uint8_t>& data, size_t image_size,
+             std::vector<uint8_t>& out) {
+    constexpr size_t kBlockHeader = 24;
+    uint32_t window = r.U32(ff.info);
+    size_t block_size = r.U32(ff.info + 4);
+    std::vector<uint8_t> stream;
+    size_t block = 0;
+    while (block_size) {
+        if (block + block_size > data.size() || block_size < kBlockHeader) return false;
+        const uint8_t* p = data.data() + block;
+        size_t o = kBlockHeader;
+        while (o + 2 <= block_size) {
+            size_t chunk = Be16(p + o);
+            o += 2;
+            if (!chunk) break;
+            if (o + chunk > block_size) return false;
+            stream.insert(stream.end(), p + o, p + o + chunk);
+            o += chunk;
+        }
+        block += block_size;
+        block_size = Be32(p);
+    }
+    return LzxDecompress(stream.data(), stream.size(), window, image_size, out);
+}
+
 // a PE image starts with MZ; a wrong key leaves noise
 bool Decode(const Reader& r, const FileFormat& ff, const uint8_t key[16], std::vector<uint8_t>& out,
             std::string& error) {
@@ -235,7 +264,8 @@ bool Decode(const Reader& r, const FileFormat& ff, const uint8_t key[16], std::v
     } else if (ff.compression == kBasic) {
         if (!Unpack(r, ff, data, out)) error = "basic compression block past the end of the file";
     } else if (ff.compression == kNormal) {
-        error = "LZX compressed image is not supported yet";
+        size_t image_size = r.U32(r.U32(kSecurityOffset) + kImageSize);
+        if (!Inflate(r, ff, data, image_size, out)) out.clear();  // a wrong key fails here, the other key is tried
     } else {
         error = "unknown compression " + std::to_string(ff.compression);
     }
@@ -367,7 +397,7 @@ bool Image::Load(const std::vector<uint8_t>& file, std::string& error) {
     base = r.U32(security + kLoadAddress);
     r.Header(kImageBase, base);
     if (!Decode(r, ff, kRetailKey, memory, error) && error.empty() && !Decode(r, ff, kDevkitKey, memory, error)) {
-        if (error.empty()) error = "image did not decrypt with the retail or devkit key";
+        if (error.empty()) error = "image did not decrypt and decompress with the retail or devkit key";
         return false;
     }
     if (!error.empty()) return false;

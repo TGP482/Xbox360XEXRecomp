@@ -15,3 +15,5 @@ using size_t = __SIZE_TYPE__;
 #define INT16_MIN (-__INT16_MAX__ - 1)
 #define INT32_MIN (-__INT32_MAX__ - 1)
 #define INT64_MIN (-__INT64_MAX__ - 1)
+#define INT32_MAX __INT32_MAX__
+#define INT64_MAX __INT64_MAX__

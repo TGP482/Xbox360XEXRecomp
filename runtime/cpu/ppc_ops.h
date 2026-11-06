@@ -77,6 +77,37 @@ inline void ppc_st64(uint8_t* p, uint64_t v) {
     std::memcpy(p, &v, 8);
 }
 
+// floating point registers hold doubles; singles convert on load and store
+#define PPC_LDF32(a) ppc_ldf32(base + (uint32_t)(a))
+#define PPC_LDF64(a) ppc_ldf64(base + (uint32_t)(a))
+#define PPC_STF32(a, v) ppc_stf32(base + (uint32_t)(a), (v))
+#define PPC_STF64(a, v) ppc_stf64(base + (uint32_t)(a), (v))
+
+inline uint64_t ppc_bits(double v) {
+    uint64_t b;
+    std::memcpy(&b, &v, 8);
+    return b;
+}
+inline double ppc_double(uint64_t b) {
+    double v;
+    std::memcpy(&v, &b, 8);
+    return v;
+}
+inline double ppc_ldf32(const uint8_t* p) {
+    uint32_t b = ppc_ld32(p);
+    float f;
+    std::memcpy(&f, &b, 4);
+    return f;
+}
+inline double ppc_ldf64(const uint8_t* p) { return ppc_double(ppc_ld64(p)); }
+inline void ppc_stf32(uint8_t* p, double v) {
+    float f = float(v);
+    uint32_t b;
+    std::memcpy(&b, &f, 4);
+    ppc_st32(p, b);
+}
+inline void ppc_stf64(uint8_t* p, double v) { ppc_st64(p, ppc_bits(v)); }
+
 // stwcx./stdcx.: a store while the reservation lwarx/ldarx took still holds the value it read
 inline bool ppc_store_conditional32(PPCContext& ctx, uint8_t* base, uint32_t a, uint32_t v) {
     if (ctx.reserve_addr != a) return false;
@@ -170,6 +201,36 @@ inline uint64_t ppc_divdu(uint64_t a, uint64_t b) { return b ? a / b : 0; }
 inline uint64_t ppc_mulhd(uint64_t a, uint64_t b) { return uint64_t((__int128(int64_t(a)) * int64_t(b)) >> 64); }
 inline uint64_t ppc_mulhdu(uint64_t a, uint64_t b) { return uint64_t((unsigned __int128)a * b >> 64); }
 
+// single precision results: the double result rounded to single
+inline double ppc_single(double v) { return double(float(v)); }
+
+// fsel: a >= 0 picks c, anything else (NaN too) picks b
+inline double ppc_fsel(double a, double b, double c) { return a >= 0.0 ? c : b; }
+
+// fres and frsqrte are estimates on the console too; the host estimates are at least as precise
+typedef float PPCFloat4 __attribute__((vector_size(16)));
+inline double ppc_fres(double v) { return __builtin_ia32_rcpss(PPCFloat4{float(v), 0, 0, 0})[0]; }
+inline double ppc_frsqrte(double v) { return __builtin_ia32_rsqrtss(PPCFloat4{float(v), 0, 0, 0})[0]; }
+
+// conversions to integer saturate, NaN gives the most negative value; the integer sits in the low bits
+inline double ppc_fctiw_value(double r) {
+    int32_t i = INT32_MIN;
+    if (r >= 2147483647.0) i = INT32_MAX;
+    else if (r > -2147483649.0) i = int32_t(r);
+    return ppc_double(uint32_t(i));
+}
+inline double ppc_fctiwz(double v) { return ppc_fctiw_value(__builtin_trunc(v)); }
+inline double ppc_fctiw(double v) { return ppc_fctiw_value(__builtin_rint(v)); }
+inline double ppc_fctid_value(double r) {
+    int64_t i = INT64_MIN;
+    if (r >= 9223372036854775807.0) i = INT64_MAX;
+    else if (r >= -9223372036854775808.0) i = int64_t(r);
+    return ppc_double(uint64_t(i));
+}
+inline double ppc_fctidz(double v) { return ppc_fctid_value(__builtin_trunc(v)); }
+inline double ppc_fctid(double v) { return ppc_fctid_value(__builtin_rint(v)); }
+inline double ppc_fcfid(double v) { return double(int64_t(ppc_bits(v))); }
+
 // trap conditions: lt gt eq signed, then lt gt unsigned
 inline bool ppc_trap_if(uint32_t to, int64_t a, int64_t b) {
     return ((to & 16) && a < b) || ((to & 8) && a > b) || ((to & 4) && a == b) ||
@@ -188,6 +249,8 @@ PPC_HOST_API void ppc_syscall(PPCContext& ctx, uint8_t* base);
 PPC_HOST_API uint64_t ppc_mfspr(PPCContext& ctx, uint32_t spr);
 PPC_HOST_API void ppc_mtspr(PPCContext& ctx, uint32_t spr, uint64_t v);
 PPC_HOST_API uint64_t ppc_timebase();
+// after FPSCR changes: its rounding mode goes to the host
+PPC_HOST_API void ppc_fpscr_changed(PPCContext& ctx);
 
 // a call through a code pointer: the runtime's table of functions, one slot a code word from code_base
 inline void ppc_call(PPCContext& ctx, uint8_t* base, uint32_t target, uint32_t code_base, uint32_t words) {

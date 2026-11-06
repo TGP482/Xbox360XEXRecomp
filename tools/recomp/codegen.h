@@ -116,6 +116,9 @@ private:
     bool EmitConditionRegister(const ppc::Insn& i);
     bool EmitTrap(const ppc::Insn& i);
     bool EmitFloat(const ppc::Insn& i);
+    void EmitFloatAccess(const ppc::Insn& i, bool single, bool store, bool update, bool indexed);
+    void EmitFloatArith(const ppc::Insn& i, const char* expr, bool single);
+    bool EmitFloatControl(const ppc::Insn& i);
     bool EmitVector(const ppc::Insn& i);
     void RecordCr0(const std::string& value);
 };

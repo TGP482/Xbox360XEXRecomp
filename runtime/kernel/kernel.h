@@ -1,8 +1,17 @@
 #pragma once
+#include <array>
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <deque>
+#include <functional>
 #include <initializer_list>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 #include "core/log.h"
 #include "cpu/ppc_ops.h"
@@ -95,6 +104,106 @@ ExportFn FindExport(Library lib, uint32_t ordinal);
 uint32_t ExportAddress(Library lib, uint32_t ordinal);
 const char* ExportName(Library lib, uint32_t ordinal);
 const char* OrdinalName(Library lib, uint32_t ordinal);  // public name from the ordinal tables, "?" if unknown
+
+// objects
+enum class ObjType : uint8_t { Event, Semaphore, Mutant, Timer, Thread, File, SymLink, Device, Queue, Other };
+
+struct Waiter;
+
+struct Object {
+    ObjType type;
+    uint32_t guest = 0;  // body in guest memory, dispatcher header first for waitables
+    // dispatcher state, protected by the dispatcher lock
+    int32_t signal = 0;
+    int32_t limit = 0;
+    bool notification = false;  // manual reset event or notification timer
+    uint32_t owner = 0;         // mutant owner thread
+    uint32_t recursion = 0;
+    std::vector<Waiter*> waiters;  // Waits blocked on it
+    std::string name;
+    explicit Object(ObjType t) : type(t) {}
+    virtual ~Object() = default;
+};
+using ObjectRef = std::shared_ptr<Object>;
+
+uint32_t NewHandle(ObjectRef obj);
+ObjectRef FromHandle(uint32_t handle);
+bool CloseHandle(uint32_t handle);
+uint32_t DuplicateHandle(uint32_t handle);
+ObjectRef FromPointer(uint32_t guest);  // dispatcher object in guest memory, created on first use
+void Bind(ObjectRef obj, uint32_t guest);
+ObjectRef FindNamed(const std::string& name);
+void AddNamed(const std::string& name, ObjectRef obj);
+
+// dispatcher
+std::mutex& DispatchLock();
+void SignalChanged();  // wakes every waiter, caller holds the lock
+void SetSignal(Object& o, int32_t v);
+uint32_t Wait(const std::vector<ObjectRef>& objs, bool wait_all, int64_t timeout_100ns, bool alertable);
+int32_t SetEvent(Object& o);
+int32_t ResetEvent(Object& o);
+int32_t PulseEvent(Object& o);
+int32_t ReleaseSemaphore(Object& o, int32_t count, uint32_t& status);
+int32_t ReleaseMutant(Object& o, uint32_t& status);
+int64_t Now100ns();                     // system time, 100 ns since 1601
+int64_t ToDeadline(int64_t due_100ns);  // relative or absolute to a steady clock deadline in ns
+void QueueDpc(uint32_t dpc, uint32_t arg1, uint32_t arg2);
+struct Thread;
+// apc_routine runs on apc_thread with (apc_context, due low, due high) each time the timer fires
+struct TimerApc {
+    std::shared_ptr<Thread> thread;
+    uint32_t routine = 0;
+    uint32_t context = 0;
+};
+void SetTimer(ObjectRef timer, int64_t due, int32_t period_ms, uint32_t dpc, TimerApc apc = {});
+bool CancelTimer(Object& timer);
+
+// threads: each guest thread runs on its own host thread with its own PCR in r13
+struct Thread : Object {
+    uint32_t id = 0;
+    uint32_t pcr = 0;
+    uint32_t kthread = 0;
+    uint32_t stack_top = 0;
+    uint32_t stack_size = 0;
+    uint32_t tls = 0;  // the title's static TLS block
+    uint32_t exit_code = 0;
+    std::atomic<uint8_t> processor{0};
+    int priority = 0;
+    std::atomic<int> suspend{0};
+    std::mutex apc_lock;
+    std::deque<std::array<uint32_t, 4>> apcs;  // routine, arg1, arg2, arg3
+    std::condition_variable resume_cv;
+    std::vector<uint32_t> tls_slots;  // KeTlsGetValue and KeTlsSetValue
+    PPCContext* ctx = nullptr;
+    Thread() : Object(ObjType::Thread) {}
+};
+using ThreadRef = std::shared_ptr<Thread>;
+
+struct ThreadStart {
+    uint32_t stack_size = 0;
+    uint32_t system_routine = 0;  // XapiThreadStartup, called with (start_routine, start_context)
+    uint32_t start_routine = 0;
+    uint32_t start_context = 0;
+    uint8_t processor = 0;
+    bool suspended = false;
+};
+
+Thread* Current();
+ThreadRef CurrentRef();
+PPCContext& CurrentContext();
+void SetTlsTemplate(uint32_t raw_data, uint32_t raw_size, uint32_t data_size);  // the image's TLS directory
+ThreadRef CreateThread(const ThreadStart& start);
+void StartThread(ThreadRef t);
+void StartHostThread(const char* name, std::function<void(PPCContext&)> fn);
+void RunDpcs(PPCContext& ctx);
+[[noreturn]] void ExitThread(uint32_t code);
+void Resume(Thread& t);
+uint32_t Suspend(Thread& t);  // previous count; another thread stops at its next kernel wait, delay or yield
+void SuspendPoint();           // blocks the current thread while it is suspended
+void SetProcessor(Thread& t, uint8_t processor);
+bool RunApcs(Thread& t);
+void QueueApc(Thread& t, uint32_t routine, uint32_t a1, uint32_t a2, uint32_t a3);
+std::vector<ThreadRef> Threads();
 
 // the guest call chain: each frame's back chain at 0(r1), the return address saved 8 bytes below the caller's r1
 void LogGuestStack(PPCContext& ctx, int frames);

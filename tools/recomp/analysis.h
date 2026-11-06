@@ -69,6 +69,8 @@ public:
     void Run();
 
     bool IsCode(uint32_t va) const;
+    uint32_t CodeBase() const { return lo_; }
+    uint32_t CodeEnd() const { return hi_; }
     ppc::Insn At(uint32_t va) const;
     // the function's instruction addresses in address order
     const std::vector<uint32_t>& Body(uint32_t entry) const { return bodies_.at(entry); }

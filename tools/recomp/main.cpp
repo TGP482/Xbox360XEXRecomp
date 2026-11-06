@@ -7,6 +7,7 @@
 #include <optional>
 
 #include "analysis.h"
+#include "codegen.h"
 
 namespace fs = std::filesystem;
 
@@ -220,7 +221,10 @@ int main(int argc, char** argv) {
                      args[0].c_str(), cfg.title, cfg.entry);
         return 1;
     }
+    fs::path out_dir = args.size() > 2 ? fs::path(args[2]) : root / cfg.out_dir;
     Analysis an(img, cfg);
     an.Run();
-    return CheckOverrides(an) ? 0 : 1;
+    if (!CheckOverrides(an)) return 1;
+    fs::create_directories(out_dir);
+    return CodeGen(an, out_dir).Run() ? 0 : 1;
 }

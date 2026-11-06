@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <string>
 
 namespace ppc {
 
@@ -549,5 +550,8 @@ struct Insn {
     uint32_t Va128() const { return Bits(16, 5) | Bits(10, 1) << 6 | Bits(5, 1) << 5; }
     uint32_t Vb128() const { return Bits(11, 5) | Bits(0, 2) << 5; }
 };
+
+// assembly text for comments in the generated code
+std::string Text(const Insn& i);
 
 }  // namespace ppc

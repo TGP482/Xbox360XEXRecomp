@@ -1,0 +1,27 @@
+# Placeholder. build.bat replaces it on the first build with the config xex_symbols writes for the game's XEX:
+#   out\build\release\xex_symbols.exe assets\default.xex <sdk>\xdk --library Game.dll --out config\game.toml
+# Names left at 0 become trapping stubs; find them in Ghidra
+# (python <sdk>\tools\symbols\xex2pe.py config\game.toml game.exe) and fill them in by hand.
+[xex]
+path = "assets/default.xex"
+out = "generated/game"
+library = "Game.dll"  # <exe>.dll, which the executable delay loads
+partitions = 128
+
+# Optional fixes, added by hand:
+# data_ranges = [[0x82150000, 0x82150040]]  # in [xex]: words in code sections that are never code, end exclusive
+#
+# [[hook]]                   # calls void FixSomething(PPCContext& ctx, uint8_t* base), defined by the game
+# at = 0x8212ABC0            # guest instruction inside a recompiled function
+# call = "FixSomething"
+# after = false              # true runs it after the instruction (not after branches or blr)
+# on_true = "ret"            # with on_true or on_false the hook returns bool: "ret" returns as the function's blr does,
+# on_false = 0x8212AC00      # an address jumps to that instruction of the same function
+#
+# [[function]]               # entry the analysis missed or ran past
+# at = 0x82123450
+# end = 0x82123520           # optional, decode no further (exclusive)
+#
+# [[switch]]                 # bctr whose table detection was wrong
+# at = 0x82123480
+# targets = [0x82123490, 0x821234A8]

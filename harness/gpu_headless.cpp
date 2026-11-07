@@ -30,7 +30,7 @@ public:
     void Present(const uint32_t*) override {
         if (harness::g_frames++ == 0) LOGR("harness: first frame");
     }
-    uint32_t BeginQuery() override { return 0; }
+    void BeginQuery(uint32_t) override {}
     void EndQuery(uint32_t) override {}
     bool QueryResult(uint32_t, uint32_t& samples) override {
         samples = 0;

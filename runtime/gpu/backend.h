@@ -6,7 +6,10 @@
 
 namespace gpu {
 
-// what the title's Direct3D hands the renderer, on the thread that draws
+constexpr uint32_t kQuerySlots = 4096;  // occlusion query numbers wrap at this
+
+// what the title's Direct3D hands the renderer: CreateShader and Info on the title's thread, the rest in order on the
+// render thread once Threaded wraps it
 class Backend {
 public:
     virtual ~Backend() = default;
@@ -22,12 +25,14 @@ public:
     virtual void Resolve(const State& s, const ResolveArgs& r) = 0;
     // front: the frame buffer's texture fetch constant, host order
     virtual void Present(const uint32_t front[6]) = 0;
-    // occlusion: pixels passing between Begin and End, false while the GPU is not past them
-    virtual uint32_t BeginQuery() = 0;
+    // occlusion: pixels passing between Begin and End, false while the GPU is not past them; the caller numbers them
+    virtual void BeginQuery(uint32_t query) = 0;
     virtual void EndQuery(uint32_t query) = 0;
     virtual bool QueryResult(uint32_t query, uint32_t& samples) = 0;
 };
 
 std::unique_ptr<Backend> CreateBackend();
+// records on the title's thread and runs inner on a render thread (threaded.cpp)
+std::unique_ptr<Backend> Threaded(std::unique_ptr<Backend> inner);
 
 }  // namespace gpu

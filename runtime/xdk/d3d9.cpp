@@ -93,7 +93,7 @@ void RequireLayout() {
 gpu::Backend* Backend() {
     if (g_backend) return g_backend.get();
     RequireLayout();
-    g_backend = gpu::CreateBackend();
+    g_backend = gpu::Threaded(gpu::CreateBackend());
     if (!g_backend->Init(kTitleWidth, kTitleHeight)) {
         LOGE("d3d: renderer init failed");
         // no owner window: this runs on the title's thread and the window may already be fullscreen over the box
@@ -248,6 +248,7 @@ gpu::VertexFetchConstant FetchFromElement(const DeclElement& el, uint32_t stride
 // stream; up_data and up_stride stand in for stream 0 in DrawVerticesUP and DrawIndexedVerticesUP
 std::vector<gpu::StreamFetch> Streams(uint32_t dev, const ShaderEntry& vs, uint32_t up_data, uint32_t up_bytes,
                                       uint32_t up_stride) {
+    auto bytes = [](uint32_t address) { return static_cast<const uint8_t*>(HostPtr(address)); };
     constexpr uint32_t kSlots = 96;  // vertex fetch constants, stream n in slot 95 - n
     const gpu::ShaderInfo& info = g_backend->Info(vs.shader);
     uint32_t decl = R32(dev + kDevDecl);
@@ -260,7 +261,7 @@ std::vector<gpu::StreamFetch> Streams(uint32_t dev, const ShaderEntry& vs, uint3
         DeclElement de;
         if (el == vs.elements.end() || !FindElement(decl, *el >> 12 & 0xF, *el >> 16 & 0xF, de)) continue;
         if (up_stride) {
-            sf.base = up_data;
+            sf.data = bytes(up_data);
             sf.size = up_bytes;
             sf.endian = 0;
             sf.fetch = FetchFromElement(de, up_stride);
@@ -269,7 +270,7 @@ std::vector<gpu::StreamFetch> Streams(uint32_t dev, const ShaderEntry& vs, uint3
         uint32_t slot = kSlots - 1 - std::min<uint32_t>(de.stream, kSlots - 1);
         uint32_t d0 = R32(dev + kDevFetch + slot * 8);
         uint32_t d1 = R32(dev + kDevFetch + slot * 8 + 4);
-        sf.base = d0 & ~3u;
+        sf.data = bytes(d0 & ~3u);
         sf.endian = d1 & 3;
         sf.size = (d1 >> 2 & 0xFFFFFF) * 4;
         sf.fetch = FetchFromElement(de, R8(dev + kDevStrides + de.stream) * 4);
@@ -334,7 +335,7 @@ HLE_FUNC(D3DDevice_DrawIndexedVertices) {
     d.count = a[4];
     d.index32 = format >> 31 & 1;
     d.index_endian = format >> 29 & 3;
-    d.indices = R32(ib + XDK_IndexBuffer_Address) + a[3] * (d.index32 ? 4 : 2);
+    d.indices = static_cast<const uint8_t*>(HostPtr(R32(ib + XDK_IndexBuffer_Address) + a[3] * (d.index32 ? 4 : 2)));
     Draw(a[0], d);
     return 0;
 }
@@ -354,7 +355,8 @@ HLE_FUNC(D3DDevice_DrawIndexedVerticesUP) {
     gpu::DrawArgs d;
     d.prim = a[1];
     d.count = a[4];
-    d.indices = a[5];
+    if (!a[5]) return 0;
+    d.indices = static_cast<const uint8_t*>(HostPtr(a[5]));
     d.index32 = a[6] & kIndex32;
     // the title's own big endian indices
     d.index_endian = d.index32 ? 2 : 1;
@@ -465,6 +467,7 @@ HLE_FUNC(D3D_MakeSpace) {
 // Occlusion queries count on the host; other types stay with the library
 namespace {
 std::unordered_map<uint32_t, uint32_t> g_queries;  // the library's query to the host's
+uint32_t g_next_query = 0;
 }
 
 PPC_EXTERN_FUNC(GUEST_ORIG(D3DQuery_Issue));
@@ -480,7 +483,10 @@ PPC_FUNC(GUEST(D3DQuery_Issue)) {
     }
     std::lock_guard lock(g_lock);
     gpu::Backend* backend = Backend();
-    if (flags & 2) g_queries[query] = backend->BeginQuery();
+    if (flags & 2) {
+        g_queries[query] = g_next_query;
+        backend->BeginQuery(g_next_query++);
+    }
     auto it = g_queries.find(query);
     if (flags & 1 && it != g_queries.end()) backend->EndQuery(it->second);
 }

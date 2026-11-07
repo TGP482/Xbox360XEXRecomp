@@ -13,6 +13,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -49,7 +50,7 @@ constexpr uint32_t kViewsPerFrame = 1u << 18;
 constexpr uint32_t kSamplerCount = 2048;
 constexpr uint32_t kRtvCount = 1024;
 constexpr uint32_t kDsvCount = 256;
-constexpr uint32_t kQueryCount = 4096;
+constexpr uint32_t kQueryCount = kQuerySlots;
 constexpr uint32_t kVsTextures = 16;
 constexpr uint32_t kPsTextures = 32;
 constexpr uint32_t kConstBytes = 256 * 16;
@@ -292,7 +293,7 @@ public:
                const Rect* rect) override;
     void Resolve(const State& s, const ResolveArgs& r) override;
     void Present(const uint32_t front[6]) override;
-    uint32_t BeginQuery() override;
+    void BeginQuery(uint32_t query) override;
     void EndQuery(uint32_t query) override;
     bool QueryResult(uint32_t query, uint32_t& samples) override;
 
@@ -416,7 +417,6 @@ private:
     ComPtr<ID3D12QueryHeap> query_heap_;
     ComPtr<ID3D12Resource> query_read_;
     Query queries_[kQueryCount];
-    uint32_t next_query_ = 0;
 
     std::chrono::steady_clock::time_point fps_start_ = std::chrono::steady_clock::now();
     uint32_t fps_frames_ = 0;
@@ -1319,7 +1319,7 @@ bool D3D12Backend::UploadIndices(const DrawArgs& a, D3D12_PRIMITIVE_TOPOLOGY& to
                                  uint32_t& max) {
     std::vector<uint32_t> src(a.count);
     if (a.indices) {
-        const uint8_t* p = Guest(a.indices);
+        const uint8_t* p = a.indices;
         for (uint32_t i = 0; i < a.count; i++) {
             if (a.index32) {
                 uint32_t v;
@@ -1384,25 +1384,27 @@ bool D3D12Backend::UploadIndices(const DrawArgs& a, D3D12_PRIMITIVE_TOPOLOGY& to
 D3D12_GPU_VIRTUAL_ADDRESS D3D12Backend::UploadStreams(const DrawArgs& a, const ShaderInfo& vs, uint32_t min,
                                                       uint32_t max) {
     std::vector<VertexFetchConstant> fetch(std::max<size_t>(vs.fetches.size(), 1));
-    std::unordered_map<uint64_t, uint32_t> copied;  // stream base and stride to ring offset of vertex 0
+    std::map<std::pair<const uint8_t*, uint32_t>, uint32_t> copied;  // stream and stride to ring offset of vertex 0
     Frame& f = CurrentFrame();
     for (size_t k = 0; k < vs.fetches.size(); k++) {
         const StreamFetch& sf = a.streams[k];
         VertexFetchConstant c = sf.fetch;
         c.format |= sf.endian << 8;
         uint32_t stride = std::max(c.stride, 4u);
-        uint64_t key = uint64_t(sf.base) << 32 | stride;
+        auto key = std::make_pair(sf.data, stride);
         auto it = copied.find(key);
         if (it == copied.end()) {
-            uint64_t first = uint64_t(int64_t(min) + a.base_vertex) * stride;
-            uint64_t end = std::min<uint64_t>((uint64_t(int64_t(max) + a.base_vertex) + 1) * stride, sf.size);
+            int64_t low = std::max<int64_t>(int64_t(min) + a.base_vertex, 0);
+            int64_t high = std::max<int64_t>(int64_t(max) + a.base_vertex + 1, 0);
+            uint64_t first = std::max<uint64_t>(uint64_t(low) * stride, sf.first);
+            uint64_t end = std::min<uint64_t>(uint64_t(high) * stride, sf.size);
             uint64_t bytes = end > first ? end - first : 0;
             Alloc v = Upload(std::max<uint64_t>(bytes, 16), 16);
             if (v.res != f.upload.Get()) {
                 static bool logged = false;
                 if (!std::exchange(logged, true)) LOGR("D3D12: vertex data past the upload ring reads as zero");
             }
-            if (bytes) std::memcpy(v.cpu, Guest(sf.base) + first, size_t(bytes));
+            if (bytes) std::memcpy(v.cpu, sf.data + (first - sf.first), size_t(bytes));
             it = copied.emplace(key, uint32_t(v.offset - first)).first;
         }
         c.address += it->second;
@@ -1731,11 +1733,10 @@ void D3D12Backend::Present(const uint32_t front[6]) {
 
 // Queries
 
-uint32_t D3D12Backend::BeginQuery() {
-    uint32_t q = next_query_++ % kQueryCount;
+void D3D12Backend::BeginQuery(uint32_t q) {
+    q %= kQueryCount;
     queries_[q] = {0, true};
     cl_->BeginQuery(query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION, q);
-    return q;
 }
 
 void D3D12Backend::EndQuery(uint32_t q) {

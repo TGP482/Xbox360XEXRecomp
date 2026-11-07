@@ -73,9 +73,10 @@ enum : uint32_t {
     kPrimQuadList = 13,
 };
 
-// where a vertex fetch reads: the stream's vertex 0 (a CPU address) and the bytes it holds
+// where a vertex fetch reads: data holds the stream's bytes from offset first up to size, null without
 struct StreamFetch {
-    uint32_t base = 0;
+    const uint8_t* data = nullptr;
+    uint32_t first = 0;
     uint32_t size = 0;
     uint32_t endian = 0;      // xenos::Endian
     VertexFetchConstant fetch;  // address: the element's offset in a vertex
@@ -85,7 +86,7 @@ struct DrawArgs {
     uint32_t prim = kPrimTriangleList;
     uint32_t count = 0;        // vertices or indices
     uint32_t start = 0;        // first vertex of a draw without indices
-    uint32_t indices = 0;      // CPU address of the first index, 0 without
+    const uint8_t* indices = nullptr;  // the first index, null without
     bool index32 = false;
     uint32_t index_endian = 0;  // xenos::Endian
     int32_t base_vertex = 0;

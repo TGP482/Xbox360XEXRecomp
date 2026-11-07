@@ -173,13 +173,10 @@ inline uint64_t ppc_srad(uint64_t v, uint64_t n, uint8_t& ca) {
 }
 
 // carrying adds: a + b + carry in, CA out
+// CA is the carry out of the low 32 bits, as in 32 bit mode
 inline uint64_t ppc_add_carry(uint64_t a, uint64_t b, uint64_t cin, uint8_t& ca) {
-    unsigned long long r1;
-    unsigned long long r2;
-    bool c1 = __builtin_uaddll_overflow(a, b, &r1);
-    bool c2 = __builtin_uaddll_overflow(r1, cin, &r2);
-    ca = c1 || c2;
-    return r2;
+    ca = uint8_t((uint64_t(uint32_t(a)) + uint32_t(b) + cin) >> 32);
+    return a + b + cin;
 }
 
 // divide by zero and INT_MIN / -1 give 0 instead of a host fault; the hardware leaves the result undefined

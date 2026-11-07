@@ -120,7 +120,7 @@ std::string CodeGen::OvW() {
     return Ov();
 }
 
-// Rc = 1: cr0 compares the low 32 bits with zero; titles count loops in words whose high half is stale
+// Rc = 1: cr0 compares the low 32 bits with zero, as in 32 bit mode
 void CodeGen::RecordCr0(const std::string& value) {
     Line(Fmt("\t%s = ppc_cmps(int64_t(int32_t(%s)), 0, %s);", Crw(0).c_str(), value.c_str(), So().c_str()));
 }
@@ -194,10 +194,11 @@ std::string CodeGen::TailCall(uint32_t to) {
 }
 
 // BO: 0x10 skips the condition, 0x08 is the value it must have, 0x04 skips the counter, 0x02 branches on zero
+// titles run in 32 bit mode: the counter is tested in its low 32 bits
 std::string CodeGen::BranchCond(const Insn& i) {
     uint32_t bo = i.Bo();
     std::string c;
-    if (!(bo & 0x04)) c = Fmt("--%s %s 0", CtrW().c_str(), bo & 0x02 ? "==" : "!=");
+    if (!(bo & 0x04)) c = Fmt("uint32_t(--%s) %s 0", CtrW().c_str(), bo & 0x02 ? "==" : "!=");
     if (!(bo & 0x10)) {
         if (!c.empty()) c += " && ";
         c += (bo & 0x08 ? "" : "!") + CrBit(i.Bi());

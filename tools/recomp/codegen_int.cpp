@@ -83,12 +83,13 @@ bool CodeGen::EmitArith(const Insn& i) {
             return true;
         case Op::addic:
         case Op::addic_dot:
-            Line(Fmt("\t{ uint64_t a = %s; %s = %s; %s = %s < a; }", R(i.Ra()).c_str(), d.c_str(),
+            Line(Fmt("\t{ uint64_t a = %s; %s = %s; %s = uint32_t(%s) < uint32_t(a); }", R(i.Ra()).c_str(), d.c_str(),
                      Offset("a", i.Simm()).c_str(), CaW().c_str(), d.c_str()));
             if (i.op == Op::addic_dot) RecordCr0(d);
             return true;
         case Op::subfic:
-            Line(Fmt("\t{ uint64_t a = %s; uint64_t b = uint64_t(int64_t(%d)); %s = b - a; %s = b >= a; }",
+            Line(Fmt("\t{ uint64_t a = %s; uint64_t b = uint64_t(int64_t(%d)); %s = b - a; "
+                     "%s = uint32_t(b) >= uint32_t(a); }",
                      R(i.Ra()).c_str(), i.Simm(), d.c_str(), CaW().c_str()));
             return true;
         case Op::mulli:

@@ -60,6 +60,7 @@ struct Tls {
 
 // The image as the console loads it: header fields plus the decrypted, decompressed basefile at base.
 struct Image {
+    std::vector<uint8_t> header;  // the XEX header, up to the image data
     std::vector<uint8_t> memory;
     uint32_t base = 0;
     uint32_t entry = 0;

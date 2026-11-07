@@ -16,6 +16,7 @@
 #include "core/log.h"
 #include "cpu/ppc_ops.h"
 #include "kernel/memory.h"
+#include "xex/xex.h"
 
 namespace kernel {
 
@@ -65,6 +66,28 @@ inline void W32(uint32_t va, uint32_t v) { ppc_st32(g_base + va, v); }
 inline uint64_t R64(uint32_t va) { return ppc_ld64(g_base + va); }
 inline void W64(uint32_t va, uint64_t v) { ppc_st64(g_base + va, v); }
 inline void* HostPtr(uint32_t va) { return g_base + va; }
+
+// read-modify-write on a big endian guest word, atomic as a guest's lwarx and stwcx. see it; returns the new value
+inline uint32_t AtomicAdd32(uint32_t va, int32_t delta) {
+    auto* p = static_cast<uint32_t*>(HostPtr(va));
+    uint32_t old = __atomic_load_n(p, __ATOMIC_SEQ_CST);
+    for (;;) {
+        uint32_t want = __builtin_bswap32(__builtin_bswap32(old) + uint32_t(delta));
+        if (__atomic_compare_exchange_n(p, &old, want, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+            return __builtin_bswap32(want);
+    }
+}
+
+inline bool AtomicCompareSwap32(uint32_t va, uint32_t expected, uint32_t desired) {
+    auto* p = static_cast<uint32_t*>(HostPtr(va));
+    uint32_t want = __builtin_bswap32(expected);
+    return __atomic_compare_exchange_n(p, &want, __builtin_bswap32(desired), false, __ATOMIC_SEQ_CST,
+                                       __ATOMIC_SEQ_CST);
+}
+
+inline void AtomicStore32(uint32_t va, uint32_t v) {
+    __atomic_store_n(static_cast<uint32_t*>(HostPtr(va)), __builtin_bswap32(v), __ATOMIC_SEQ_CST);
+}
 
 // ANSI_STRING / OBJECT_STRING: USHORT Length, USHORT MaximumLength, PCHAR Buffer
 std::string ReadAnsiString(uint32_t str);
@@ -211,6 +234,15 @@ bool DeleteSymbolicLink(const std::string& link);
 std::string QuerySymbolicLink(const std::string& link);
 std::string ResolvePath(const std::string& console_path, uint32_t root_handle);  // host path or empty
 bool ReadGameFile(const std::string& console_path, std::vector<uint8_t>& out);  // from a host folder or the disc image
+
+// kernel variables the host keeps current, set up by boot
+void InitKernelData(const xex::Image& img);
+
+// boot: the image into guest memory, its imports bound, its first thread started
+bool Boot(const std::vector<uint8_t>& xex, const std::string& xex_name, const std::string& game_dir,
+          const std::string& data_dir);
+const xex::Image& LoadedImage();
+[[noreturn]] void Shutdown(int code);
 
 // the guest call chain: each frame's back chain at 0(r1), the return address saved 8 bytes below the caller's r1
 void LogGuestStack(PPCContext& ctx, int frames);

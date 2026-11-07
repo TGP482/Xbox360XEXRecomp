@@ -392,6 +392,7 @@ bool Image::Load(const std::vector<uint8_t>& file, std::string& error) {
         error = "XEX2 header is cut short";
         return false;
     }
+    header.assign(file.begin(), file.begin() + r.U32(kDataOffset));
     module_flags = r.U32(kModuleFlags);
     image_flags = r.U32(security + kImageFlags);
     base = r.U32(security + kLoadAddress);

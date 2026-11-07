@@ -18,6 +18,7 @@
 
 #include "app/app.h"
 #include "gpu/backend.h"
+#include "kernel/memory.h"
 #include "xdk/hle.h"
 #include "xdk/layout.h"
 
@@ -40,8 +41,8 @@ constexpr uint32_t kDevFence = XDK_Device_Fence;          // the next fence, two
 constexpr uint32_t kDevGpuFlags = XDK_Device_GpuFlags;
 constexpr uint32_t kDevDecl = XDK_Device_VertexDeclaration;
 constexpr uint32_t kDevIndices = XDK_Device_IndexBuffer;
-constexpr uint32_t kDevTargets = XDK_Device_RenderTargets;  // 4 surfaces
-constexpr uint32_t kDevDepth = XDK_Device_DepthStencil;
+[[maybe_unused]] constexpr uint32_t kDevTargets = XDK_Device_RenderTargets;  // 4 surfaces
+[[maybe_unused]] constexpr uint32_t kDevDepth = XDK_Device_DepthStencil;
 constexpr uint32_t kDevStrides = XDK_Device_StreamStrides;  // a byte per stream, in dwords
 constexpr uint32_t kDevPixelShader = XDK_Device_PixelShader;
 constexpr uint32_t kDevVertexShader = XDK_Device_VertexShader;
@@ -501,6 +502,97 @@ HLE_FUNC(D3D_MakeSpace) {
     if (writeback) W32(writeback, R32(dev + kDevFence) - 2);
     return R32(dev + kDevRingWrite);
 }
+
+// Builds whose library reads the GPU's registers itself (2417): the reads go, the rest is the library's
+
+#ifdef SUB_D3D_InterruptHandler
+PPC_EXTERN_FUNC(GUEST_ORIG(D3D_InterruptHandler));
+
+// (source, device): the host's interrupt 0 is always a vertical blank, so the display status register is not read
+PPC_FUNC(GUEST(D3D_InterruptHandler)) {
+    constexpr uint32_t kVerticalBlank = 0;
+    constexpr uint32_t kCount = 0x3D00;      // vertical blanks so far
+    constexpr uint32_t kSwapAt = 0x3D04;     // the count when the presentation wait ran out
+    constexpr uint32_t kWait = 0x3D08;       // vertical blanks the presentation still waits
+    constexpr uint32_t kCallback = 0x3CFC;   // the title's vertical blank callback
+    constexpr uint32_t kSwaps = 0x3D0C;
+    constexpr uint32_t kWaitFlag = 0x2894;   // a block whose word 1 the wait clears
+    if (uint32_t(ctx.r[3]) != kVerticalBlank) {
+        GUEST_ORIG(D3D_InterruptHandler)(ctx, base);
+        return;
+    }
+    static uint32_t data = mem::AllocSystem(12);  // the callback's argument, one interrupt at a time
+    uint32_t dev = uint32_t(ctx.r[4]);
+    W32(dev + kCount, R32(dev + kCount) + 1);
+    int32_t wait = int32_t(R32(dev + kWait));
+    if (wait > 0) {
+        W32(dev + kWait, uint32_t(--wait));
+        if (!wait) {
+            W32(R32(dev + kWaitFlag) + 4, 0);
+            W32(dev + kSwapAt, R32(dev + kCount));
+        }
+    }
+    if (uint32_t fn = R32(dev + kCallback)) {
+        W32(data, R32(dev + kCount));
+        W32(data + 4, R32(dev + kSwaps));
+        W32(data + 8, 0);
+        CallGuest(ctx, fn, {data});
+    }
+}
+#endif
+
+#ifdef SUB_D3D_InitializeEngines
+// (device): the library's interrupt handler is registered as the library does, the RB register copy starts clear
+PPC_FUNC(GUEST(D3D_InitializeEngines)) {
+    constexpr uint32_t kSetInterruptCallback = 0x1D5;  // VdSetGraphicsInterruptCallback
+    constexpr uint32_t kRbShadow = 0x28A0;
+    uint32_t dev = uint32_t(ctx.r[3]);
+    if (kernel::ExportFn set = kernel::FindExport(kernel::Library::Kernel, kSetInterruptCallback)) {
+        ctx.r[3] = SYM(D3D_InterruptHandler);
+        ctx.r[4] = dev;
+        set(ctx, base);
+    }
+    W32(dev + kRbShadow, 0);
+    ctx.r[3] = 1;
+}
+#endif
+
+#ifdef SUB_D3D_SetDefaultRegisters
+// (device): XDK 2417's defaults for the register copy, without its reads of the hardware's and its ring packets
+HLE_FUNC(D3D_SetDefaultRegisters) {
+    constexpr uint32_t kTextureFetches = 26;
+    constexpr uint32_t kTextureStride = 0x18;
+    constexpr uint32_t kVertexFetches = 18;
+    constexpr uint32_t kVertexStride = 8;
+    uint32_t dev = a[0];
+    W64(dev + 0x2C98, 0xFFFFFFFFull);
+    for (uint32_t i = 0; i < kTextureFetches; i++) {
+        uint32_t f = dev + 0x480 + i * kTextureStride;
+        W32(f, R32(f) & ~3u);
+    }
+    for (uint32_t i = 0; i < kVertexFetches; i++) {
+        uint32_t f = dev + 0x6F0 + i * kVertexStride;
+        W32(f, (R32(f) & ~3u) | 1);
+    }
+    W32(dev + 0x2CFC, 0x20002000);
+    W32(dev + 0x2E14, 0x000FF000);
+    W32(dev + 0x2DAC, 8);
+    W32(dev + 0x2DC4, 0xE);
+    W32(dev + 0x2E50, 0xE);
+    W32(dev + 0x2E88, 2);
+    W32(dev + 0x2D0C, 0x00FFFFFF);
+    W32(dev + 0x2D94, 4);
+    W32(dev + 0x2E00, 4);
+    W32(dev + 0x2E18, 0x000FF100);
+    W32(dev + 0x2E54, 0x10);
+    W32(dev + 0x2D84, R32(dev + 0x2D84) | 0x80000);
+    W32(dev + 0x2D88, R32(dev + 0x2D88) | 0x10000);
+    for (uint32_t dirty = 0x10; dirty <= 0x30; dirty += 8) W64(dev + dirty, ~0ull);
+    W32(dev + 0x28A8, 0x100);
+    W32(dev + 0x28A0, 0);
+    return 0;
+}
+#endif
 
 // Occlusion queries count on the host; other types stay with the library
 namespace {

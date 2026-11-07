@@ -6,7 +6,12 @@
 #include "kernel/kernel.h"
 
 #ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #else
 #include <pthread.h>
@@ -38,6 +43,7 @@ constexpr uint8_t kThreadObject = 6;
 constexpr uint32_t kMinStack = 0x10000;
 constexpr uint32_t kInitialFrame = 0x80;
 constexpr uint32_t kTlsSlots = 64;
+constexpr uint32_t kHostThreadStack = 0x20000;  // guest stack of the runtime's own threads (DPCs)
 // recompiled code nests host frames as deep as the guest's calls; committed, as the game code has no stack probes
 constexpr size_t kHostStack = 32u << 20;
 
@@ -207,7 +213,7 @@ void StartThread(ThreadRef t) {
 }
 
 void StartHostThread(const char* name, std::function<void(PPCContext&)> fn) {
-    ThreadRef t = NewThread(0x20000, 0);
+    ThreadRef t = NewThread(kHostThreadStack, 0);
     std::string n = name;
     Spawn([t, fn, n] {
         t_current = t;

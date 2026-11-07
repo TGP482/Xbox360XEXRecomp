@@ -44,7 +44,7 @@ struct ShaderInfo {
 struct ShaderOptions {
     // vertex: export register to interpolator, how the pixel shader links its inputs
     uint8_t export_map[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
-    int8_t param_gen = -1;  // pixel: register given the pixel position, -1 none
+    int8_t vpos_reg = -1;  // pixel: register the shader reads VPOS and VFACE from, -1 none
     bool alpha_test = false;
 };
 
@@ -59,17 +59,12 @@ struct FlowConstants {
 
 // b2
 struct DrawConstants {
-    float ndc_scale[4];   // console clip space to host, xyz
+    float ndc_scale[4];   // the title's viewport over the host target, xyz
     float ndc_offset[4];  // times w
-    uint32_t flags;       // kNdc*
-    uint32_t alpha_func;  // RB_COLORCONTROL alpha function, 7 always
+    uint32_t alpha_func;  // compare function, 0 never to 7 always
     float alpha_ref;
+    float vpos_scale;  // title pixels per host pixel
     uint32_t pad;
-};
-enum : uint32_t {
-    kNdcXyDivided = 1,  // PA_CL_VTE_CNTL: xy come divided by w
-    kNdcZDivided = 2,
-    kNdcW0 = 4,  // w comes as 1 / w
 };
 
 // b3, per fetch instruction

@@ -33,7 +33,7 @@ ls "$GEN"/ppc_recomp.*.cpp "$GEN"/ppc_func_mapping.cpp | xargs -P "$JOBS" -I{} s
     $CXX $GAME -I"$RT" -I"$GEN" -c {} -o "$o.tmp" && mv "$o.tmp" "$o"'
 
 others=$(ls "$GEN/.." | grep -vx "$(basename "$GEN")" | paste -sd'|' -)
-SRC=$(ls "$RT"/*/*.cpp | grep -Ev "/runtime/app/|/core/input.cpp|/gpu/d3d12.cpp|/audio/xaudio2.cpp")
+SRC=$(ls "$RT"/*/*.cpp | grep -Ev "/runtime/app/|/core/input.cpp|/gpu/d3d12.cpp|/gpu/compiler.cpp|/audio/xaudio2.cpp")
 SRC="$SRC $(ls "$REPO"/src/*/*.cpp | grep -Ev "/src/(${others:-^$})/" || true)"
 SRC="$SRC $(ls "$H"/*.cpp) ${EXTRA[*]}"
 for x in "${EXCL[@]}"; do SRC=$(echo $SRC | tr ' ' '\n' | grep -Ev -- "$x"); done

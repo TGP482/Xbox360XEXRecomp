@@ -74,6 +74,21 @@ set(XEX_IMGUI_SOURCES
     ${imgui_SOURCE_DIR}/backends/imgui_impl_dx12.cpp)
 
 file(GLOB XEX_RUNTIME_SOURCES CONFIGURE_DEPENDS ${XEX_SDK_DIR}/runtime/*/*.cpp)
+
+# the shader compiler the renderer loads, dxcompiler.dll and dxil.dll: the newest Windows SDK's unless XEX_DXC_DIR says
+if(NOT XEX_DXC_DIR)
+    file(GLOB XEX_DXC_DIRS "C:/Program Files (x86)/Windows Kits/10/bin/10.*/x64")
+    list(SORT XEX_DXC_DIRS COMPARE NATURAL ORDER DESCENDING)
+    foreach(dir ${XEX_DXC_DIRS})
+        if(EXISTS ${dir}/dxcompiler.dll AND EXISTS ${dir}/dxil.dll)
+            set(XEX_DXC_DIR ${dir})
+            break()
+        endif()
+    endforeach()
+endif()
+if(NOT XEX_DXC_DIR)
+    message(WARNING "dxcompiler.dll and dxil.dll not found, set XEX_DXC_DIR to the folder holding them")
+endif()
 # SDL's headers go to the input code alone (it is linked LINK_ONLY)
 set_source_files_properties(${XEX_SDK_DIR}/runtime/core/input.cpp PROPERTIES
     INCLUDE_DIRECTORIES "${sdl3_SOURCE_DIR}/include")
@@ -124,6 +139,11 @@ function(add_xex_image target xex config partitions game_dir)
         d3dcompiler xaudio2 ole32 windowscodecs dbghelp winmm dwmapi ws2_32)
     target_link_libraries(${target} PRIVATE ${GEN}/code.lib delayimp)
     target_link_options(${target} PRIVATE -fuse-ld=lld -g -Wl,/delayload:${target}.dll)
+    if(XEX_DXC_DIR)
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${XEX_DXC_DIR}/dxcompiler.dll ${XEX_DXC_DIR}/dxil.dll
+                    $<TARGET_FILE_DIR:${target}>)
+    endif()
 
     # without a C runtime: the executable passes on what the code calls. Built for the CPU it runs on; the executable
     # stays at the x86-64-v2 floor. No fused multiply add or errno: PowerPC rounds each step, fma is explicit. No stack

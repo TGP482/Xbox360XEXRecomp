@@ -278,9 +278,9 @@ cbuffer Flow : register(b1) { uint4 g_bools[2]; uint4 g_loops[8]; };
 cbuffer Draw : register(b2) {
     float4 g_ndc_scale;
     float4 g_ndc_offset;
-    uint g_flags;
     uint g_alpha_func;
     float g_alpha_ref;
+    float g_vpos_scale;
     uint g_pad;
 };
 
@@ -941,9 +941,6 @@ VOut main(uint id : SV_VertexID) {
     r[0].x = float(id);
     Run();
     float4 pos = o_pos;
-    if (g_flags & 4) pos.w = 1 / pos.w;
-    if (g_flags & 1) pos.xy *= pos.w;
-    if (g_flags & 2) pos.z *= pos.w;
     pos.xyz = pos.xyz * g_ndc_scale.xyz + g_ndc_offset.xyz * pos.w;
     // depth stored reversed
     pos.z = pos.w - pos.z;
@@ -973,8 +970,10 @@ struct POut {
 POut main(PIn i) {
     [unroll] for (uint k = 0; k < 16; k++) r[k] = i.v[k];
 )";
-    if (opt_.param_gen >= 0) {
-        s += F("    r[%d] = float4(i.front ? i.pos.x : -i.pos.x, i.pos.y, 0, 0);\n", opt_.param_gen & 63);
+    // VPOS as whole pixels, VFACE in the sign of x as the console hands them over
+    if (opt_.vpos_reg >= 0) {
+        s += "    float2 vpos = floor(i.pos.xy * g_vpos_scale);\n";
+        s += F("    r[%d] = float4(i.front ? vpos.x : -vpos.x, vpos.y, 0, 0);\n", opt_.vpos_reg & 63);
     }
     s += "    Run();\n";
     if (opt_.alpha_test) {

@@ -1,0 +1,2 @@
+# XDK 2.0.3529 data layout the host reads, emitted as XDK_<name> in image_symbols.h
+[layout]

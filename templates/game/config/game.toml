@@ -1,7 +1,6 @@
 # Placeholder. build.bat replaces it on the first build with the config xex_symbols writes for the game's XEX:
 #   out\build\release\xex_symbols.exe assets\default.xex <sdk>\xdk --library Game.dll --out config\game.toml
-# Names left at 0 become trapping stubs; find them in Ghidra
-# (python <sdk>\tools\symbols\xex2pe.py config\game.toml game.exe) and fill them in by hand.
+# Names left at 0 become trapping stubs; find them in Ghidra, which loads the xex itself, and fill them in by hand.
 [xex]
 path = "assets/default.xex"
 out = "generated/game"

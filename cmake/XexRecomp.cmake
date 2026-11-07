@@ -58,6 +58,13 @@ target_include_directories(xex_recomp PRIVATE ${XEX_SDK_DIR}/runtime ${XEX_SDK_D
 target_compile_definitions(xex_recomp PRIVATE _CRT_SECURE_NO_WARNINGS)
 target_link_libraries(xex_recomp PRIVATE tomlplusplus::tomlplusplus)
 
+# XDK signature scanner that writes a new title's config
+add_executable(xex_symbols ${XEX_SDK_DIR}/tools/symbols/main.cpp ${XEX_SDK_DIR}/runtime/xex/xex.cpp
+    ${XEX_SDK_DIR}/runtime/xex/lzx.cpp)
+target_include_directories(xex_symbols PRIVATE ${XEX_SDK_DIR}/runtime)
+target_compile_definitions(xex_symbols PRIVATE _CRT_SECURE_NO_WARNINGS)
+target_link_libraries(xex_symbols PRIVATE tomlplusplus::tomlplusplus)
+
 set(XEX_IMGUI_SOURCES
     ${imgui_SOURCE_DIR}/imgui.cpp
     ${imgui_SOURCE_DIR}/imgui_draw.cpp

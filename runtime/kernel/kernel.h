@@ -102,8 +102,7 @@ uint32_t RegisterData(Library lib, uint32_t ordinal, const char* name, uint32_t 
 ExportFn FindExport(Library lib, uint32_t ordinal);
 // what an import variable holds: a data export's address, or an address that calls the function; 0 if missing
 uint32_t ExportAddress(Library lib, uint32_t ordinal);
-const char* ExportName(Library lib, uint32_t ordinal);
-const char* OrdinalName(Library lib, uint32_t ordinal);  // public name from the ordinal tables, "?" if unknown
+const char* ExportName(Library lib, uint32_t ordinal);  // the host implementation's name, "?" if none
 
 // objects
 enum class ObjType : uint8_t { Event, Semaphore, Mutant, Timer, Thread, File, SymLink, Device, Queue, Other };

@@ -91,9 +91,7 @@ constexpr uint32_t kMaxImports = 2048;
 
 [[noreturn]] void MissingImport(PPCContext& ctx, uint32_t slot) {
     const PPCImport& im = g_import_list[slot];
-    kernel::Library lib = kernel::LibraryFromName(im.library);
-    LOGE("%s export %u (%s) is not implemented, called from %08X", im.library, im.ordinal,
-         kernel::OrdinalName(lib, im.ordinal), uint32_t(ctx.lr));
+    LOGE("%s export 0x%X is not implemented, called from %08X", im.library, im.ordinal, uint32_t(ctx.lr));
     ppc_trap(ctx, uint32_t(ctx.lr), "unimplemented import");
 }
 
@@ -117,7 +115,7 @@ void BindImports() {
         PPCFunc* fn = kernel::FindExport(lib, im.ordinal);
         if (!fn) {
             missing++;
-            LOGR("imports: %s %u (%s) is not implemented", im.library, im.ordinal, kernel::OrdinalName(lib, im.ordinal));
+            LOGR("imports: %s 0x%X is not implemented", im.library, im.ordinal);
             if (i >= kMaxImports) {
                 LOGE("imports: more than %u imports, raise kMaxImports", kMaxImports);
                 std::abort();
@@ -237,7 +235,7 @@ uint32_t ExportAddress(Library lib, uint32_t ordinal) {
 
 const char* ExportName(Library lib, uint32_t ordinal) {
     const Export* e = FindEntry(lib, ordinal);
-    return e && e->name ? e->name : OrdinalName(lib, ordinal);
+    return e && e->name ? e->name : "?";
 }
 
 // the callee gets a frame with its back chain and the stack argument slots, and the registers Args reads come back

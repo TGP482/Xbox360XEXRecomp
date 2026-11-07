@@ -23,6 +23,7 @@
 #include "core/input.h"
 #include "core/log.h"
 #include "cpu/dispatch.h"
+#include "hook_exports.h"  // exports the [[hook]] functions the DLL imports
 #include "image_symbols.h"
 #include "kernel/disc.h"
 

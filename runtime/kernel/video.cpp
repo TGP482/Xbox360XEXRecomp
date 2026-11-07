@@ -107,7 +107,13 @@ KERNEL_EXPORT(0x1C3, VdInitializeRingBuffer) { return 0; }
 KERNEL_EXPORT(0x1B6, VdEnableRingBufferRPtrWriteBack) { return 0; }
 KERNEL_EXPORT(0x1D9, VdSetSystemCommandBufferGpuIdentifierAddress) { return 0; }
 KERNEL_EXPORT(0x1C5, VdInitializeScalerCommandBuffer) { return 0; }
-KERNEL_EXPORT(0x1C7, VdRetrainEDRAM) { return 0; }
+KERNEL_EXPORT(0x1C7, VdPersistDisplay) { return 0; }
+KERNEL_EXPORT(0x268, VdInitializeEDRAM) { return 0; }
+KERNEL_EXPORT(0x269, VdRetrainEDRAM) { return 0; }
+KERNEL_EXPORT(0x26A, VdRetrainEDRAMWorker) { return 0; }
+
+// libraries take the retail path (EDRAM retrain) from 0x10 up
+KERNEL_EXPORT(0x1BC, VdGetGraphicsAsicID) { return 0x11; }
 KERNEL_EXPORT(0x25B, VdSwap) { return 0; }
 
 // (buffer, gpu address): no system command buffer

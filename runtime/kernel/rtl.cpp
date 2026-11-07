@@ -395,6 +395,13 @@ KERNEL_EXPORT(0x14D, _vsnprintf) {
     return s.size() < count ? uint32_t(s.size()) : 0xFFFFFFFFu;
 }
 
+// (buffer, format, va_list)
+KERNEL_EXPORT(0x14E, vsprintf) {
+    std::string s = Format(ReadCString(a[1]), GuestArgs(ctx, a[2], true), false);
+    std::memcpy(HostPtr(a[0]), s.c_str(), s.size() + 1);
+    return s.size();
+}
+
 // (buffer, format, va_list), wide
 KERNEL_EXPORT(0x151, vswprintf) {
     std::string s = Format(ReadWide(a[1]), GuestArgs(ctx, a[2], true), true);

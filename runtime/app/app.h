@@ -73,6 +73,14 @@ void HandoverSwap();     // each Swap: drops the held frame once the title has d
 std::recursive_mutex& UiLock();
 
 // what the game repo defines once
+// the first start compiler window's colours as 0xFFRRGGBB, the game's F10 menu ones; 0 keeps the default
+struct WindowColours {
+    uint32_t background = 0;
+    uint32_t text = 0;
+    uint32_t dim = 0;
+    uint32_t bar_empty = 0;
+    uint32_t bar_full = 0;
+};
 struct Option {  // a setting in the settings file, flag or value
     const char* key;
     bool* flag;
@@ -99,6 +107,7 @@ struct GameInfo {
     void (*ui)(double fps);        // each frame inside the ImGui frame, UiLock held
     void (*pad)(int port, input::Pad& pad);  // a polled pad before the game gets it
     void (*rumble)(int port, uint16_t& left, uint16_t& right);
+    WindowColours compiler_colours{};
 };
 extern const GameInfo kGame;
 

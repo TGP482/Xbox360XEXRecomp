@@ -20,4 +20,5 @@ const app::GameInfo app::kGame = {
     .ui = nullptr,                        // ImGui drawing each frame
     .pad = nullptr,                       // changes a polled pad
     .rumble = nullptr,                    // changes a rumble before it is set
+    .compiler_colours = {},               // first start compiler window, 0xFFRRGGBB as the F10 menu; 0 the default
 };

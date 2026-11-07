@@ -35,6 +35,7 @@ enum Button : uint16_t {
 
 void Init();  // window thread, before boot; the game code window starts it earlier
 uint16_t HeldOnAnyController();  // face buttons as kA/kB/kX/kY masks, GameInfo::pad left out
+bool AnyConnected();
 // the controller on that port, then GameInfo::pad
 Pad Poll(int port);
 void Rumble(int port, uint16_t left, uint16_t right);

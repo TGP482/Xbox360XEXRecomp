@@ -135,6 +135,12 @@ uint16_t HeldOnAnyController() {
     return held;
 }
 
+bool AnyConnected() {
+    std::lock_guard lock(g_lock);
+    UpdatePads();
+    return std::any_of(std::begin(g_pads), std::end(g_pads), [](SDL_Gamepad* pad) { return pad != nullptr; });
+}
+
 // the motors run until set again
 void Rumble(int port, uint16_t left, uint16_t right) {
     if (app::kGame.rumble) app::kGame.rumble(port, left, right);

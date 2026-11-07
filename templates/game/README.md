@@ -52,5 +52,4 @@ Run `build.bat`. The first build recompiles the game and takes a while. The exe 
 ## Credits
 
 - [Xbox 360 XEX Recomp](https://github.com/TGP482/Xbox360XEX-Recomp), the recompiler and runtime this is built on.
-- [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) for the overridable function layout and instruction hooks.
 - [toml++](https://github.com/marzer/tomlplusplus) for the configs, [Dear ImGui](https://github.com/ocornut/imgui) for the settings overlay and [SDL](https://github.com/libsdl-org/SDL) for the window, input and controllers.

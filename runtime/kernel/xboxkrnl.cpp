@@ -527,16 +527,20 @@ KERNEL_EXPORT(0x10B, ObLookupThreadByThreadId) {
 // threads
 
 // (handle out, stack size, thread id out, XapiThreadStartup, start routine, start context, creation flags)
+// flags: top byte is the processor mask, 0x80 returns the KTHREAD instead of a handle
 KERNEL_EXPORT(0x0D, ExCreateThread) {
     constexpr uint32_t kCreateSuspended = 0x1;
+    constexpr uint32_t kReturnKthread = 0x80;
+    uint32_t processor_mask = a[6] >> 24;
     ThreadStart start;
     start.stack_size = a[1];
     start.system_routine = a[3];
     start.start_routine = a[4];
     start.start_context = a[5];
     start.suspended = a[6] & kCreateSuspended;
+    if (processor_mask) start.processor = uint8_t(__builtin_ctz(processor_mask));
     ThreadRef t = CreateThread(start);
-    if (a[0]) W32(a[0], NewHandle(t));
+    if (a[0]) W32(a[0], (a[6] & kReturnKthread) ? t->kthread : NewHandle(t));
     if (a[2]) W32(a[2], t->id);
     StartThread(t);
     return kSuccess;

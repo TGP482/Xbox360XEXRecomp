@@ -59,6 +59,7 @@ A new XDK build needs `xdk/<build>/layout.toml` and signatures made from titles 
 
 ### Audio
 - **XMA** - Decodes XMA through the kernel's XMA functions at the API level, with Windows' own WMA Pro decoder.
+- **XAudio** - Implements the XDK's XAudio engine at the API level on a host mixer, with source and submix voices, packets and the reverb on XAudio2's own, found in each game by signatures.
 
 ### Input
 - **Controller** - Supports Xbox, PlayStation and Switch controllers through SDL3, with hot plugging and rumble.

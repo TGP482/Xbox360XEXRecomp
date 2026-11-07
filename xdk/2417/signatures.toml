@@ -11,5 +11,30 @@ D3DDevice_Swap = {len = 0x177, hash = "0x81132C8A65C9AE65", calls = [[0x58, "0x2
 D3DQuery_GetData = {len = 0xD2, hash = "0xD8A83EF32AA5A0B6", calls = [[0x3A, "0xF25723B02F444AA0", [[0x66, "0x4B871A48C19AD538"], [0x32, "0x58BD8FFBB7211769"], [0x2F, "0x787E91C0855716F2"], [0x4F, "0xACBE7A7EAD6376D8"], [0x39, "0x52B38C73180DBE3C"]]]]}
 D3DQuery_Issue = {len = 0x69, hash = "0xC1E3D367772E1D58", calls = [[0x6B, "0x5760AD4516307B1B", [[0x3A, "0xF25723B02F444AA0"]]], [0x3A, "0xF25723B02F444AA0", [[0x66, "0x4B871A48C19AD538"], [0x32, "0x58BD8FFBB7211769"], [0x2F, "0x787E91C0855716F2"], [0x4F, "0xACBE7A7EAD6376D8"], [0x39, "0x52B38C73180DBE3C"]]]]}
 D3D_MakeSpace = {len = 0x3A, hash = "0xF25723B02F444AA0", calls = [[0x66, "0x4B871A48C19AD538", [[0x32, "0x58BD8FFBB7211769"]]], [0x32, "0x58BD8FFBB7211769", []], [0x2F, "0x787E91C0855716F2", [[0x28, "0xB40669B96E593B42"], [0x77, "0x128371111CE6732A"]]], [0x4F, "0xACBE7A7EAD6376D8", [[0x44, "0x9EABE42469BEFD6B"], [0x35, "0x51DA9D4C6C9A95F4"], [0x2F, "0x787E91C0855716F2"], [0x3C, "0xE9E69883E9DD59F0"]]], [0x39, "0x52B38C73180DBE3C", [[0x22, "0x3B2E4326678F9861"], [0x3A, "0xF25723B02F444AA0"], [0x40, "0x358C5310639BC4D"]]]]}
+XAudioCreateSourceVoice = {len = 0x17, hash = "0x5FE354E37226F93F", calls = [[0x40, "0x234D38F2224BACF4", [[0x3C, "0xB3D13B2C25AD78AB"], [0x2B, "0xE81B7AC1B5509F0"], [0x3D, "0x740C6226F6D40283"], [0x42, "0xAE954BAB786C639B"]]]]}
+XAudioCreateSubmixVoice = {len = 0x17, hash = "0x5FE354E37226F93F", calls = [[0x43, "0x7C03A838AC32CAC7", [[0x2D, "0x4E962869F1EF48FA"], [0x2B, "0xE81B7AC1B5509F0"], [0x44, "0xBCA9FECC8EE60BCE"], [0x1A, "0x651E654EF5DC90CF"]]]]}
+XAudioInitialize = {len = 0x35, hash = "0x1D026C973EBB06FD"}
+XAudioRegisterEffects = {len = 0x22, hash = "0xE6D84C1CF9247D25", count = 2, nth = 0}
+XAudioRegisterRenderCallback = {len = 0x20, hash = "0xE135D96DE6037550", calls = [[0x5F, "0xA9FA81112759EFFD", []]]}
+XAudioShutDown = {len = 0x1F, hash = "0x69E3A7357B6B12A"}
+XAudioSourceVoice_FlushPackets = {len = 0x16, hash = "0xC5DCAA864376E389", calls = [[0x1A, "0x8C576F0B4CD91B1F", []]]}
+XAudioSourceVoice_GetPacketPosition = {len = 0x15, hash = "0x77A9289F33712072", count = 4, nth = 0}
+XAudioSourceVoice_GetStreamPosition = {len = 0x15, hash = "0x77A9289F33712072", count = 4, nth = 3}
+XAudioSourceVoice_SetPacketLoopCount = {len = 0x15, hash = "0x77A9289F33712072", count = 4, nth = 2}
+XAudioSourceVoice_SetPacketPosition = {len = 0x15, hash = "0x77A9289F33712072", count = 4, nth = 1}
+XAudioSourceVoice_SetPitch = {len = 0x1D, hash = "0xCDF89DA13B33BB08"}
+XAudioSourceVoice_Start = {len = 0x13, hash = "0x7B2202D61C693864", calls = [[0x29, "0x9607C9D5472A05C5", [[0x88, "0x110EA1CA5CE33628"], [0xCD, "0x1EFD4CF737548CAD"], [0x87, "0x494451D66F342FCA"]]]]}
+XAudioSourceVoice_SubmitPacket = {len = 0x17, hash = "0x79CE8D1CCED3EDB2"}
+XAudioUnregisterEffects = {len = 0x22, hash = "0xE6D84C1CF9247D25", count = 2, nth = 1}
+XAudioUnregisterRenderCallback = {len = 0x1F, hash = "0x5E0BCAC1EF6DB9EF", calls = [[0x62, "0x6117CE2C73003243", []]]}
+XAudioVoice_GetVoiceState = {len = 0x15, hash = "0x1D402C6E66A464C1", count = 3, nth = 2}
+XAudioVoice_GetVolume = {len = 0x10, hash = "0x30987F5E0659D67B"}
+XAudioVoice_Release = {len = 0x19, hash = "0x4183305B2BAE90F8", count = 2, nth = 1}
+XAudioVoice_SetEffectParam = {len = 0x1B, hash = "0x31FDC3A5A0C20BC5"}
+XAudioVoice_SetEffectState = {len = 0x17, hash = "0xA6E8941396D3335D"}
+XAudioVoice_SetVoiceOutput = {len = 0x15, hash = "0x1D402C6E66A464C1", count = 3, nth = 0}
+XAudioVoice_SetVoiceOutputVolume = {len = 0x15, hash = "0x1D402C6E66A464C1", count = 3, nth = 1}
+XAudioVoice_SetVolume = {len = 0x1D, hash = "0x4ACBDC2467E59811"}
+XAudioVoice_Stop = {len = 0x16, hash = "0x1FA7561376D1819"}
 
 [data]

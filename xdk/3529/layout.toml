@@ -18,6 +18,7 @@ Device_Reg2380 = 0x29D0
 Device_Writeback = 0x2A10
 Device_Fence = 0x2A1C
 Device_GpuFlags = 0x2A39
+Device_GpuFlagCpuFences = 2
 Device_VertexDeclaration = 0x2D10
 Device_IndexBuffer = 0x2F84
 Device_RenderTargets = 0x2F88
@@ -38,8 +39,10 @@ VertexDeclaration_Elements = 0x34
 # index buffer: format (bit 31 32 bit indices, endian at 29), CPU address
 IndexBuffer_Format = 0x0
 IndexBuffer_Address = 0x18
+IndexBuffer_Endian = 29
 Query_Type = 0x4
 # shader containers (0x102A11xx): the header field holding the info block's offset, then the info block
+Shader_Magic = 0x102A11
 Shader_Info = 0x18
 ShaderInfo_Code = 0x0
 ShaderInfo_CodeSize = 0x4

@@ -81,6 +81,12 @@ constexpr bool AllKnown(const LayoutKey (&keys)[N]) {
 #ifndef XDK_Device_GpuFlags
 #define XDK_Device_GpuFlags 0xFFFFFFFFu
 #endif
+#ifndef XDK_Device_GpuFlagCpuFences
+#define XDK_Device_GpuFlagCpuFences 0xFFFFFFFFu
+#endif
+#ifndef XDK_Device_KickFences
+#define XDK_Device_KickFences 0xFFFFFFFFu
+#endif
 #ifndef XDK_Device_VertexDeclaration
 #define XDK_Device_VertexDeclaration 0xFFFFFFFFu
 #endif
@@ -135,11 +141,20 @@ constexpr bool AllKnown(const LayoutKey (&keys)[N]) {
 #ifndef XDK_IndexBuffer_Address
 #define XDK_IndexBuffer_Address 0xFFFFFFFFu
 #endif
+#ifndef XDK_IndexBuffer_Endian
+#define XDK_IndexBuffer_Endian 0xFFFFFFFFu
+#endif
 #ifndef XDK_Query_Type
 #define XDK_Query_Type 0xFFFFFFFFu
 #endif
+#ifndef XDK_Shader_Magic
+#define XDK_Shader_Magic 0xFFFFFFFFu
+#endif
 #ifndef XDK_Shader_Info
 #define XDK_Shader_Info 0xFFFFFFFFu
+#endif
+#ifndef XDK_Shader_CodeSize
+#define XDK_Shader_CodeSize 0xFFFFFFFFu
 #endif
 #ifndef XDK_ShaderInfo_Code
 #define XDK_ShaderInfo_Code 0xFFFFFFFFu

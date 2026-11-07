@@ -1,2 +1,54 @@
 # XDK 2.0.2417 data layout the host reads, emitted as XDK_<name> in image_symbols.h
 [layout]
+# the device: fetch constants (32 x 6 dwords), float constants (vertex 256 float4 then pixel 256), bools, loops
+Device_FetchConstants = 0x480
+Device_VsConstants = 0x780
+Device_BoolConstants = 0x2780
+Device_LoopConstants = 0x27A0
+# the register shadow, a bank per 0x80 registers from 0x2000
+Device_Reg2000 = 0x2CC0
+Device_Reg2080 = 0x2D00
+Device_Reg2100 = 0x2D0C
+Device_Reg2180 = 0x2D60
+Device_Reg2200 = 0x2D74
+Device_Reg2280 = 0x2DA4
+Device_Reg2300 = 0x2DF8
+Device_Reg2380 = 0x2E90
+# fences: writeback block pointer ([0] last fence passed), next fence, flags (bit 4 fences written by the CPU)
+Device_Writeback = 0x2890
+Device_Fence = 0x289C
+Device_GpuFlags = 0x28C1
+Device_GpuFlagCpuFences = 4
+# the kick in MakeSpace writes the next fence
+Device_KickFences = 1
+Device_VertexDeclaration = 0x2C90
+Device_IndexBuffer = 0x30F4
+Device_RenderTargets = 0x30F8
+Device_DepthStencil = 0x3108
+Device_StreamStrides = 0x3190
+Device_PixelShader = 0x3290
+Device_VertexShader = 0x3294
+# the command ring, allocated a segment at a time: write pointer, segment end, limit, segment start
+Device_RingWrite = 0x0
+Device_RingSegmentEnd = 0x4
+Device_RingLimit = 0x8
+Device_RingSegmentStart = 0x36CC
+Texture_FetchConstant = 0x10
+VertexDeclaration_Count = 0x8
+VertexDeclaration_Elements = 0x24
+# index buffer: format (bit 31 32 bit indices), CPU address
+IndexBuffer_Format = 0x0
+IndexBuffer_Address = 0xC
+Query_Type = 0x4
+# shader containers (0x102A0Exx): the physical block is the microcode, its size in the header
+Shader_Magic = 0x102A0E
+Shader_Info = 0x14
+Shader_CodeSize = 0x8
+ShaderInfo_ProgramControl = 0x0
+ShaderInfo_ContextMisc = 0x4
+# bits 5 to 9 count the pixel inputs, or the vertex exports
+ShaderInfo_Interpolators = 0x10
+PixelInfo_Inputs = 0x20
+VertexInfo_Skip = 0x18
+VertexInfo_ElementCount = 0x1C
+VertexInfo_Elements = 0x28

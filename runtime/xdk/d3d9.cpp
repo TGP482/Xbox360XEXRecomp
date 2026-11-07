@@ -1,4 +1,4 @@
-// Direct3D 9 (XDK 3529 and builds laid out alike) entry points the title calls, implemented on the host renderer.
+// Direct3D 9 entry points the title calls, implemented on the host renderer, for the XDK builds with a layout.toml.
 // State setters, resource creation and locking stay recompiled: they fill the device's own copy of the GPU registers
 // and constants, which the draws read. Draws, clears, resolves and swaps never run the library's bodies.
 #ifndef WIN32_LEAN_AND_MEAN
@@ -57,7 +57,7 @@ constexpr uint32_t kDevRingBase = XDK_Device_RingBase;
 constexpr uint32_t kDevRingSegment = XDK_Device_RingSegment;
 constexpr uint32_t kDevRingSegmentStart = XDK_Device_RingSegmentStart;
 constexpr uint32_t kRingReserve = 0xA0;  // bytes the library keeps free at a segment's end
-constexpr uint8_t kGpuFlagCpuFences = 2;  // the library writes its fences to the writeback itself
+constexpr uint8_t kGpuFlagCpuFences = uint8_t(XDK_Device_GpuFlagCpuFences);  // the library writes its own fences
 
 // D3DDevice_ClearF flags, and Resolve's
 constexpr uint32_t kClearDepth = 0x10;
@@ -78,16 +78,25 @@ void RequireLayout() {
                 XDK_KEY(Device_LoopConstants), XDK_KEY(Device_Reg2000), XDK_KEY(Device_Reg2080),
                 XDK_KEY(Device_Reg2100), XDK_KEY(Device_Reg2180), XDK_KEY(Device_Reg2200), XDK_KEY(Device_Reg2280),
                 XDK_KEY(Device_Reg2300), XDK_KEY(Device_Reg2380), XDK_KEY(Device_Writeback), XDK_KEY(Device_Fence),
-                XDK_KEY(Device_GpuFlags), XDK_KEY(Device_VertexDeclaration), XDK_KEY(Device_IndexBuffer),
-                XDK_KEY(Device_RenderTargets), XDK_KEY(Device_DepthStencil), XDK_KEY(Device_StreamStrides),
-                XDK_KEY(Device_PixelShader), XDK_KEY(Device_VertexShader), XDK_KEY(Device_RingWrite),
-                XDK_KEY(Device_RingSegmentEnd), XDK_KEY(Device_RingLimit), XDK_KEY(Device_RingBase),
-                XDK_KEY(Device_RingSegment), XDK_KEY(Device_RingSegmentStart), XDK_KEY(Texture_FetchConstant),
+                XDK_KEY(Device_GpuFlags), XDK_KEY(Device_GpuFlagCpuFences), XDK_KEY(Device_VertexDeclaration),
+                XDK_KEY(Device_IndexBuffer), XDK_KEY(Device_RenderTargets), XDK_KEY(Device_DepthStencil),
+                XDK_KEY(Device_StreamStrides), XDK_KEY(Device_PixelShader), XDK_KEY(Device_VertexShader),
+                XDK_KEY(Device_RingWrite), XDK_KEY(Device_RingSegmentStart), XDK_KEY(Texture_FetchConstant),
                 XDK_KEY(VertexDeclaration_Count), XDK_KEY(VertexDeclaration_Elements), XDK_KEY(IndexBuffer_Format),
-                XDK_KEY(IndexBuffer_Address), XDK_KEY(Query_Type), XDK_KEY(Shader_Info), XDK_KEY(ShaderInfo_Code),
-                XDK_KEY(ShaderInfo_CodeSize), XDK_KEY(ShaderInfo_ProgramControl), XDK_KEY(ShaderInfo_ContextMisc),
-                XDK_KEY(ShaderInfo_Interpolators), XDK_KEY(PixelInfo_Inputs), XDK_KEY(VertexInfo_Skip),
-                XDK_KEY(VertexInfo_ElementCount), XDK_KEY(VertexInfo_OutputCount), XDK_KEY(VertexInfo_Elements));
+                XDK_KEY(IndexBuffer_Address), XDK_KEY(Query_Type), XDK_KEY(Shader_Magic), XDK_KEY(Shader_Info),
+                XDK_KEY(ShaderInfo_ProgramControl), XDK_KEY(ShaderInfo_ContextMisc), XDK_KEY(ShaderInfo_Interpolators),
+                XDK_KEY(PixelInfo_Inputs), XDK_KEY(VertexInfo_Skip), XDK_KEY(VertexInfo_ElementCount),
+                XDK_KEY(VertexInfo_Elements));
+    // the microcode: placed by the info block, or the whole physical block
+    if constexpr (XDK_ShaderInfo_Code != xdk::kUnknown) {
+        XDK_REQUIRE("d3d9", XDK_KEY(ShaderInfo_CodeSize));
+    } else {
+        XDK_REQUIRE("d3d9", XDK_KEY(Shader_CodeSize));
+    }
+    // one ring with a base, or segments allocated as needed
+    if constexpr (kDevRingBase != xdk::kUnknown) {
+        XDK_REQUIRE("d3d9", XDK_KEY(Device_RingSegment), XDK_KEY(Device_RingSegmentEnd), XDK_KEY(Device_RingLimit));
+    }
 }
 
 gpu::Backend* Backend() {
@@ -128,19 +137,32 @@ std::vector<uint32_t> ReadWords(uint32_t at, uint32_t n) {
 
 // a shader container: a virtual block (header, constant table, info) then the physical block holding the microcode
 bool ReadContainer(uint32_t c, bool vertex, ShaderEntry& e) {
-    constexpr uint32_t kMagic = 0x102A11;
     constexpr uint32_t kMaxBytes = 0x100000;
     uint32_t virtual_size = R32(c + 4);
-    if (R32(c) >> 8 != kMagic || virtual_size > kMaxBytes) return false;
+    if (R32(c) >> 8 != XDK_Shader_Magic || virtual_size > kMaxBytes) return false;
     uint32_t info = c + R32(c + XDK_Shader_Info);
-    uint32_t code_bytes = R32(info + XDK_ShaderInfo_CodeSize);
+    uint32_t code_at = c + virtual_size;
+    uint32_t code_bytes = 0;
+    if constexpr (XDK_ShaderInfo_Code != xdk::kUnknown) {
+        code_at += R32(info + XDK_ShaderInfo_Code);
+        code_bytes = R32(info + XDK_ShaderInfo_CodeSize);
+    } else {
+        code_bytes = R32(c + XDK_Shader_CodeSize);
+    }
     if (code_bytes > kMaxBytes) return false;
-    std::vector<uint32_t> code = ReadWords(c + virtual_size + R32(info + XDK_ShaderInfo_Code), code_bytes / 4);
+    std::vector<uint32_t> code = ReadWords(code_at, code_bytes / 4);
     if (vertex) {
         uint32_t elements = info + XDK_VertexInfo_Elements + R32(info + XDK_VertexInfo_Skip) * 4;
         uint32_t count = std::min<uint32_t>(R32(info + XDK_VertexInfo_ElementCount), 64);
+        // the exports follow the elements, counted in their own field or the interpolator word
+        uint32_t outputs = 0;
+        if constexpr (XDK_VertexInfo_OutputCount != xdk::kUnknown) {
+            outputs = R32(info + XDK_VertexInfo_OutputCount);
+        } else {
+            outputs = R32(info + XDK_ShaderInfo_Interpolators) >> 5 & 31;
+        }
         e.elements = ReadWords(elements, count);
-        e.outputs = ReadWords(elements + count * 4, std::min<uint32_t>(R32(info + XDK_VertexInfo_OutputCount), 16));
+        e.outputs = ReadWords(elements + count * 4, std::min<uint32_t>(outputs, 16));
     } else {
         uint32_t count = R32(info + XDK_ShaderInfo_Interpolators) >> 5 & 31;
         e.outputs = ReadWords(info + XDK_PixelInfo_Inputs, std::min<uint32_t>(count, 16));
@@ -334,7 +356,12 @@ HLE_FUNC(D3DDevice_DrawIndexedVertices) {
     d.base_vertex = int32_t(a[2]);
     d.count = a[4];
     d.index32 = format >> 31 & 1;
-    d.index_endian = format >> 29 & 3;
+    // the format's endian where the library keeps one, else the index size's
+    if constexpr (XDK_IndexBuffer_Endian != xdk::kUnknown) {
+        d.index_endian = format >> XDK_IndexBuffer_Endian & 3;
+    } else {
+        d.index_endian = d.index32 ? 2 : 1;
+    }
     d.indices = static_cast<const uint8_t*>(HostPtr(R32(ib + XDK_IndexBuffer_Address) + a[3] * (d.index32 ? 4 : 2)));
     Draw(a[0], d);
     return 0;
@@ -349,6 +376,8 @@ HLE_FUNC(D3DDevice_DrawVerticesUP) {
     return 0;
 }
 
+// entry points some XDK builds lack
+#ifdef SUB_D3DDevice_DrawIndexedVerticesUP
 // (device, primitive, min vertex index, vertex count, index count, index data, index format, vertex data, stride)
 HLE_FUNC(D3DDevice_DrawIndexedVerticesUP) {
     constexpr uint32_t kIndex32 = 4;  // the format's bit for D3DFMT_INDEX32
@@ -364,7 +393,9 @@ HLE_FUNC(D3DDevice_DrawIndexedVerticesUP) {
     Draw(a[0], d, a[7], (a[2] + a[3]) * stride, stride);
     return 0;
 }
+#endif
 
+#ifdef SUB_D3DDevice_ClearF
 // (device, flags, rect, colour float4, f1 z, r8 stencil): flags bits 0 to 3 the colour targets, 0x10 z, 0x20 stencil
 HLE_FUNC(D3DDevice_ClearF) {
     uint32_t dev = a[0];
@@ -387,6 +418,7 @@ HLE_FUNC(D3DDevice_ClearF) {
     backend->Clear(s, flags, color, float(a.Float(0)), a[5], a[2] ? &rect : nullptr);
     return 0;
 }
+#endif
 
 // (device, flags, source rect, destination texture, destination point, level, slice, clear colour, f1 clear z,
 // clear stencil)
@@ -453,12 +485,18 @@ HLE_FUNC(D3DDevice_Swap) {
 HLE_FUNC(D3D_MakeSpace) {
     uint32_t dev = a[0];
     UseCpuFences(dev);
-    uint32_t ring = R32(dev + kDevRingBase);
-    uint32_t segment = R32(dev + kDevRingSegment) & ~3u;
-    W32(dev + kDevRingSegmentStart, ring);
-    W32(dev + kDevRingWrite, ring - 4);
-    W32(dev + kDevRingSegmentEnd, ring + segment);
-    W32(dev + kDevRingLimit, ring + segment - kRingReserve);
+    if constexpr (kDevRingBase != xdk::kUnknown) {
+        uint32_t ring = R32(dev + kDevRingBase);
+        uint32_t segment = R32(dev + kDevRingSegment) & ~3u;
+        W32(dev + kDevRingSegmentStart, ring);
+        W32(dev + kDevRingWrite, ring - 4);
+        W32(dev + kDevRingSegmentEnd, ring + segment);
+        W32(dev + kDevRingLimit, ring + segment - kRingReserve);
+    } else {
+        W32(dev + kDevRingWrite, R32(dev + kDevRingSegmentStart) - 4);
+    }
+    // the fence the library's kick would have written
+    if constexpr (XDK_Device_KickFences == 1) W32(dev + kDevFence, R32(dev + kDevFence) + 2);
     uint32_t writeback = R32(dev + kDevWriteback);
     if (writeback) W32(writeback, R32(dev + kDevFence) - 2);
     return R32(dev + kDevRingWrite);

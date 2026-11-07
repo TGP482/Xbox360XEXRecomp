@@ -82,8 +82,8 @@ uint32_t Be32(const uint8_t* p) {
     return __builtin_bswap32(v);
 }
 
-// a GPU (physical) address as the host sees it
-const uint8_t* Gpu(uint32_t address) { return mem::Base() + mem::kPhysical64k + (address & (mem::kPhysicalSize - 1)); }
+// the title's Direct3D keeps CPU addresses in its fetch constants and objects
+const uint8_t* Guest(uint32_t address) { return mem::Base() + address; }
 
 D3D12_RESOURCE_DESC BufferDesc(uint64_t bytes) {
     D3D12_RESOURCE_DESC d{};
@@ -288,8 +288,8 @@ public:
     Shader* CreateShader(ShaderStage stage, const uint32_t* code, size_t dwords) override;
     const ShaderInfo& Info(const Shader* s) const override { return s->info; }
     void Draw(const State& s, const DrawArgs& a) override;
-    void Clear(const State& s, uint32_t flags, uint32_t color, float z, uint32_t stencil, const Rect* rects,
-               uint32_t count) override;
+    void Clear(const State& s, uint32_t flags, const float color[4], float z, uint32_t stencil,
+               const Rect* rect) override;
     void Resolve(const State& s, const ResolveArgs& r) override;
     void Present(const uint32_t front[6]) override;
     uint32_t BeginQuery() override;
@@ -325,7 +325,7 @@ private:
     D3D12_GPU_VIRTUAL_ADDRESS UploadConstants(const void* data, uint32_t size);
     uint32_t AllocViews(uint32_t n);
     D3D12_CPU_DESCRIPTOR_HANDLE ViewCpu(uint32_t i) const;
-    D3D12_GPU_DESCRIPTOR_HANDLE ViewGpu(uint32_t i) const;
+    D3D12_GPU_DESCRIPTOR_HANDLE ViewGuest(uint32_t i) const;
     D3D12_CPU_DESCRIPTOR_HANDLE Rtv(uint32_t i) const;
     D3D12_CPU_DESCRIPTOR_HANDLE Dsv(uint32_t i) const;
 
@@ -343,7 +343,7 @@ private:
 
     // shaders and pipelines
     Variant* EnsureVariant(Shader* s, const ShaderOptions& opt);
-    ID3D12PipelineState* EnsurePipeline(const PipelineKey& k, const Variant& vs, const Variant& ps);
+    ID3D12PipelineState* EnsurePipeline(const PipelineKey& k, const Variant& vs, const Variant* ps);
     void FillPipelineDesc(const PipelineKey& k, D3D12_GRAPHICS_PIPELINE_STATE_DESC& d) const;
     ID3D12PipelineState* EnsureResolvePipeline(DXGI_FORMAT rtv, bool ms);
 
@@ -361,7 +361,8 @@ private:
     // draws
     bool BindTargets(const State& s, const ShaderInfo& ps, PipelineKey& k, uint32_t& w, uint32_t& h);
     void FillDrawConstants(const State& s, uint32_t w, uint32_t h, DrawConstants& c) const;
-    D3D12_RECT ScissorRect(const State& s, uint32_t w, uint32_t h) const;
+    Rect GuestScissor(const State& s, uint32_t w, uint32_t h) const;
+    D3D12_RECT HostRect(const Rect& r) const;
     bool UploadIndices(const DrawArgs& a, D3D12_PRIMITIVE_TOPOLOGY& topo, uint32_t& count, uint32_t& min,
                        uint32_t& max);
     D3D12_GPU_VIRTUAL_ADDRESS UploadStreams(const DrawArgs& a, const ShaderInfo& vs, uint32_t min, uint32_t max);
@@ -697,7 +698,7 @@ uint32_t D3D12Backend::AllocViews(uint32_t n) {
 D3D12_CPU_DESCRIPTOR_HANDLE D3D12Backend::ViewCpu(uint32_t i) const {
     return {view_heap_->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T(i) * view_inc_};
 }
-D3D12_GPU_DESCRIPTOR_HANDLE D3D12Backend::ViewGpu(uint32_t i) const {
+D3D12_GPU_DESCRIPTOR_HANDLE D3D12Backend::ViewGuest(uint32_t i) const {
     return {view_heap_->GetGPUDescriptorHandleForHeapStart().ptr + UINT64(i) * view_inc_};
 }
 D3D12_CPU_DESCRIPTOR_HANDLE D3D12Backend::Rtv(uint32_t i) const {
@@ -827,7 +828,7 @@ void D3D12Backend::ClearTarget(Target& t, uint32_t flags, const float color[4], 
         Transition(t.res.Get(), t.state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
         // depth is held reversed
         cl_->ClearDepthStencilView(Dsv(t.view), f, 1 - z, stencil, count, rects);
-    } else if (flags & kClearTarget) {
+    } else if (flags & kClearColors) {
         Transition(t.res.Get(), t.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
         cl_->ClearRenderTargetView(Rtv(t.view), color, count, rects);
     }
@@ -938,14 +939,14 @@ void D3D12Backend::FillPipelineDesc(const PipelineKey& k, D3D12_GRAPHICS_PIPELIN
     d.SampleDesc.Count = k.samples;
 }
 
-ID3D12PipelineState* D3D12Backend::EnsurePipeline(const PipelineKey& k, const Variant& vs, const Variant& ps) {
+ID3D12PipelineState* D3D12Backend::EnsurePipeline(const PipelineKey& k, const Variant& vs, const Variant* ps) {
     uint64_t key = Hash64(&k, sizeof(k));
     auto it = pipelines_.find(key);
     if (it != pipelines_.end()) return it->second.Get();
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d{};
     FillPipelineDesc(k, d);
     d.VS = {vs.dxil.data(), vs.dxil.size()};
-    d.PS = {ps.dxil.data(), ps.dxil.size()};
+    if (ps) d.PS = {ps->dxil.data(), ps->dxil.size()};
     wchar_t name[24];
     swprintf(name, 24, L"%016llx", static_cast<unsigned long long>(key));
     ComPtr<ID3D12PipelineState> pso;
@@ -994,7 +995,7 @@ uint64_t GuestHash(const xenos::TextureFetch& t, const std::vector<xenos::Level>
     for (const xenos::Level& l : levels) {
         uint64_t bytes = uint64_t(l.pitch_blocks) * l.rows_blocks * fi.bytes;
         uint64_t total = l.face_stride ? uint64_t(l.face_stride) * (t.depth - 1) + bytes : bytes;
-        h = Hash64(Gpu(l.address), size_t(std::min<uint64_t>(total, mem::kPhysicalSize)), h);
+        h = Hash64(Guest(l.address), size_t(std::min<uint64_t>(total, UINT32_MAX - l.address)), h);
     }
     return h;
 }
@@ -1059,7 +1060,7 @@ void D3D12Backend::UploadTexture(Texture& tex, const xenos::TextureFetch& t) {
     std::vector<xenos::Level> levels = xenos::Levels(t);
     bool volume = t.dimension == xenos::Dimension::D3;
     uint32_t faces = volume ? 1 : t.depth;
-    const uint8_t* physical = mem::Base() + mem::kPhysical64k;
+    const uint8_t* memory = mem::Base();
     Transition(tex.res.Get(), tex.state, D3D12_RESOURCE_STATE_COPY_DEST);
     D3D12_RESOURCE_DESC desc = tex.res->GetDesc();
     std::vector<uint8_t> rows;
@@ -1075,7 +1076,7 @@ void D3D12Backend::UploadTexture(Texture& tex, const xenos::TextureFetch& t) {
             uint32_t planes = volume ? fp.Footprint.Depth : 1;
             for (uint32_t z = 0; z < planes; z++) {
                 uint32_t pitch = 0;
-                xenos::LoadLevel(physical, t, levels[l], volume ? z : face, rows, pitch);
+                xenos::LoadLevel(memory, t, levels[l], volume ? z : face, rows, pitch);
                 CopyRows(rows, pitch, fp, row_count, row_size, z, a.cpu);
             }
             fp.Offset = a.offset;
@@ -1290,7 +1291,8 @@ void D3D12Backend::FillDrawConstants(const State& s, uint32_t w, uint32_t h, Dra
     c.vpos_scale = 1 / scale_;
 }
 
-D3D12_RECT D3D12Backend::ScissorRect(const State& s, uint32_t w, uint32_t h) const {
+// the window scissor in the target's pixels, within w x h
+Rect D3D12Backend::GuestScissor(const State& s, uint32_t w, uint32_t h) const {
     uint32_t tl = s.Reg(kPaScWindowScissorTl);
     uint32_t br = s.Reg(kPaScWindowScissorBr);
     int32_t x1 = Bits(tl, 0, 15);
@@ -1304,8 +1306,12 @@ D3D12_RECT D3D12Backend::ScissorRect(const State& s, uint32_t w, uint32_t h) con
         y1 += SignedBits(wo, 16, 15);
         y2 += SignedBits(wo, 16, 15);
     }
-    auto px = [&](int32_t v, uint32_t limit) { return LONG(std::clamp(v, 0, int32_t(limit)) * scale_); };
-    return {px(x1, w), px(y1, h), px(x2, w), px(y2, h)};
+    auto clamp = [](int32_t v, uint32_t limit) { return std::clamp(v, 0, int32_t(limit)); };
+    return {clamp(x1, w), clamp(y1, h), clamp(x2, w), clamp(y2, h)};
+}
+
+D3D12_RECT D3D12Backend::HostRect(const Rect& r) const {
+    return {LONG(r.x1 * scale_), LONG(r.y1 * scale_), LONG(r.x2 * scale_), LONG(r.y2 * scale_)};
 }
 
 // indices into the upload ring as the host draws them: byte order fixed, fans, quads and loops made lists
@@ -1313,7 +1319,7 @@ bool D3D12Backend::UploadIndices(const DrawArgs& a, D3D12_PRIMITIVE_TOPOLOGY& to
                                  uint32_t& max) {
     std::vector<uint32_t> src(a.count);
     if (a.indices) {
-        const uint8_t* p = Gpu(a.indices);
+        const uint8_t* p = Guest(a.indices);
         for (uint32_t i = 0; i < a.count; i++) {
             if (a.index32) {
                 uint32_t v;
@@ -1396,7 +1402,7 @@ D3D12_GPU_VIRTUAL_ADDRESS D3D12Backend::UploadStreams(const DrawArgs& a, const S
                 static bool logged = false;
                 if (!std::exchange(logged, true)) LOGR("D3D12: vertex data past the upload ring reads as zero");
             }
-            if (bytes) std::memcpy(v.cpu, Gpu(sf.base) + first, size_t(bytes));
+            if (bytes) std::memcpy(v.cpu, Guest(sf.base) + first, size_t(bytes));
             it = copied.emplace(key, uint32_t(v.offset - first)).first;
         }
         c.address += it->second;
@@ -1444,8 +1450,8 @@ void D3D12Backend::BindViews(const State& s, const ShaderInfo& vs, const ShaderI
     raw.Buffer.NumElements = UINT(kUploadSize / 4);
     raw.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
     dev_->CreateShaderResourceView(CurrentFrame().upload.Get(), &raw, ViewCpu(vs_views));
-    cl_->SetGraphicsRootDescriptorTable(kRootVsViews, ViewGpu(vs_views));
-    cl_->SetGraphicsRootDescriptorTable(kRootPsViews, ViewGpu(ps_views));
+    cl_->SetGraphicsRootDescriptorTable(kRootVsViews, ViewGuest(vs_views));
+    cl_->SetGraphicsRootDescriptorTable(kRootPsViews, ViewGuest(ps_views));
     cl_->SetGraphicsRootDescriptorTable(kRootVsSamplers, vs_samplers);
     cl_->SetGraphicsRootDescriptorTable(kRootPsSamplers, ps_samplers);
 }
@@ -1459,7 +1465,7 @@ D3D12_PRIMITIVE_TOPOLOGY_TYPE TopologyType(D3D12_PRIMITIVE_TOPOLOGY topo) {
 }
 
 void D3D12Backend::Draw(const State& s, const DrawArgs& a) {
-    if (!s.vs || !s.ps || !s.consts || !s.fetch || !a.count) return;
+    if (!s.vs || !s.consts || !s.fetch || !a.count) return;
     // a cull of both faces draws nothing
     if (Bits(s.Reg(kPaSuScModeCntl), 0, 2) == 3) return;
     ShaderOptions vs_opt;
@@ -1468,16 +1474,19 @@ void D3D12Backend::Draw(const State& s, const DrawArgs& a) {
     ps_opt.vpos_reg = s.link.vpos_reg;
     ps_opt.alpha_test = Bits(s.Reg(kRbColorControl), 3, 1) && Bits(s.Reg(kRbColorControl), 0, 3) != 7;
     Variant* vs = EnsureVariant(s.vs, vs_opt);
-    Variant* ps = EnsureVariant(s.ps, ps_opt);
-    if (!vs || !ps || (!vs->info.fetches.empty() && !a.streams)) return;
-    BindViews(s, vs->info, ps->info);
+    // no pixel shader: a depth only draw
+    Variant* ps = s.ps ? EnsureVariant(s.ps, ps_opt) : nullptr;
+    if (!vs || (s.ps && !ps) || (!vs->info.fetches.empty() && !a.streams)) return;
+    static const ShaderInfo kNoPixelShader;
+    const ShaderInfo& ps_info = ps ? ps->info : kNoPixelShader;
+    BindViews(s, vs->info, ps_info);
 
     PipelineKey k;
     k.vs = Hash64(&vs_opt, sizeof(vs_opt), uintptr_t(s.vs));
-    k.ps = Hash64(&ps_opt, sizeof(ps_opt), uintptr_t(s.ps));
+    k.ps = ps ? Hash64(&ps_opt, sizeof(ps_opt), uintptr_t(s.ps)) : 0;
     uint32_t w = 0;
     uint32_t h = 0;
-    if (!BindTargets(s, ps->info, k, w, h)) return;
+    if (!BindTargets(s, ps_info, k, w, h)) return;
     FillKeyStates(s, k);
     if (!k.ds_format) k.depth_control = 0;
     D3D12_PRIMITIVE_TOPOLOGY topo;
@@ -1489,14 +1498,14 @@ void D3D12Backend::Draw(const State& s, const DrawArgs& a) {
     bool strip = topo == D3D_PRIMITIVE_TOPOLOGY_LINESTRIP || topo == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
     // PA_SU_SC_MODE_CNTL multi_prim_ib_ena: strips restart at an all ones index
     if (strip && Bits(s.Reg(kPaSuScModeCntl), 21, 1)) k.strip_cut = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF;
-    ID3D12PipelineState* pso = EnsurePipeline(k, *vs, *ps);
+    ID3D12PipelineState* pso = EnsurePipeline(k, *vs, ps);
     if (!pso) return;
 
     DrawConstants c;
     FillDrawConstants(s, w, h, c);
     BindConstants(s, UploadStreams(a, vs->info, min, max), c);
     D3D12_VIEWPORT vp{0, 0, std::ceil(w * scale_), std::ceil(h * scale_), 0, 1};
-    D3D12_RECT sc = ScissorRect(s, w, h);
+    D3D12_RECT sc = HostRect(GuestScissor(s, w, h));
     cl_->RSSetViewports(1, &vp);
     cl_->RSSetScissorRects(1, &sc);
     float blend[4];
@@ -1510,24 +1519,27 @@ void D3D12Backend::Draw(const State& s, const DrawArgs& a) {
     if (ext_) ext_->EndDraw(*this, s);
 }
 
-// D3D Clear: the bound targets, then the targets their EDRAM range holds
-void D3D12Backend::Clear(const State& s, uint32_t flags, uint32_t color, float z, uint32_t stencil, const Rect* rects,
-                         uint32_t count) {
+// D3D Clear, within the scissor: a whole target clear also clears the targets its EDRAM range holds
+void D3D12Backend::Clear(const State& s, uint32_t flags, const float color[4], float z, uint32_t stencil,
+                         const Rect* rect) {
     uint32_t height = TargetHeight(s);
-    float rgba[4] = {Bits(color, 16, 8) / 255.0f, Bits(color, 8, 8) / 255.0f, Bits(color, 0, 8) / 255.0f,
-                     Bits(color, 24, 8) / 255.0f};
-    std::vector<D3D12_RECT> host(count);
-    for (uint32_t i = 0; i < count; i++) {
-        host[i] = {LONG(rects[i].x1 * scale_), LONG(rects[i].y1 * scale_), LONG(rects[i].x2 * scale_),
-                   LONG(rects[i].y2 * scale_)};
+    uint32_t width = SurfacePitch(s);
+    Rect r = GuestScissor(s, width, height);
+    if (rect) {
+        r = {std::max(r.x1, rect->x1), std::max(r.y1, rect->y1), std::min(r.x2, rect->x2), std::min(r.y2, rect->y2)};
     }
-    auto clear = [&](Target* t) {
+    if (r.x1 >= r.x2 || r.y1 >= r.y2) return;
+    bool whole = r.x1 == 0 && r.y1 == 0 && r.x2 == int32_t(width) && r.y2 == int32_t(height);
+    D3D12_RECT host = HostRect(r);
+    auto clear = [&](Target* t, uint32_t which) {
         if (!t) return;
-        ClearTarget(*t, flags, rgba, z, uint8_t(stencil), count ? host.data() : nullptr, count);
-        if (!count) ClearSpan(*t, flags, rgba, z, uint8_t(stencil));
+        ClearTarget(*t, which, color, z, uint8_t(stencil), whole ? nullptr : &host, whole ? 0 : 1);
+        if (whole) ClearSpan(*t, which, color, z, uint8_t(stencil));
     };
-    if (flags & kClearTarget) clear(ColorTarget(s, 0, height));
-    if (flags & (kClearZ | kClearStencil)) clear(DepthTarget(s, height));
+    for (uint32_t i = 0; i < 4; i++) {
+        if (flags >> i & 1) clear(ColorTarget(s, i, height), 1u << i);
+    }
+    if (flags & (kClearZ | kClearStencil)) clear(DepthTarget(s, height), flags & (kClearZ | kClearStencil));
 }
 
 // D3D Resolve: the target's rect to the texture at dst_base, held on the host and read in place of guest memory
@@ -1565,10 +1577,8 @@ void D3D12Backend::Resolve(const State& s, const ResolveArgs& r) {
         if (!std::exchange(logged, true)) LOGR("D3D12: resolve to format %u left out", r.dst_format);
     }
     if (src && r.clear) {
-        float rgba[4] = {Bits(r.clear_color, 16, 8) / 255.0f, Bits(r.clear_color, 8, 8) / 255.0f,
-                         Bits(r.clear_color, 0, 8) / 255.0f, Bits(r.clear_color, 24, 8) / 255.0f};
-        ClearTarget(*src, r.clear, rgba, r.clear_z, uint8_t(r.clear_stencil), nullptr, 0);
-        ClearSpan(*src, r.clear, rgba, r.clear_z, uint8_t(r.clear_stencil));
+        ClearTarget(*src, r.clear, r.clear_color, r.clear_z, uint8_t(r.clear_stencil), nullptr, 0);
+        ClearSpan(*src, r.clear, r.clear_color, r.clear_z, uint8_t(r.clear_stencil));
     }
 }
 
@@ -1598,7 +1608,7 @@ void D3D12Backend::CopyResolve(Target& src, Resolved& dst, const ResolveArgs& r)
     cl_->SetPipelineState(pso);
     cl_->SetGraphicsRootConstantBufferView(kRootVsConsts, addr);
     cl_->SetGraphicsRootConstantBufferView(kRootPsConsts, addr);
-    cl_->SetGraphicsRootDescriptorTable(kRootPsViews, ViewGpu(views));
+    cl_->SetGraphicsRootDescriptorTable(kRootPsViews, ViewGuest(views));
     cl_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
     cl_->DrawInstanced(4, 1, 0, 0);
     const_hash_[kRootVsConsts] = const_hash_[kRootPsConsts] = 0;
@@ -1650,7 +1660,7 @@ void D3D12Backend::BlitToSwap(ID3D12Resource* src, D3D12_RESOURCE_STATES& state,
     cl_->SetPipelineState(pso);
     cl_->SetGraphicsRootConstantBufferView(kRootVsConsts, addr);
     cl_->SetGraphicsRootConstantBufferView(kRootPsConsts, addr);
-    cl_->SetGraphicsRootDescriptorTable(kRootPsViews, ViewGpu(views));
+    cl_->SetGraphicsRootDescriptorTable(kRootPsViews, ViewGuest(views));
     cl_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
     cl_->DrawInstanced(4, 1, 0, 0);
 }

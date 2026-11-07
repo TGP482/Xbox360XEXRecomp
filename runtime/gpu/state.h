@@ -5,7 +5,8 @@
 #include "gpu/shaders.h"
 
 // What the title's Direct3D keeps for a draw: its own copy of the GPU registers it set, its constant banks and its
-// fetch constants. The renderer translates these to D3D12; nothing here models the console's GPU.
+// fetch constants, whose addresses are CPU addresses. The renderer translates these to D3D12; nothing here models the
+// console's GPU.
 namespace gpu {
 
 // register numbers as the XDK's register shadow names them
@@ -72,7 +73,7 @@ enum : uint32_t {
     kPrimQuadList = 13,
 };
 
-// where a vertex fetch reads: the stream's vertex 0 in guest memory and the bytes it holds
+// where a vertex fetch reads: the stream's vertex 0 (a CPU address) and the bytes it holds
 struct StreamFetch {
     uint32_t base = 0;
     uint32_t size = 0;
@@ -84,15 +85,15 @@ struct DrawArgs {
     uint32_t prim = kPrimTriangleList;
     uint32_t count = 0;        // vertices or indices
     uint32_t start = 0;        // first vertex of a draw without indices
-    uint32_t indices = 0;      // guest address of the first index, 0 without
+    uint32_t indices = 0;      // CPU address of the first index, 0 without
     bool index32 = false;
     uint32_t index_endian = 0;  // xenos::Endian
     int32_t base_vertex = 0;
     const StreamFetch* streams = nullptr;  // one per entry of the vertex shader's ShaderInfo::fetches
 };
 
-// D3DCLEAR flags
-enum : uint32_t { kClearTarget = 1, kClearZ = 2, kClearStencil = 4 };
+// D3DDevice_ClearF flags: a bit per colour target, then depth and stencil
+enum : uint32_t { kClearColors = 0xF, kClearZ = 0x10, kClearStencil = 0x20 };
 
 struct Rect {
     int32_t x1, y1, x2, y2;
@@ -102,14 +103,14 @@ struct Rect {
 struct ResolveArgs {
     uint32_t source = 0;  // colour target 0 to 3, 4 the depth target
     Rect rect{};          // in the target's pixels
-    uint32_t dst_base = 0;
+    uint32_t dst_base = 0;  // CPU address
     uint32_t dst_format = 6;  // xenos::TexFormat
     uint32_t dst_pitch = 0;   // texels
     uint32_t dst_height = 0;
     int32_t dst_x = 0;
     int32_t dst_y = 0;
     uint32_t clear = 0;  // kClear* after the copy
-    uint32_t clear_color = 0;
+    float clear_color[4] = {};
     float clear_z = 1;
     uint32_t clear_stencil = 0;
 };

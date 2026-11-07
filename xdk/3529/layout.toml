@@ -1,2 +1,53 @@
 # XDK 2.0.3529 data layout the host reads, emitted as XDK_<name> in image_symbols.h
 [layout]
+# the device: fetch constants (32 x 6 dwords), float constants (vertex 256 float4 then pixel 256), bools, loops
+Device_FetchConstants = 0x400
+Device_VsConstants = 0x700
+Device_BoolConstants = 0x2700
+Device_LoopConstants = 0x2720
+# the register shadow, a bank per 0x80 registers from 0x2000
+Device_Reg2000 = 0x2800
+Device_Reg2080 = 0x2840
+Device_Reg2100 = 0x284C
+Device_Reg2180 = 0x28A0
+Device_Reg2200 = 0x28B4
+Device_Reg2280 = 0x28E4
+Device_Reg2300 = 0x2938
+Device_Reg2380 = 0x29D0
+# fences: writeback block pointer ([0] last fence passed), next fence, flags (bit 1 fences written by the CPU)
+Device_Writeback = 0x2A10
+Device_Fence = 0x2A1C
+Device_GpuFlags = 0x2A39
+Device_VertexDeclaration = 0x2D10
+Device_IndexBuffer = 0x2F84
+Device_RenderTargets = 0x2F88
+Device_DepthStencil = 0x2F98
+Device_StreamStrides = 0x2FE0
+Device_PixelShader = 0x3080
+Device_VertexShader = 0x3084
+# the command ring: write pointer, segment end, limit, base, segment size, segment start
+Device_RingWrite = 0x28
+Device_RingSegmentEnd = 0x2C
+Device_RingLimit = 0x30
+Device_RingBase = 0x34AC
+Device_RingSegment = 0x34B4
+Device_RingSegmentStart = 0x34C4
+Texture_FetchConstant = 0x1C
+VertexDeclaration_Count = 0x18
+VertexDeclaration_Elements = 0x34
+# index buffer: format (bit 31 32 bit indices, endian at 29), CPU address
+IndexBuffer_Format = 0x0
+IndexBuffer_Address = 0x18
+Query_Type = 0x4
+# shader containers (0x102A11xx): the header field holding the info block's offset, then the info block
+Shader_Info = 0x18
+ShaderInfo_Code = 0x0
+ShaderInfo_CodeSize = 0x4
+ShaderInfo_ProgramControl = 0x8
+ShaderInfo_ContextMisc = 0xC
+ShaderInfo_Interpolators = 0x14
+PixelInfo_Inputs = 0x20
+VertexInfo_Skip = 0x18
+VertexInfo_ElementCount = 0x1C
+VertexInfo_OutputCount = 0x20
+VertexInfo_Elements = 0x24

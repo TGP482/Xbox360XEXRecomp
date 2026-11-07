@@ -653,12 +653,12 @@ void Translator::EmitExport(const Alu& a, bool vector, bool scalar) {
     }
 }
 
-// dst.c = src's selected component, 0 or 1, per the fetch's 3 bit selects; 6 and 7 leave the component
+// dst.c = src's selected component per the fetch's 3 bit selects: 0 to 3, 4 and 6 zero, 5 one, 7 leaves it
 void Translator::EmitWrite(const std::string& dst, uint32_t swizzle, const char* src) {
     for (uint32_t i = 0; i < 4; i++) {
         uint32_t s = Bits(swizzle, 3 * i, 3);
         if (s < 4) Line(F("%s.%c = %s.%c;", dst.c_str(), kComp[i], src, kComp[s]));
-        else if (s == 4 || s == 5) Line(F("%s.%c = %u;", dst.c_str(), kComp[i], s - 4));
+        else if (s != 7) Line(F("%s.%c = %u;", dst.c_str(), kComp[i], s == 5 ? 1u : 0u));
     }
 }
 

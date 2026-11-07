@@ -88,6 +88,8 @@ void CodeGen::WriteSymbols(std::vector<uint32_t>& absent) const {
         uint32_t a = va ? va : kAbsentBase + uint32_t(absent.size());
         if (!va) absent.push_back(a);
         s += Fmt("#define SYM_%s 0x%08X\n#define HAS_%s %d\n", name.c_str(), a, name.c_str(), va ? 1 : 0);
+        // the function and its recompiled body by name, for host overrides (xdk/hle.h)
+        s += Fmt("#define SUB_%s sub_%08X\n#define IMP_%s __imp__sub_%08X\n", name.c_str(), a, name.c_str(), a);
     }
     for (auto& [name, va] : an_.cfg.data)
         s += Fmt("#define SYM_%s 0x%08X\n#define HAS_%s %d\n", name.c_str(), va, name.c_str(), va ? 1 : 0);

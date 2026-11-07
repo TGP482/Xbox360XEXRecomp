@@ -505,6 +505,11 @@ HLE_FUNC(D3D_MakeSpace) {
 
 // Builds whose library reads the GPU's registers itself (2417): the reads go, the rest is the library's
 
+#ifdef SUB_D3D_SubmitIndirect
+// (device, buffers, count): a segment handed to the GPU's ring and its write pointer register; nothing reads it
+HLE_FUNC(D3D_SubmitIndirect) { return 0; }
+#endif
+
 #ifdef SUB_D3D_InterruptHandler
 PPC_EXTERN_FUNC(GUEST_ORIG(D3D_InterruptHandler));
 
@@ -542,7 +547,8 @@ PPC_FUNC(GUEST(D3D_InterruptHandler)) {
 #endif
 
 #ifdef SUB_D3D_InitializeEngines
-// (device): the library's interrupt handler is registered as the library does, the RB register copy starts clear
+// (device): the library's interrupt handler is registered as the library does, the RB register copy starts clear and
+// fences are the CPU's from the start
 PPC_FUNC(GUEST(D3D_InitializeEngines)) {
     constexpr uint32_t kSetInterruptCallback = 0x1D5;  // VdSetGraphicsInterruptCallback
     constexpr uint32_t kRbShadow = 0x28A0;
@@ -553,6 +559,7 @@ PPC_FUNC(GUEST(D3D_InitializeEngines)) {
         set(ctx, base);
     }
     W32(dev + kRbShadow, 0);
+    UseCpuFences(dev);  // nothing reads the rings, so the library's waits for room end at once
     ctx.r[3] = 1;
 }
 #endif

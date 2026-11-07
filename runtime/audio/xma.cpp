@@ -1,12 +1,12 @@
 // The kernel's XMA functions a title decodes with directly: each context is a host object that decodes inside the
-// calls, as far as the title's input packets and free output allow. No decoder for the codec yet: every frame comes
-// out as silence of its length, so a title's streams keep their pace.
-#include <cstring>
+// calls, as far as the title's input packets and free output allow, into 16 bit big endian PCM as the console does.
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 #include <utility>
 
+#include "audio/xma_decoder.h"
 #include "core/log.h"
 #include "kernel/exports.h"
 #include "kernel/memory.h"
@@ -17,10 +17,10 @@ namespace {
 
 constexpr uint32_t kOk = 0;
 constexpr uint32_t kFail = 0x80004005;  // E_FAIL
-constexpr uint32_t kPacketBytes = 2048;
-constexpr uint32_t kBlockBytes = 256;     // the output buffer's offsets count these
-constexpr uint32_t kSubframesPerFrame = 4;  // 512 samples, written 128 at a time
-constexpr uint32_t kSubframeBytes = 128 * 2;  // 16 bit samples, per channel
+constexpr uint32_t kPacketBytes = audio::XmaDecoder::kPacketBytes;
+constexpr uint32_t kBlockBytes = 256;        // the output buffer's offsets count these
+constexpr uint32_t kSubframeSamples = 128;  // per channel, the unit the output is written in
+constexpr uint32_t kSampleRates[] = {24000, 32000, 44100, 48000};
 
 // XMA_CONTEXT_INIT
 constexpr uint32_t kInitInput0 = 0x00;
@@ -30,6 +30,7 @@ constexpr uint32_t kInitInput1Packets = 0x0C;
 constexpr uint32_t kInitOutput = 0x14;
 constexpr uint32_t kInitOutputBlocks = 0x18;
 constexpr uint32_t kInitStereo = 0x24;
+constexpr uint32_t kInitSampleRate = 0x28;
 
 struct Context {
     uint32_t input[2] = {};
@@ -44,7 +45,9 @@ struct Context {
     bool output_valid = false;
     bool enabled = false;
     uint32_t channels = 1;
-    uint32_t pending = 0;  // subframes decoded and not yet written
+    std::unique_ptr<audio::XmaDecoder> decoder;
+    std::vector<int16_t> pcm;  // decoded and not yet written, from pcm_at
+    size_t pcm_at = 0;
 };
 
 std::mutex g_lock;
@@ -60,13 +63,10 @@ Context* Find(uint32_t handle) {
     return it != g_contexts.end() ? it->second.get() : nullptr;
 }
 
-// XMA packet header: frames starting in the packet in the top 6 bits
-uint32_t FramesIn(uint32_t packet) { return R32(packet) >> 26; }
-
-// the next packet's frames into pending; false once both input buffers are spent
+// the next packet decoded; false once both input buffers are spent
 bool ReadPacket(Context& c) {
     if (!c.input_valid[c.current]) return false;
-    c.pending += FramesIn(c.input[c.current] + c.packet * kPacketBytes) * kSubframesPerFrame;
+    c.decoder->Packet(static_cast<const uint8_t*>(HostPtr(c.input[c.current] + c.packet * kPacketBytes)), c.pcm);
     if (++c.packet >= c.packets[c.current]) {
         c.input_valid[c.current] = false;
         c.current ^= 1;
@@ -80,22 +80,34 @@ uint32_t FreeBlocks(const Context& c) {
     return c.read > c.write ? c.read - c.write : c.blocks - c.write + c.read;
 }
 
+// enough decoded for a subframe; false once the input has run dry
+bool Decoded(Context& c, size_t samples) {
+    while (c.pcm.size() - c.pcm_at < samples) {
+        if (ReadPacket(c)) continue;
+        c.decoder->Flush(c.pcm);
+        return c.pcm.size() - c.pcm_at >= samples;
+    }
+    return true;
+}
+
 // what the decoder would have done by now: subframes out until the input runs dry or the output is full
 void Run(Context& c) {
-    if (!c.enabled) return;
-    uint32_t step = c.channels * kSubframeBytes / kBlockBytes;
-    for (;;) {
-        if (!c.pending && !ReadPacket(c)) return;
-        if (!c.pending) continue;
+    if (!c.enabled || !c.decoder) return;
+    size_t samples = kSubframeSamples * c.channels;
+    uint32_t step = uint32_t(samples * 2 / kBlockBytes);
+    while (Decoded(c, samples)) {
         if (FreeBlocks(c) < step) {
             c.output_valid = false;
-            return;
+            break;
         }
-        std::memset(HostPtr(c.output + c.write * kBlockBytes), 0, step * kBlockBytes);
+        uint32_t at = c.output + c.write * kBlockBytes;
+        for (size_t i = 0; i < samples; i++) W16(at + uint32_t(i) * 2, uint16_t(c.pcm[c.pcm_at + i]));
+        c.pcm_at += samples;
         c.write = (c.write + step) % c.blocks;
-        c.pending--;
         if (c.write == c.read) c.output_valid = false;
     }
+    c.pcm.erase(c.pcm.begin(), c.pcm.begin() + ptrdiff_t(c.pcm_at));
+    c.pcm_at = 0;
 }
 
 template <typename F>
@@ -121,8 +133,6 @@ KERNEL_EXPORT(0x224, XMACreateContext) {
 
 // (context, init)
 KERNEL_EXPORT(0x225, XMAInitializeContext) {
-    static bool logged = false;
-    if (!std::exchange(logged, true)) LOGR("XMA: no decoder yet, streams play as silence");
     std::lock_guard lock(g_lock);
     Context* c = Find(a[0]);
     if (!c) return kFail;
@@ -135,6 +145,7 @@ KERNEL_EXPORT(0x225, XMAInitializeContext) {
     c->output = Virtual(R32(init + kInitOutput));
     c->blocks = R32(init + kInitOutputBlocks);
     c->channels = R32(init + kInitStereo) ? 2 : 1;
+    c->decoder = std::make_unique<audio::XmaDecoder>(kSampleRates[R32(init + kInitSampleRate) & 3], c->channels);
     return kOk;
 }
 

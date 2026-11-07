@@ -136,7 +136,7 @@ function(add_xex_image target xex config partitions game_dir)
     target_compile_options(${target} PRIVATE -fno-strict-aliasing)
     target_compile_definitions(${target} PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
     target_link_libraries(${target} PRIVATE tomlplusplus::tomlplusplus $<LINK_ONLY:SDL3::SDL3-static> d3d12 dxgi dxguid
-        d3dcompiler xaudio2 ole32 windowscodecs dbghelp winmm dwmapi ws2_32)
+        d3dcompiler xaudio2 ole32 windowscodecs dbghelp winmm dwmapi ws2_32 mfplat mfuuid wmcodecdspuuid)
     target_link_libraries(${target} PRIVATE ${GEN}/code.lib delayimp)
     target_link_options(${target} PRIVATE -fuse-ld=lld -g -Wl,/delayload:${target}.dll)
     if(XEX_DXC_DIR)

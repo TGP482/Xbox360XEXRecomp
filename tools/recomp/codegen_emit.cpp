@@ -120,9 +120,9 @@ std::string CodeGen::OvW() {
     return Ov();
 }
 
-// Rc = 1: cr0 compares the 64 bit result with zero
+// Rc = 1: cr0 compares the low 32 bits with zero; titles count loops in words whose high half is stale
 void CodeGen::RecordCr0(const std::string& value) {
-    Line(Fmt("\t%s = ppc_cmps(int64_t(%s), 0, %s);", Crw(0).c_str(), value.c_str(), So().c_str()));
+    Line(Fmt("\t%s = ppc_cmps(int64_t(int32_t(%s)), 0, %s);", Crw(0).c_str(), value.c_str(), So().c_str()));
 }
 
 // spill stores what the function writes, reload loads all it uses

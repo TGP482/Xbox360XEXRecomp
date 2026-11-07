@@ -30,15 +30,6 @@ namespace {
 constexpr uint32_t kRing = 16;
 constexpr uint32_t kMaxFrames = 1024;
 
-// the lock parameters' type, named differently across SDK versions
-template <typename F>
-struct LockArg;
-template <typename C, typename P>
-struct LockArg<HRESULT (STDMETHODCALLTYPE C::*)(UINT32, const P*, UINT32, const P*)> {
-    using Type = P;
-};
-using LockParams = LockArg<decltype(&IXAPO::LockForProcess)>::Type;
-
 struct Device {
     ComPtr<IXAudio2> x2;
     IXAudio2MasteringVoice* master = nullptr;
@@ -152,8 +143,8 @@ std::unique_ptr<Reverb> MakeReverb(uint32_t channels, uint32_t frames) {
     for (auto [in, out] : shapes) {
         WAVEFORMATEXTENSIBLE fin = FloatFormat(in);
         WAVEFORMATEXTENSIBLE fout = FloatFormat(out);
-        LockParams pin{&fin.Format, frames};
-        LockParams pout{&fout.Format, frames};
+        XAPO_LOCKFORPROCESS_BUFFER_PARAMETERS pin{&fin.Format, frames};
+        XAPO_LOCKFORPROCESS_BUFFER_PARAMETERS pout{&fout.Format, frames};
         if (FAILED(r->apo->LockForProcess(1, &pin, 1, &pout))) continue;
         r->in = in;
         r->out = out;

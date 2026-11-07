@@ -245,6 +245,11 @@ bool Boot(const std::vector<uint8_t>& xex, const std::string& xex_name, const st
           const std::string& data_dir);
 const xex::Image& LoadedImage();
 [[noreturn]] void Shutdown(int code);
+// XamLoaderLaunchTitle: the executable named exe beside this one takes over (app::HandOver), this one when exe is
+// null or missing
+[[noreturn]] void Relaunch(const char* exe);
+bool ExecutableExists(const char* exe);
+inline std::atomic<bool> g_relaunching{false};
 
 // the guest call chain: each frame's back chain at 0(r1), the return address saved 8 bytes below the caller's r1
 void LogGuestStack(PPCContext& ctx, int frames);

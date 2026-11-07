@@ -1,8 +1,13 @@
 #include "xam/xam.h"
 
 #include <algorithm>
+#include <cctype>
+#include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <set>
+
+#include "app/app.h"
 
 namespace xam {
 
@@ -163,40 +168,91 @@ XAM_EXPORT(0x3D1, XGetVideoMode) {
     return 0;
 }
 
-// the loader: one title per run until image switching
+// the loader: launch data outlives a switch to another image of the game, as it outlives the console's reboot
 
 namespace {
 
 std::mutex g_launch_lock;
 std::vector<uint8_t> g_launch_data;
+bool g_launch_read = false;
+
+std::filesystem::path LaunchFile() {
+    std::string suffix = app::Instance() ? std::to_string(app::Instance()) : std::string();
+    return app::ExeDir() / ("launch" + suffix + ".bin");
+}
+
+// what the previous image left, read once; caller holds g_launch_lock
+std::vector<uint8_t>& LaunchData() {
+    if (g_launch_read) return g_launch_data;
+    g_launch_read = true;
+    std::ifstream f(LaunchFile(), std::ios::binary);
+    if (f) g_launch_data.assign(std::istreambuf_iterator<char>(f), {});
+    f.close();
+    std::error_code ec;
+    std::filesystem::remove(LaunchFile(), ec);
+    return g_launch_data;
+}
+
+std::string Lower(std::string s) {
+    for (char& c : s) c = char(std::tolower(uint8_t(c)));
+    return s;
+}
+
+// the executable GameInfo::images names for an image path such as game:\level.xex, null when none
+const char* ExeFor(const std::string& path) {
+    std::string name = Lower(path.substr(path.find_last_of("\\/:") + 1));
+    for (const auto& [xex, exe] : app::kGame.images) {
+        if (Lower(xex) == name) return exe;
+    }
+    return nullptr;
+}
 
 }  // namespace
 
 XAM_EXPORT(0x1A6, XamLoaderSetLaunchData) {
     std::lock_guard<std::mutex> lock(g_launch_lock);
     auto* p = static_cast<const uint8_t*>(HostPtr(a[0]));
-    g_launch_data.assign(p, p + a[1]);
+    LaunchData().assign(p, p + a[1]);
     return kErrorSuccess;
 }
 
 XAM_EXPORT(0x1A7, XamLoaderGetLaunchDataSize) {
     std::lock_guard<std::mutex> lock(g_launch_lock);
-    if (g_launch_data.empty()) return kErrorNotFound;
-    W32(a[0], uint32_t(g_launch_data.size()));
+    if (LaunchData().empty()) return kErrorNotFound;
+    W32(a[0], uint32_t(LaunchData().size()));
     return kErrorSuccess;
 }
 
 XAM_EXPORT(0x1A8, XamLoaderGetLaunchData) {
     std::lock_guard<std::mutex> lock(g_launch_lock);
-    if (g_launch_data.empty()) return kErrorNotFound;
-    std::memcpy(HostPtr(a[0]), g_launch_data.data(), std::min<size_t>(a[1], g_launch_data.size()));
+    if (LaunchData().empty()) return kErrorNotFound;
+    std::memcpy(HostPtr(a[0]), LaunchData().data(), std::min<size_t>(a[1], LaunchData().size()));
     return kErrorSuccess;
 }
 
+// (path, flags): the image's own executable takes over with the launch data; without one this executable restarts
+// to its first screen, and an empty path is the dashboard
 XAM_EXPORT(0x1A4, XamLoaderLaunchTitle) {
-    LOGR("XamLoaderLaunchTitle %s flags %X: switching images is not there yet", a[0] ? ReadCString(a[0]).c_str() : "",
-         a[1]);
-    Shutdown(0);
+    std::string path = a[0] ? ReadCString(a[0]) : std::string();
+    if (path.empty()) {
+        LOGR("XamLoaderLaunchTitle: the dashboard, exiting");
+        Shutdown(0);
+    }
+    const char* exe = ExeFor(path);
+    bool runs = ExecutableExists(exe);
+    {
+        std::lock_guard<std::mutex> lock(g_launch_lock);
+        if (runs) {
+            std::ofstream f(LaunchFile(), std::ios::binary);
+            f.write(reinterpret_cast<const char*>(LaunchData().data()), std::streamsize(LaunchData().size()));
+        } else {
+            std::error_code ec;
+            std::filesystem::remove(LaunchFile(), ec);
+        }
+    }
+    if (runs) LOGR("XamLoaderLaunchTitle %s: %s takes over", path.c_str(), exe);
+    else LOGE("XamLoaderLaunchTitle %s: no executable of this game runs it, restarting this one", path.c_str());
+    Relaunch(exe);
 }
 
 XAM_EXPORT(0x1A9, XamLoaderTerminateTitle) { Shutdown(0); }

@@ -5,6 +5,8 @@
 #include <mutex>
 #include <thread>
 
+#include <unistd.h>
+
 #include "app/app.h"
 
 namespace app {
@@ -38,9 +40,12 @@ bool OpenSplash() { return false; }
 void SplashFirstFrame() {}
 void CloseSplash() {}
 void OpenGameWindow(bool) {}
-bool StartHandover() { return false; }
-bool HandingOver() { return false; }
-void FinishHandover() {}
+void HandOver(const std::filesystem::path& exe) {
+    execl(exe.c_str(), exe.c_str(), nullptr);
+    std::_Exit(0);
+}
+void HoldHandedFrame() {}
+void HandoverSwap() {}
 
 std::recursive_mutex& UiLock() {
     static std::recursive_mutex m;

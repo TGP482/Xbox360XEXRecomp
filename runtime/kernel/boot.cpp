@@ -1,5 +1,18 @@
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
+
 #include <algorithm>
 #include <cstdlib>
+#include <filesystem>
 
 #include "app/app.h"
 #include "cpu/dispatch.h"
@@ -70,6 +83,38 @@ bool Boot(const std::vector<uint8_t>& xex, const std::string& xex_name, const st
     start.start_routine = img.entry;
     StartThread(CreateThread(start));
     return true;
+}
+
+#ifdef _WIN32
+constexpr char kExeSuffix[] = ".exe";
+#else
+constexpr char kExeSuffix[] = "";
+#endif
+
+std::filesystem::path ExecutablePath(const char* exe) { return app::ExeDir() / (std::string(exe) + kExeSuffix); }
+
+bool ExecutableExists(const char* exe) {
+    std::error_code ec;
+    return exe && std::filesystem::exists(ExecutablePath(exe), ec);
+}
+
+void Relaunch(const char* exe) {
+    std::filesystem::path path;
+    if (ExecutableExists(exe)) {
+        path = ExecutablePath(exe);
+    } else {
+#ifdef _WIN32
+        wchar_t self[MAX_PATH];
+        GetModuleFileNameW(nullptr, self, MAX_PATH);
+        path = self;
+#else
+        char self[4096] = {};
+        ssize_t n = readlink("/proc/self/exe", self, sizeof(self) - 1);
+        path = std::string(self, n > 0 ? size_t(n) : 0);
+#endif
+    }
+    g_relaunching = true;
+    app::HandOver(path);
 }
 
 void Shutdown(int code) {

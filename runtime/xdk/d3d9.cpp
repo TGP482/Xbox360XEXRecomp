@@ -431,8 +431,7 @@ HLE_FUNC(D3DDevice_Resolve) {
 // (device, front buffer texture, parameters)
 HLE_FUNC(D3DDevice_Swap) {
     app::SplashFirstFrame();
-    // handed over from the previous instance: the window opens on the second frame
-    if (app::HandingOver() && g_presents >= 2) app::FinishHandover();
+    app::HandoverSwap();
     {
         std::lock_guard lock(g_lock);
         UseCpuFences(a[0]);

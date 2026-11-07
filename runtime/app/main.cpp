@@ -129,8 +129,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_ACTIVATE:
             if (LOWORD(wp) == WA_INACTIVE) {
-                // a changed display mode steps aside for the desktop, minimized, and comes back on return
-                if (g_mode_changed) {
+                // a changed display mode steps aside for the desktop, minimized, and comes back on return; not while
+                // handing over to the next instance, which runs in the same mode
+                if (g_mode_changed && !kernel::g_relaunching) {
                     MONITORINFOEXW mi{};
                     mi.cbSize = sizeof(mi);
                     GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &mi);
@@ -255,6 +256,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     if (!app::FindGame(game)) return 1;
     if (!app::PrepareGameCode(game)) return 1;
 
+    app::HoldHandedFrame();
     bool splash = app::OpenSplash();
 
     WNDCLASSEXW wc{sizeof(wc)};

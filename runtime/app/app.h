@@ -63,10 +63,11 @@ bool OpenSplash();        // window thread, at launch; false without one, and th
 void SplashFirstFrame();  // the game's first Swap: waits out the splash's minimum, then opens the game window
 void CloseSplash();       // window thread
 void OpenGameWindow(bool apply = true);  // any thread but the window thread's; returns once the window is up
-// relaunched: the previous instance keeps its window up until this one has shown its first frames (handover.cpp)
-bool StartHandover();   // window thread, at launch; true: the game window starts hidden
-bool HandingOver();
-void FinishHandover();  // any thread but the window thread's: opens the game window, lets the old instance go
+// switching images (handover.cpp): the old process hands its last frame to the new one and leaves before the new one
+// boots, so the two never run the title side by side; the new one shows that frame over its window until it draws
+[[noreturn]] void HandOver(const std::filesystem::path& exe);  // any thread: starts exe, exits once it holds the frame
+void HoldHandedFrame();  // window thread, at launch: shows the previous instance's frame and lets that one exit
+void HandoverSwap();     // each Swap: drops the held frame once the title has drawn
 
 // held around ImGui: the window thread's messages and the renderer's frame
 std::recursive_mutex& UiLock();

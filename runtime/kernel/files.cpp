@@ -218,9 +218,14 @@ std::string ReadCString(uint32_t va, size_t max) {
     return s;
 }
 
+std::string g_data_dir;
+
+const std::string& DataDir() { return g_data_dir; }
+
 // game: and d: are the disc, the hard disk's content partition and title caches are folders under the data folder
 void MountDefaults(const std::string& game_dir, const std::string& data_dir) {
     std::lock_guard<std::mutex> lock(g_links_lock);
+    g_data_dir = data_dir;
     fs::path d = data_dir;
     g_devices[kCdRom] = game_dir;
     g_devices["\\DEVICE\\HARDDISK0\\PARTITION1"] = d / "hdd";

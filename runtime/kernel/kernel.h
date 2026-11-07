@@ -233,10 +233,12 @@ bool CreateSymbolicLink(const std::string& link, const std::string& target);
 bool DeleteSymbolicLink(const std::string& link);
 std::string QuerySymbolicLink(const std::string& link);
 std::string ResolvePath(const std::string& console_path, uint32_t root_handle);  // host path or empty
+const std::string& DataDir();  // the host folder the hard disk and saves live under
 bool ReadGameFile(const std::string& console_path, std::vector<uint8_t>& out);  // from a host folder or the disc image
 
 // kernel variables the host keeps current, set up by boot
 void InitKernelData(const xex::Image& img);
+uint32_t XexHeaderField(uint32_t key);  // as RtlImageXexHeaderField on the title's header, 0 when absent
 
 // boot: the image into guest memory, its imports bound, its first thread started
 bool Boot(const std::vector<uint8_t>& xex, const std::string& xex_name, const std::string& game_dir,

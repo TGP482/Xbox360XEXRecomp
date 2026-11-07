@@ -626,20 +626,28 @@ KERNEL_EXPORT(0x155, KeTlsSetValue) {
 
 // the image: its XEX header fields and modules
 
-// (header base, key): a field of up to one dword holds its value, a longer one its offset from the header
-KERNEL_EXPORT(0x12B, RtlImageXexHeaderField) {
+namespace {
+
+// a field of up to one dword holds its value, a longer one its offset from the header
+uint32_t HeaderField(uint32_t base, uint32_t key) {
     constexpr uint32_t kHeaderCount = 0x14;
     constexpr uint32_t kHeaderList = 0x18;
-    uint32_t base = a[0];
     uint32_t count = R32(base + kHeaderCount);
     for (uint32_t i = 0; i < count; i++) {
         uint32_t entry = base + kHeaderList + i * 8;
-        if (R32(entry) != a[1]) continue;
+        if (R32(entry) != key) continue;
         uint32_t value = R32(entry + 4);
-        return (a[1] & 0xFF) <= 1 ? value : base + value;
+        return (key & 0xFF) <= 1 ? value : base + value;
     }
     return 0;
 }
+
+}  // namespace
+
+uint32_t XexHeaderField(uint32_t key) { return HeaderField(g_xex_header, key); }
+
+// (header base, key)
+KERNEL_EXPORT(0x12B, RtlImageXexHeaderField) { return HeaderField(a[0], a[1]); }
 
 namespace {
 

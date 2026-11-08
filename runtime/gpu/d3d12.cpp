@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -1519,6 +1520,29 @@ D3D12_PRIMITIVE_TOPOLOGY_TYPE TopologyType(D3D12_PRIMITIVE_TOPOLOGY topo) {
     return D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
 }
 
+// diagnostic: the shaders of the first draws of one present, microcode and translation, into CrashDumps
+void DumpShaders(uint64_t present, const State& s, const ShaderOptions& vs_opt, const ShaderOptions& ps_opt) {
+    constexpr uint64_t kPresent = 420;
+    constexpr int kDraws = 24;
+    static int dumped = 0;
+    if (present != kPresent || dumped >= kDraws) return;
+    auto dir = app::ExeDir() / "CrashDumps";
+    std::error_code e;
+    std::filesystem::create_directories(dir, e);
+    int draw = dumped++;
+    auto write = [&](const Shader* sh, const ShaderOptions& opt, const char* stage) {
+        if (!sh) return;
+        ShaderInfo info;
+        std::string hlsl = TranslateShader(sh->stage, sh->code.data(), sh->code.size(), opt, info);
+        std::string name = "draw" + std::to_string(draw) + "_" + stage;
+        std::ofstream(dir / (name + ".hlsl")) << hlsl;
+        std::ofstream(dir / (name + ".bin"), std::ios::binary)
+            .write(reinterpret_cast<const char*>(sh->code.data()), std::streamsize(sh->code.size() * 4));
+    };
+    write(s.vs, vs_opt, "vs");
+    write(s.ps, ps_opt, "ps");
+}
+
 void D3D12Backend::Draw(const State& s, const DrawArgs& a) {
     DrawStats& st = draw_stats_;
     st.calls++;
@@ -1536,6 +1560,7 @@ void D3D12Backend::Draw(const State& s, const DrawArgs& a) {
     ShaderOptions ps_opt;
     ps_opt.vpos_reg = s.link.vpos_reg;
     ps_opt.alpha_test = Bits(s.Reg(kRbColorControl), 3, 1) && Bits(s.Reg(kRbColorControl), 0, 3) != 7;
+    DumpShaders(presents_, s, vs_opt, ps_opt);
     Variant* vs = EnsureVariant(s.vs, vs_opt);
     // no pixel shader: a depth only draw
     Variant* ps = s.ps ? EnsureVariant(s.ps, ps_opt) : nullptr;

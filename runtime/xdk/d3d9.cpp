@@ -42,8 +42,8 @@ constexpr uint32_t kDevFence = XDK_Device_Fence;          // the next fence, two
 constexpr uint32_t kDevGpuFlags = XDK_Device_GpuFlags;
 constexpr uint32_t kDevDecl = XDK_Device_VertexDeclaration;
 constexpr uint32_t kDevIndices = XDK_Device_IndexBuffer;
-[[maybe_unused]] constexpr uint32_t kDevTargets = XDK_Device_RenderTargets;  // 4 surfaces
-[[maybe_unused]] constexpr uint32_t kDevDepth = XDK_Device_DepthStencil;
+constexpr uint32_t kDevTargets = XDK_Device_RenderTargets;  // 4 surfaces
+constexpr uint32_t kDevDepth = XDK_Device_DepthStencil;
 constexpr uint32_t kDevStrides = XDK_Device_StreamStrides;  // a byte per stream, in dwords
 constexpr uint32_t kDevPixelShader = XDK_Device_PixelShader;
 constexpr uint32_t kDevVertexShader = XDK_Device_VertexShader;
@@ -67,6 +67,8 @@ constexpr uint32_t kDevTileCount = XDK_Device_TileCount;
 constexpr uint32_t kDevTileRects = XDK_Device_TileRects;
 constexpr uint32_t kDevTileRectsAligned = XDK_Device_TileRectsAligned;
 constexpr uint32_t kDevPredication = XDK_Device_Predication;
+constexpr uint32_t kDevTilingTargets = XDK_Device_TilingTargets;
+constexpr uint32_t kDevTilingExtent = XDK_Device_TilingExtent;
 
 // D3DDevice_ClearF flags, and Resolve's
 constexpr uint32_t kClearDepth = 0x10;
@@ -117,7 +119,8 @@ void RequireLayout() {
     }
 #ifdef SUB_D3DDevice_BeginTiling
     XDK_REQUIRE("d3d9", XDK_KEY(Device_TilingFlags), XDK_KEY(Device_TilingOn), XDK_KEY(Device_TileCount),
-                XDK_KEY(Device_TileRects), XDK_KEY(Device_TileRectsAligned), XDK_KEY(Device_Predication));
+                XDK_KEY(Device_TileRects), XDK_KEY(Device_TileRectsAligned), XDK_KEY(Device_Predication),
+                XDK_KEY(Device_TilingTargets), XDK_KEY(Device_TilingExtent));
 #endif
 }
 
@@ -594,6 +597,13 @@ void WriteTileRects(uint32_t dev) {
         }
     }
     W32(dev + kDevTileCount, uint32_t(g_tiling.tiles.size()));
+    // SetViewport and SetScissorRect size to the extent while the targets are these
+    W32(dev + kDevTilingExtent, uint32_t(g_tiling.extent.x2));
+    W32(dev + kDevTilingExtent + 4, uint32_t(g_tiling.extent.y2));
+    uint32_t color0 = R32(dev + kDevTargets);
+    W32(dev + kDevTilingTargets, color0 ? color0 : R32(dev + kDevDepth));
+    for (uint32_t i = 0; i < 4; i++) W32(dev + kDevTilingTargets + 4 + i * 4, R32(dev + kDevTargets + i * 4));
+    W32(dev + kDevTilingTargets + 20, R32(dev + kDevDepth));
 }
 
 // (device, flags, tile count, tile rects, clear colour, f1 clear z, clear stencil): the tiles become one host target,
@@ -653,6 +663,7 @@ HLE_FUNC(D3DDevice_EndTiling) {
         g_tiling = {};
         W8(dev + kDevTilingFlags, uint8_t(R8(dev + kDevTilingFlags) & ~kTilingOn));
         W32(dev + kDevPredication, 0);
+        W32(dev + kDevTilingTargets, 0);
     }
     CallGuest(ctx, SYM(D3DDevice_SetViewport), {dev, WholeViewport()});
     return 0;

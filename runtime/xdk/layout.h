@@ -144,6 +144,12 @@ constexpr bool AllKnown(const LayoutKey (&keys)[N]) {
 #ifndef XDK_Device_TileRectsAligned
 #define XDK_Device_TileRectsAligned 0xFFFFFFFFu
 #endif
+#ifndef XDK_Device_TilingTargets
+#define XDK_Device_TilingTargets 0xFFFFFFFFu
+#endif
+#ifndef XDK_Device_TilingExtent
+#define XDK_Device_TilingExtent 0xFFFFFFFFu
+#endif
 #ifndef XDK_Texture_FetchConstant
 #define XDK_Texture_FetchConstant 0xFFFFFFFFu
 #endif

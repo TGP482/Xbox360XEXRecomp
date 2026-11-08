@@ -33,6 +33,8 @@ Device_Streams = 0x310C
 VertexBuffer_Address = 0xC
 VertexBuffer_Size = 0x10
 Device_PixelShader = 0x3290
+# SetClipPlane 8273C130 keeps plane i, clip space, at +i * 16 beside PA_CL_UCP
+Device_ClipPlanes = 0x3230
 Device_VertexShader = 0x3294
 # the command ring, allocated a segment at a time: write pointer, segment end, limit, segment start
 Device_RingWrite = 0x0

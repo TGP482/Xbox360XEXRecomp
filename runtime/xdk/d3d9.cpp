@@ -51,6 +51,7 @@ constexpr uint32_t kDevStreams = XDK_Device_Streams;
 constexpr uint32_t kVbAddress = XDK_VertexBuffer_Address;
 constexpr uint32_t kVbSize = XDK_VertexBuffer_Size;
 constexpr uint32_t kDevPixelShader = XDK_Device_PixelShader;
+constexpr uint32_t kDevClipPlanes = XDK_Device_ClipPlanes;  // SetClipPlane's copies, 16 bytes each
 constexpr uint32_t kDevVertexShader = XDK_Device_VertexShader;
 // the register shadow, a bank per 0x80 registers from 0x2000
 constexpr uint32_t kDevBanks[] = {XDK_Device_Reg2000, XDK_Device_Reg2080, XDK_Device_Reg2100, XDK_Device_Reg2180,
@@ -284,6 +285,11 @@ void ReadRegisters(uint32_t dev, gpu::State& s) {
         s.tiled_width = uint32_t(g_tiling.extent.x2);
         s.tiled_height = uint32_t(g_tiling.extent.y2);
         s.predicated = SelectedTiles();
+    }
+    if constexpr (kDevClipPlanes != xdk::kUnknown) {
+        for (uint32_t i = 0; i < 6; i++) {
+            for (uint32_t k = 0; k < 4; k++) s.clip_planes[i][k] = GF(dev + kDevClipPlanes + (i * 4 + k) * 4);
+        }
     }
 }
 

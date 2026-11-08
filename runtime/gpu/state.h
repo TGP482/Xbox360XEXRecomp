@@ -29,6 +29,7 @@ enum : uint32_t {
     kRbDepthControl = 0x2200,
     kRbBlendControl0 = 0x2201,
     kRbColorControl = 0x2202,
+    kPaClClipCntl = 0x2204,
     kPaSuScModeCntl = 0x2205,
     kPaClVteCntl = 0x2206,
     kRbBlendControl1 = 0x2209,  // then 2 and 3
@@ -59,6 +60,7 @@ struct State {
     uint32_t tiled_width = 0;
     uint32_t tiled_height = 0;
     Rect predicated{};  // the tiles a predicated draw is for, empty for all of them
+    float clip_planes[6][4] = {};  // SetClipPlane's, in clip space
 
     uint32_t Reg(uint32_t r) const { return regs[r - kRegFirst]; }
     float RegF(uint32_t r) const {

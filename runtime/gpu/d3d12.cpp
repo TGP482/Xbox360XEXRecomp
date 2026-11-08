@@ -1469,6 +1469,12 @@ void D3D12Backend::FillDrawConstants(const State& s, const Bound& b, DrawConstan
     c.alpha_ref = s.RegF(kRbAlphaRef);
     c.vpos_scale = 1 / b.scale;
     c.vtx_fmt = Bits(vte, 8, 3);
+    // bits 0 to 5 enable the user planes, 16 turns clipping off
+    uint32_t clip = s.Reg(kPaClClipCntl);
+    for (uint32_t i = 0; i < 6; i++) {
+        bool on = Bits(clip, i, 1) && !Bits(clip, 16, 1);
+        if (on) std::memcpy(c.clip[i], s.clip_planes[i], sizeof(c.clip[i]));
+    }
 }
 
 // the window scissor in the target's pixels, within w x h

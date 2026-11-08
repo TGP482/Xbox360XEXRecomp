@@ -287,7 +287,8 @@ cbuffer Draw : register(b2) {
     float g_vpos_scale;
     uint g_vtx_fmt;
 )";
-const char* kPreludeEnd = R"(};
+const char* kPreludeEnd = R"(    float4 g_clip[6];
+};
 
 static float4 r[64];
 static float ps;
@@ -949,6 +950,8 @@ std::string Translator::Entry() const {
 struct VOut {
     float4 pos : SV_Position;
     float4 o[16] : TEXCOORD0;
+    float4 clip0 : SV_ClipDistance0;
+    float2 clip1 : SV_ClipDistance1;
 };
 
 VOut main(uint id : SV_VertexID) {
@@ -961,10 +964,12 @@ VOut main(uint id : SV_VertexID) {
     // xy and z given already divided by w go back to clip space so the host's divide returns them
     if (g_vtx_fmt & 1) pos.xy *= pos.w;
     if (g_vtx_fmt & 2) pos.z *= pos.w;
+    VOut v;
+    v.clip0 = float4(dot(pos, g_clip[0]), dot(pos, g_clip[1]), dot(pos, g_clip[2]), dot(pos, g_clip[3]));
+    v.clip1 = float2(dot(pos, g_clip[4]), dot(pos, g_clip[5]));
     pos.xyz = pos.xyz * g_ndc_scale.xyz + g_ndc_offset.xyz * pos.w;
     // depth stored reversed
     pos.z = pos.w - pos.z;
-    VOut v;
     v.pos = pos;
     v.o = o;
     return v;

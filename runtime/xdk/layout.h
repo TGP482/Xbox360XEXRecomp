@@ -216,6 +216,9 @@ constexpr bool AllKnown(const LayoutKey (&keys)[N]) {
 #ifndef XDK_XAudio_SourceXma
 #define XDK_XAudio_SourceXma 0xFFFFFFFFu
 #endif
+#ifndef XDK_Device_ClipPlanes
+#define XDK_Device_ClipPlanes 0xFFFFFFFFu
+#endif
 #ifndef XDK_Device_Streams
 #define XDK_Device_Streams 0xFFFFFFFFu
 #endif

@@ -60,6 +60,17 @@ XAM_EXPORT(0x2EE, XamUserCreateAchievementEnumerator) {
     return kErrorSuccess;
 }
 
+// leaderboards are Live's: an empty enumerator
+// (title, kind, key, rows, spec count, specs, buffer size out, handle out)
+XAM_EXPORT(0x2F7, XamUserCreateStatsEnumerator) {
+    constexpr uint32_t kStatsResults = 0x8;  // XUSER_STATS_READ_RESULTS: view count, views
+    auto e = std::make_shared<Enumerator>();
+    e->item_size = kStatsResults;
+    if (a[6]) W32(a[6], kStatsResults);
+    W32(a[7], NewEnumerator(e));
+    return kErrorSuccess;
+}
+
 // (user, title, small picture id, large picture id, count, overlapped): XUserAwardGamerPicture, no pictures to award
 XAM_EXPORT(0x2F0, XamWriteGamerTile) { return Complete(a[5], kErrorSuccess); }
 

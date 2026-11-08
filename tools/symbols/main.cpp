@@ -516,6 +516,17 @@ int Scan(const ScanArgs& args) {
     return 0;
 }
 
+// the loaded image for xex2pe.py: base and entry as little endian words, then the memory from base
+int WriteImage(const fs::path& xex, const fs::path& out) {
+    Image img;
+    if (!img.Load(xex)) return 1;
+    std::ofstream f(out, std::ios::binary);
+    for (uint32_t v : {img.x.base, img.x.entry})
+        for (int i = 0; i < 4; i++) f.put(char(v >> (8 * i)));
+    f.write(reinterpret_cast<const char*>(img.x.memory.data()), std::streamsize(img.x.memory.size()));
+    return f ? 0 : 1;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -532,10 +543,12 @@ int main(int argc, char** argv) {
     std::string library = opt("--library");
     if (!a.empty() && a[0] == "--sign" && a.size() >= 2 && !out.empty())
         return Sign(out, std::vector<fs::path>(a.begin() + 1, a.end()));
+    if (a.size() == 2 && a[0] == "--image" && !out.empty()) return WriteImage(a[1], out);
     if (a.size() != 2 || library.empty()) {
         std::fprintf(stderr,
                      "usage: xex_symbols <game.xex> <sdk>/xdk --library <exe>.dll [--out config/game.toml] [--name game]\n"
-                     "       xex_symbols --sign <config.toml>... --out signatures.toml\n");
+                     "       xex_symbols --sign <config.toml>... --out signatures.toml\n"
+                     "       xex_symbols --image <game.xex> --out image.bin\n");
         return 1;
     }
     return Scan({a[0], a[1], out, name.empty() ? "game" : name, library});

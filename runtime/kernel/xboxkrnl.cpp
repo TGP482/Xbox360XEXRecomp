@@ -449,6 +449,39 @@ KERNEL_EXPORT(0xF3, NtReleaseSemaphore) {
     return status;
 }
 
+// (handle out, object attributes, type): notification 0, synchronization 1
+KERNEL_EXPORT(0xD7, NtCreateTimer) {
+    constexpr uint8_t kNotificationTimer = 8;  // dispatcher type, synchronization is one more
+    constexpr uint32_t kTimerBytes = 0x28;
+    std::string name;
+    if (ObjectRef existing = Named(a[1], name)) return OpenExisting(existing, a[0]);
+    auto o = std::make_shared<Object>(ObjType::Timer);
+    o->notification = a[2] == 0;
+    uint32_t body = mem::AllocSystem(kTimerBytes);
+    InitHeader(body, uint8_t(kNotificationTimer + (a[2] ? 1 : 0)), kTimerBytes / 4, 0);
+    return Publish(o, body, name, a[0]);
+}
+
+// (handle, due time, apc routine, apc mode, apc context, resume, period ms, previous state out)
+KERNEL_EXPORT(0xFA, NtSetTimerEx) {
+    ObjectRef o = FromHandle(a[0]);
+    if (!o || o->type != ObjType::Timer) return kInvalidHandle;
+    if (a[7]) W8(a[7], uint8_t(o->signal != 0));
+    TimerApc apc;
+    if (a[2]) apc = {CurrentRef(), a[2], a[4]};
+    SetTimer(o, int64_t(R64(a[1])), int32_t(a[6]), 0, std::move(apc));
+    return kSuccess;
+}
+
+// (handle, current state out)
+KERNEL_EXPORT(0xCD, NtCancelTimer) {
+    ObjectRef o = FromHandle(a[0]);
+    if (!o || o->type != ObjType::Timer) return kInvalidHandle;
+    CancelTimer(*o);
+    if (a[1]) W8(a[1], uint8_t(o->signal != 0));
+    return kSuccess;
+}
+
 // (semaphore, count, limit)
 KERNEL_EXPORT(0x74, KeInitializeSemaphore) {
     InitHeader(a[0], kSemaphoreObject, 5, int32_t(a[1]));

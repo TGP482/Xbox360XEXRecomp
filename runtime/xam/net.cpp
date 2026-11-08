@@ -778,6 +778,9 @@ XAM_EXPORT(0x33, NetDll_XNetStartup) {
 
 XAM_EXPORT(0x34, NetDll_XNetCleanup) { return 0; }
 
+// (caller): the title the network stack is started for
+XAM_EXPORT(0x136, XNetLogonGetTitleID) { return LoadedImage().title_id; }
+
 // (caller, buffer, length)
 XAM_EXPORT(0x35, NetDll_XNetRandom) {
     Random(a[1], a[2]);

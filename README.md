@@ -29,7 +29,7 @@ This tool was originally created for porting [Far Cry Instincts Predator](https:
    ```
    This prints the XEX's library versions, picks `xdk/<build>/signatures.toml` and finds the XDK functions and data the host replaces, then writes the config: `[xex]` with a partition count and the code sections, the `layout.toml` include, `[symbols]` and `[data]`. Misses and ambiguous names are listed and left at 0, which become trapping stubs. It stops when no `signatures.toml` exists for the XEX's build.
 4. Fill in `app::kGame` in `src/common/game_info.cpp`: title, window name, log and settings file names, splash, the xex to exe table, game options, the hooks for loading, the window, drawing and the pads, and the compiler window's colours.
-5. Game hooks go in `src/game`. Define `PPC_FUNC(sub_XXXXXXXX)` to replace a recompiled function, and call `__imp__sub_XXXXXXXX` to reach the original.
+5. Game hooks go in `src/game`. Define `PPC_FUNC(sub_XXXXXXXX)` to replace a recompiled function, and call `__imp__sub_XXXXXXXX` to reach the original. `xex_symbols --image assets\default.xex --out image.bin` then `python sdk/tools/symbols/xex2pe.py config/game.toml image.bin game.exe` writes a flat PE with the recompiled functions as exports for Ghidra.
 6. Run `build.bat`. One game repo can build several images, one config and `add_xex_image` each; `--name` sets the config's `generated/<name>`, which is the folder argument of `add_xex_image`.
 
 A new XDK build needs `xdk/<build>/layout.toml` and signatures made from titles whose configs are complete: `xex_symbols --sign config/a.toml [config/b.toml] --out sdk/xdk/<build>/signatures.toml`. Signatures are lengths and hashes of the functions with addresses masked, never library code.

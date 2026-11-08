@@ -538,6 +538,11 @@ void Analysis::SeedPointers() {
     }
     for (uint32_t t : targets) {
         if (functions.count(t) || At(t).op == Op::invalid) continue;
+        // past the .pdata range of the function before it: a leaf a walk fell into after a call that never returns
+        if (PastPdataEnd(t)) {
+            AddFunction(t);
+            continue;
+        }
         if (CoverAt(t) == kBody || PdataOwner(t)) data_labels.insert(t);
         AddCode(t);
     }
@@ -551,6 +556,14 @@ uint32_t Analysis::PdataOwner(uint32_t va) const {
         if (it->second.pdata_end) return va > it->first && va < it->second.pdata_end ? it->first : 0;
     }
     return 0;
+}
+
+// past the end of the .pdata range of the function just before va
+bool Analysis::PastPdataEnd(uint32_t va) const {
+    auto it = functions.upper_bound(va);
+    if (it == functions.begin()) return false;
+    --it;
+    return it->second.pdata_end && va >= it->second.pdata_end;
 }
 
 // Code found outside any walk: part of the function whose .pdata range holds it, else a function of its own.

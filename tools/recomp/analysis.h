@@ -118,6 +118,7 @@ private:
     bool AddFunction(uint32_t va);
     uint32_t PdataOwner(uint32_t va) const;
     void AddCode(uint32_t va);
+    bool PastPdataEnd(uint32_t va) const;
     void Fixpoint();
     void SeedPointers();
     void GapFill();

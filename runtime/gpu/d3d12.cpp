@@ -10,6 +10,7 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -1099,12 +1100,29 @@ void CopyRows(const std::vector<uint8_t>& rows, uint32_t pitch, const D3D12_PLAC
     }
 }
 
+// the first 2D textures' level 0 guest bytes into CrashDumps, to check their decode offline
+void DumpGuestTexture(const xenos::TextureFetch& t, const xenos::Level& l, const uint8_t* memory) {
+    constexpr int kDumps = 64;
+    constexpr size_t kMaxBytes = 4u << 20;
+    static int dumped = 0;
+    size_t bytes = size_t(l.pitch_blocks) * l.rows_blocks * xenos::Info(t.format).bytes;
+    if (dumped >= kDumps || t.dimension != xenos::Dimension::D2 || bytes > kMaxBytes) return;
+    auto dir = app::ExeDir() / "CrashDumps";
+    std::error_code e;
+    std::filesystem::create_directories(dir, e);
+    char name[96];
+    std::snprintf(name, sizeof(name), "tex_%02d_%08X_f%u_%ux%u_p%u_t%u_e%u.bin", dumped++, t.base, uint32_t(t.format),
+                  t.width, t.height, t.pitch, uint32_t(t.tiled), uint32_t(t.endian));
+    std::ofstream(dir / name, std::ios::binary).write(reinterpret_cast<const char*>(memory + l.address), bytes);
+}
+
 // each level of each face or array slice is a subresource; a volume's slices are planes of one
 void D3D12Backend::UploadTexture(Texture& tex, const xenos::TextureFetch& t) {
     std::vector<xenos::Level> levels = xenos::Levels(t);
     bool volume = t.dimension == xenos::Dimension::D3;
     uint32_t faces = volume ? 1 : t.depth;
     const uint8_t* memory = Guest(0);  // the physical window, each level adds its address
+    DumpGuestTexture(t, levels[0], memory);
     Transition(tex.res.Get(), tex.state, D3D12_RESOURCE_STATE_COPY_DEST);
     D3D12_RESOURCE_DESC desc = tex.res->GetDesc();
     std::vector<uint8_t> rows;

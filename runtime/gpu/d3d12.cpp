@@ -1105,7 +1105,6 @@ void D3D12Backend::UploadTexture(Texture& tex, const xenos::TextureFetch& t) {
     std::vector<xenos::Level> levels = xenos::Levels(t);
     bool volume = t.dimension == xenos::Dimension::D3;
     uint32_t faces = volume ? 1 : t.depth;
-    const uint8_t* memory = Guest(0);  // the physical window, each level adds its address
     Transition(tex.res.Get(), tex.state, D3D12_RESOURCE_STATE_COPY_DEST);
     D3D12_RESOURCE_DESC desc = tex.res->GetDesc();
     std::vector<uint8_t> rows;
@@ -1119,6 +1118,8 @@ void D3D12Backend::UploadTexture(Texture& tex, const xenos::TextureFetch& t) {
             dev_->GetCopyableFootprints(&desc, sub, 1, 0, &fp, &row_count, &row_size, &total);
             Alloc a = Upload(total, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
             uint32_t planes = volume ? fp.Footprint.Depth : 1;
+            // per level: a 4 KB window block's bytes sit one page below its physical address
+            const uint8_t* memory = Guest(levels[l].address) - levels[l].address;
             for (uint32_t z = 0; z < planes; z++) {
                 uint32_t pitch = 0;
                 xenos::LoadLevel(memory, t, levels[l], volume ? z : face, rows, pitch);

@@ -105,7 +105,11 @@ struct XmaDecoder::Impl {
     void EndPacket(std::vector<int16_t>& pcm);
     bool Open();
     void Decode(const uint8_t* data, std::vector<int16_t>& pcm);
-    void Drain(std::vector<int16_t>& pcm);
+#ifdef _WIN32
+    bool Configure(IMFTransform* t) const;
+    HRESULT Feed(IMFTransform* t, const uint8_t* data, std::vector<int16_t>& pcm, HRESULT& out);  // input result
+    HRESULT Drain(IMFTransform* t, std::vector<int16_t>& pcm);  // the last ProcessOutput result
+#endif
 };
 
 // frames starting in this packet; the last may run on into the next
@@ -162,6 +166,9 @@ void XmaDecoder::Impl::EndPacket(std::vector<int16_t>& pcm) {
 
 using Microsoft::WRL::ComPtr;
 
+// length prefixed frames of 512 samples; the 0x1000 bit XMA streams carry makes the Windows decoder refuse them
+constexpr uint16_t kXmaDecodeFlags = 0x00D6;
+
 bool XmaDecoder::Impl::Open() {
     static std::once_flag started;
     static bool mf = false;
@@ -172,11 +179,20 @@ bool XmaDecoder::Impl::Open() {
         if (!std::exchange(logged, true)) LOGE("XMA: the Windows WMA Pro decoder is missing, XMA plays as silence");
         return false;
     }
+    if (!Configure(mft.Get())) {
+        LOGE("XMA: the WMA Pro decoder takes no %u Hz %u channel stream", rate, channels);
+        mft.Reset();
+        return false;
+    }
+    return true;
+}
+
+// the input and output types, then streaming starts
+bool XmaDecoder::Impl::Configure(IMFTransform* t) const {
     // WAVEFORMATEX then the WMA Pro extra data: bits per sample, channel mask, 8 reserved bytes, decode flags
     constexpr uint32_t kExtraBytes = 18;
     constexpr uint32_t kMaskOffset = 2;
     constexpr uint32_t kFlagsOffset = 14;
-    constexpr uint16_t kXmaDecodeFlags = 0x10D6;  // length prefixed frames of 512 samples
 #pragma pack(push, 1)
     struct {
         WAVEFORMATEX wfx;
@@ -202,40 +218,49 @@ bool XmaDecoder::Impl::Open() {
     bool ok = SUCCEEDED(MFCreateMediaType(&in_type)) && SUCCEEDED(MFCreateMediaType(&out_type)) &&
               SUCCEEDED(MFInitMediaTypeFromWaveFormatEx(in_type.Get(), &in.wfx, sizeof(in))) &&
               SUCCEEDED(MFInitMediaTypeFromWaveFormatEx(out_type.Get(), &out, sizeof(out))) &&
-              SUCCEEDED(mft->SetInputType(0, in_type.Get(), 0)) && SUCCEEDED(mft->SetOutputType(0, out_type.Get(), 0));
-    if (!ok) {
-        LOGE("XMA: the WMA Pro decoder takes no %u Hz %u channel stream", rate, channels);
-        mft.Reset();
-        return false;
-    }
-    mft->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
-    mft->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+              SUCCEEDED(t->SetInputType(0, in_type.Get(), 0)) && SUCCEEDED(t->SetOutputType(0, out_type.Get(), 0));
+    if (!ok) return false;
+    t->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+    t->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
     return true;
 }
 
 void XmaDecoder::Impl::Decode(const uint8_t* data, std::vector<int16_t>& pcm) {
+    size_t before = pcm.size();
+    HRESULT out = E_FAIL;
+    HRESULT in = Feed(mft.Get(), data, pcm, out);
+    static int logged = 0;
+    if (logged < 3) {
+        logged++;
+        LOGR("XMA: WMA Pro packet %d: input %08lX, output %08lX, %zu samples", logged, in, out, pcm.size() - before);
+    }
+}
+
+HRESULT XmaDecoder::Impl::Feed(IMFTransform* t, const uint8_t* data, std::vector<int16_t>& pcm, HRESULT& out) {
     ComPtr<IMFMediaBuffer> buffer;
     ComPtr<IMFSample> sample;
     BYTE* p = nullptr;
     if (FAILED(MFCreateMemoryBuffer(kPacketBytes, &buffer)) || FAILED(MFCreateSample(&sample)) ||
         FAILED(buffer->Lock(&p, nullptr, nullptr))) {
-        return;
+        return E_OUTOFMEMORY;
     }
     std::memcpy(p, data, kPacketBytes);
     buffer->Unlock();
     buffer->SetCurrentLength(kPacketBytes);
     sample->AddBuffer(buffer.Get());
-    if (mft->ProcessInput(0, sample.Get(), 0) == MF_E_NOTACCEPTING) {
-        Drain(pcm);
-        mft->ProcessInput(0, sample.Get(), 0);
+    HRESULT in = t->ProcessInput(0, sample.Get(), 0);
+    if (in == MF_E_NOTACCEPTING) {
+        Drain(t, pcm);
+        in = t->ProcessInput(0, sample.Get(), 0);
     }
-    Drain(pcm);
+    out = Drain(t, pcm);
+    return in;
 }
 
-void XmaDecoder::Impl::Drain(std::vector<int16_t>& pcm) {
+HRESULT XmaDecoder::Impl::Drain(IMFTransform* t, std::vector<int16_t>& pcm) {
     constexpr DWORD kOutputBytes = 0x10000;
     MFT_OUTPUT_STREAM_INFO info{};
-    mft->GetOutputStreamInfo(0, &info);
+    t->GetOutputStreamInfo(0, &info);
     bool provided = info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES;
     for (;;) {
         MFT_OUTPUT_DATA_BUFFER out{};
@@ -244,15 +269,15 @@ void XmaDecoder::Impl::Drain(std::vector<int16_t>& pcm) {
         if (!provided) {
             if (FAILED(MFCreateSample(&sample)) ||
                 FAILED(MFCreateMemoryBuffer(std::max(info.cbSize, kOutputBytes), &buffer))) {
-                return;
+                return E_OUTOFMEMORY;
             }
             sample->AddBuffer(buffer.Get());
             out.pSample = sample.Get();
         }
         DWORD status = 0;
-        HRESULT hr = mft->ProcessOutput(0, 1, &out, &status);
+        HRESULT hr = t->ProcessOutput(0, 1, &out, &status);
         if (out.pEvents) out.pEvents->Release();
-        if (FAILED(hr)) return;
+        if (FAILED(hr)) return hr;
         if (provided) sample.Attach(out.pSample);
         ComPtr<IMFMediaBuffer> data;
         BYTE* p = nullptr;
@@ -269,7 +294,6 @@ void XmaDecoder::Impl::Drain(std::vector<int16_t>& pcm) {
 
 bool XmaDecoder::Impl::Open() { return false; }
 void XmaDecoder::Impl::Decode(const uint8_t*, std::vector<int16_t>&) {}
-void XmaDecoder::Impl::Drain(std::vector<int16_t>&) {}
 
 #endif
 

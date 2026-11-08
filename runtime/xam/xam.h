@@ -50,4 +50,7 @@ uint32_t NewEnumerator(std::shared_ptr<Enumerator> e);
 void ShowUi();
 void Notify(uint32_t id, uint32_t param);
 
+// system link sockets closed, before another executable takes over
+void CloseSockets();
+
 }  // namespace xam

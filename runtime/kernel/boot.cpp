@@ -17,6 +17,7 @@
 #include "app/app.h"
 #include "cpu/dispatch.h"
 #include "kernel/kernel.h"
+#include "xam/xam.h"
 
 namespace kernel {
 
@@ -114,6 +115,7 @@ void Relaunch(const char* exe) {
 #endif
     }
     g_relaunching = true;
+    xam::CloseSockets();
     app::HandOver(path);
 }
 

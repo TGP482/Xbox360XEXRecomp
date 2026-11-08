@@ -6,11 +6,8 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
-#include <cstdio>
 #include <cstring>
 #include <deque>
-#include <filesystem>
-#include <fstream>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -18,7 +15,6 @@
 #include <utility>
 #include <vector>
 
-#include "app/app.h"
 #include "audio/xaudio2.h"
 #include "audio/xma_decoder.h"
 #include "core/log.h"
@@ -389,20 +385,6 @@ void ReportXmaStall(const Voice& v) {
     if (std::exchange(logged, true)) return;
     LOGR("xaudio: XMA voice at %u Hz, %u channels, pitch %.2f decodes %u packets a frame without enough samples", v.rate,
          v.channels, v.pitch, kXmaPacketsPerFrame);
-}
-
-// the first XMA buffers raw into CrashDumps, to check the decode offline
-void DumpXma(const Voice& v, const Packet& k) {
-    constexpr int kDumps = 4;
-    static int dumped = 0;
-    if (dumped >= kDumps) return;
-    auto dir = app::ExeDir() / "CrashDumps";
-    std::error_code e;
-    std::filesystem::create_directories(dir, e);
-    char name[64];
-    std::snprintf(name, sizeof(name), "xma_%d_%u_%u.bin", dumped, v.rate, v.channels);
-    std::ofstream(dir / name, std::ios::binary).write(static_cast<const char*>(HostPtr(k.buffer)), k.bytes);
-    LOGR("xaudio: XMA buffer %d, %u bytes, loops %u, dumped", dumped++, k.bytes, k.loops);
 }
 
 // one output frame of the voice into out (channels interleaved), resampled by its rate and pitch
@@ -847,7 +829,6 @@ HLE_FUNC(XAudioSourceVoice_SubmitPacket) {
         uint32_t length = R32(p + kPacketLoopLength) / align;
         k.loop_end = length ? k.loop_start + length : 0;
         if (!k.buffer || !k.bytes) return kInvalidArg;
-        if (v.type == kTypeXma) DumpXma(v, k);
         v.packets.push_back(k);
         return kOk;
     });

@@ -10,6 +10,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -367,6 +368,32 @@ bool ReadState(uint32_t dev, gpu::State& s, const ShaderEntry*& vs) {
     return true;
 }
 
+// diagnostic: the vertex inputs and textures of the first draws of one present
+void LogDrawInputs(uint32_t dev, const gpu::DrawArgs& a, const std::vector<gpu::StreamFetch>& streams,
+                   const gpu::State& s, uint32_t up_stride) {
+    constexpr uint32_t kPresent = 420;
+    constexpr int kDraws = 24;
+    static int logged = 0;
+    if (g_presents != kPresent || logged >= kDraws) return;
+    LOGR("d3d9: present %u draw %d: prim %u, count %u, up stride %u", kPresent, logged++, a.prim, a.count, up_stride);
+    for (size_t k = 0; k < streams.size(); k++) {
+        const gpu::StreamFetch& sf = streams[k];
+        const gpu::VertexFetchConstant& f = sf.fetch;
+        char bytes[2 * 16 + 1] = {};
+        for (uint32_t i = 0; sf.data && i < 16 && f.address + i < sf.size; i++) {
+            std::snprintf(bytes + 2 * i, 3, "%02X", sf.data[f.address + i]);
+        }
+        LOGR("d3d9:   fetch %zu: offset %u, stride %u, format %X, swizzle %03X, endian %u, vertex 0 %s", k, f.address,
+             f.stride, f.format, f.swizzle, sf.endian, bytes);
+    }
+    if (!s.ps) return;
+    for (const gpu::TextureBinding& b : Backend()->Info(s.ps).textures) {
+        uint32_t at = dev + kDevFetch + b.fetch * 24;
+        LOGR("d3d9:   texture %u: %08X %08X %08X %08X %08X %08X", b.fetch, R32(at), R32(at + 4), R32(at + 8),
+             R32(at + 12), R32(at + 16), R32(at + 20));
+    }
+}
+
 void Draw(uint32_t dev, gpu::DrawArgs& a, uint32_t up_data = 0, uint32_t up_bytes = 0, uint32_t up_stride = 0) {
     std::lock_guard lock(g_lock);
     gpu::Backend* backend = Backend();
@@ -375,6 +402,7 @@ void Draw(uint32_t dev, gpu::DrawArgs& a, uint32_t up_data = 0, uint32_t up_byte
     if (!ReadState(dev, s, vs)) return;
     std::vector<gpu::StreamFetch> streams = Streams(dev, *vs, up_data, up_bytes, up_stride);
     a.streams = streams.data();
+    LogDrawInputs(dev, a, streams, s, up_stride);
     backend->Draw(s, a);
 }
 

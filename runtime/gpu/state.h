@@ -121,4 +121,12 @@ struct ResolveArgs {
     uint32_t clear_stencil = 0;
 };
 
+// a texture's level 0 copied into another's, as D3DX's surface copy does; an empty rect is the whole texture
+struct CopyArgs {
+    uint32_t src[6] = {};  // texture fetch constants, host order, GPU addresses
+    uint32_t dst[6] = {};
+    Rect src_rect{};  // texels
+    Rect dst_rect{};
+};
+
 }  // namespace gpu

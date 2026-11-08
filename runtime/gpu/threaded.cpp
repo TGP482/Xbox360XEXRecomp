@@ -27,7 +27,7 @@ constexpr size_t kFetchBytes = 32 * 6 * 4;
 
 constexpr uint64_t kNotEnded = UINT64_MAX;
 
-enum class Op { Draw, Clear, Resolve, Present, BeginQuery, EndQuery };
+enum class Op { Draw, Clear, Resolve, Copy, Present, BeginQuery, EndQuery };
 
 struct Command {
     Op op = Op::Draw;
@@ -41,6 +41,7 @@ struct Command {
     std::vector<StreamFetch> streams;
     std::vector<uint8_t> data;  // indices, then each stream's vertices
     ResolveArgs resolve;
+    CopyArgs copy;
     uint32_t flags = 0;
     float color[4] = {};
     float z = 1;
@@ -183,6 +184,11 @@ public:
         c->resolve = r;
         Push(std::move(c));
     }
+    void Copy(const CopyArgs& a) override {
+        std::unique_ptr<Command> c = New(Op::Copy);
+        c->copy = a;
+        Push(std::move(c));
+    }
     void Present(const uint32_t front[6]) override {
         std::unique_ptr<Command> c = New(Op::Present);
         std::memcpy(c->front, front, sizeof(c->front));
@@ -250,6 +256,7 @@ private:
                 inner_->Clear(c.state, c.flags, c.color, c.z, c.stencil, c.has_rect ? &c.rect : nullptr);
                 break;
             case Op::Resolve: inner_->Resolve(c.state, c.resolve); break;
+            case Op::Copy: inner_->Copy(c.copy); break;
             case Op::Present: inner_->Present(c.front); break;
             case Op::BeginQuery: inner_->BeginQuery(c.query); break;
             case Op::EndQuery: inner_->EndQuery(c.query); break;

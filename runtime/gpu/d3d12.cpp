@@ -362,6 +362,7 @@ public:
     void Clear(const State& s, uint32_t flags, const float color[4], float z, uint32_t stencil,
                const Rect* rect) override;
     void Resolve(const State& s, const ResolveArgs& r) override;
+    void Copy(const CopyArgs& c) override;
     void Present(const uint32_t front[6]) override;
     void BeginQuery(uint32_t query) override;
     void EndQuery(uint32_t query) override;
@@ -465,6 +466,9 @@ private:
                     uint32_t h);
     void RenderUi();
     void CopyResolve(Target& src, Resolved& dst, const ResolveArgs& r);
+    Resolved& EnsureResolved(uint64_t key, DXGI_FORMAT format, uint32_t w, uint32_t h);
+    void DropResolved(uint32_t base);
+    void CopyResolved(Resolved& from, Resolved& to, const Rect& src, const Rect& dst);
 
     // passes
     ID3D12PipelineState* EnsurePassPipeline(const std::string& hlsl, const char* entry, DXGI_FORMAT rtv, float blend);
@@ -1788,28 +1792,9 @@ void D3D12Backend::Resolve(const State& s, const ResolveArgs& r) {
         CapSave(*src, name, 1);
     }
     if (src && fi.block == 1 && fi.convert != xenos::Convert::Unsupported) {
-        Resolved& dst = resolved_[ResolvedKey(r.dst_base, src->key)];
         uint32_t w = std::max(r.dst_pitch, 1u);
         uint32_t h = std::max(r.dst_height, 1u);
-        if (!dst.res || dst.format != fi.host || dst.width != w || dst.height != h) {
-            if (dst.res) {
-                Release(dst.res);
-            } else if (!free_rtv_.empty()) {
-                dst.view = free_rtv_.back();
-                free_rtv_.pop_back();
-            }
-            dst.format = fi.host;
-            dst.width = w;
-            dst.height = h;
-            uint32_t hw = uint32_t(std::ceil(w * scale_));
-            uint32_t hh = uint32_t(std::ceil(h * scale_));
-            D3D12_RESOURCE_DESC d = TextureDesc(fi.host, hw, hh);
-            d.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-            D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
-            dst.state = D3D12_RESOURCE_STATE_RENDER_TARGET;
-            dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, dst.state, nullptr, IID_PPV_ARGS(&dst.res));
-            dev_->CreateRenderTargetView(dst.res.Get(), nullptr, Rtv(dst.view));
-        }
+        Resolved& dst = EnsureResolved(ResolvedKey(r.dst_base, src->key), fi.host, w, h);
         if (dst.res) CopyResolve(*src, dst, r);
     } else if (src) {
         static bool logged = false;
@@ -1819,6 +1804,87 @@ void D3D12Backend::Resolve(const State& s, const ResolveArgs& r) {
         ClearTarget(*src, r.clear, r.clear_color, r.clear_z, uint8_t(r.clear_stencil), nullptr, 0);
         ClearSpan(*src, r.clear, r.clear_color, r.clear_z, uint8_t(r.clear_stencil));
     }
+}
+
+// the host texture read in place of guest memory, made again when the format or size changes
+Resolved& D3D12Backend::EnsureResolved(uint64_t key, DXGI_FORMAT format, uint32_t w, uint32_t h) {
+    Resolved& dst = resolved_[key];
+    if (dst.res && dst.format == format && dst.width == w && dst.height == h) return dst;
+    if (dst.res) {
+        Release(dst.res);
+    } else if (!free_rtv_.empty()) {
+        dst.view = free_rtv_.back();
+        free_rtv_.pop_back();
+    }
+    dst.format = format;
+    dst.width = w;
+    dst.height = h;
+    uint32_t hw = uint32_t(std::ceil(w * scale_));
+    uint32_t hh = uint32_t(std::ceil(h * scale_));
+    D3D12_RESOURCE_DESC d = TextureDesc(format, hw, hh);
+    d.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    dst.state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, dst.state, nullptr, IID_PPV_ARGS(&dst.res));
+    dev_->CreateRenderTargetView(dst.res.Get(), nullptr, Rtv(dst.view));
+    return dst;
+}
+
+// guest memory at base is read again
+void D3D12Backend::DropResolved(uint32_t base) {
+    std::erase_if(resolved_, [&](auto& entry) {
+        Resolved& r = entry.second;
+        if (uint32_t(entry.first) != base) return false;
+        if (r.res) {
+            Release(r.res);
+            free_rtv_.push_back(r.view);
+        }
+        return true;
+    });
+}
+
+// D3DX copies through guest memory: a resolve's copy is made here and kept like the resolve, any other copy leaves
+// the destination to guest memory
+void D3D12Backend::Copy(const CopyArgs& c) {
+    xenos::TextureFetch src = xenos::DecodeTextureFetch(c.src);
+    xenos::TextureFetch dst = xenos::DecodeTextureFetch(c.dst);
+    if (dst.mip_min || src.base == dst.base) return;
+    std::vector<uint64_t> keys;  // the source's resolves, one per target key
+    for (auto& [key, r] : resolved_) {
+        if (uint32_t(key) == src.base && !src.mip_min && r.res) keys.push_back(key >> 32);
+    }
+    const xenos::FormatInfo& fi = xenos::Info(dst.format);
+    if (keys.empty() || fi.block != 1 || fi.convert == xenos::Convert::Unsupported) {
+        DropResolved(dst.base);
+        return;
+    }
+    Rect from = c.src_rect;
+    if (from.x2 <= from.x1 || from.y2 <= from.y1) from = {0, 0, int32_t(src.width), int32_t(src.height)};
+    Rect to = c.dst_rect;
+    if (to.x2 <= to.x1 || to.y2 <= to.y1) to = {0, 0, int32_t(dst.width), int32_t(dst.height)};
+    uint32_t w = dst.pitch ? dst.pitch : dst.width;
+    for (uint64_t key : keys) {
+        Resolved& out = EnsureResolved(ResolvedKey(dst.base, key), fi.host, w, dst.height);
+        if (out.res) CopyResolved(resolved_[ResolvedKey(src.base, key)], out, from, to);
+    }
+}
+
+// from's rect over to's, filtered as D3DX's linear and box filters do
+void D3D12Backend::CopyResolved(Resolved& from, Resolved& to, const Rect& src, const Rect& dst) {
+    Transition(from.res.Get(), from.state, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+    Transition(to.res.Get(), to.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = Rtv(to.view);
+    cl_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    float dw = (dst.x2 - dst.x1) * scale_;
+    float dh = (dst.y2 - dst.y1) * scale_;
+    D3D12_VIEWPORT vp{dst.x1 * scale_, dst.y1 * scale_, dw, dh, 0, 1};
+    D3D12_RECT sc{0, 0, LONG(std::ceil(to.width * scale_)), LONG(std::ceil(to.height * scale_))};
+    cl_->RSSetViewports(1, &vp);
+    cl_->RSSetScissorRects(1, &sc);
+    float w = float(from.width);
+    float h = float(from.height);
+    float uv[4] = {src.x1 / w, src.y1 / h, (src.x2 - src.x1) / w, (src.y2 - src.y1) / h};
+    Blit(from.res.Get(), from.format, uv, false, true, 1, 1, to.format);
 }
 
 void D3D12Backend::CopyResolve(Target& src, Resolved& dst, const ResolveArgs& r) {

@@ -487,6 +487,12 @@ void ResolveTo(uint32_t dev, const ResolveCall& c) {
     return vp;
 }
 
+// a surface's copy of its texture's fetch constant, mip_min set to its level, with a GPU address
+[[maybe_unused]] void SurfaceFetch(uint32_t surface, uint32_t out[6]) {
+    for (uint32_t i = 0; i < 6; i++) out[i] = R32(surface + XDK_Texture_FetchConstant + i * 4);
+    out[1] = mem::PhysicalFromVirtual(out[1] & 0xFFFFF000) | (out[1] & 0xFFF);
+}
+
 }  // namespace
 
 // Shaders: the library makes its object, the host translates the container's microcode as created
@@ -584,6 +590,21 @@ HLE_FUNC(D3DDevice_Resolve) {
     ResolveTo(a[0], c);
     return 0;
 }
+
+#ifdef SUB_D3DXLoadSurfaceFromSurface
+// (dst surface, palette, dst rect, src surface, palette, src rect, filter, colour key): D3DX copies guest memory,
+// which holds no resolve, so the renderer copies a resolved source too
+HLE_AFTER(D3DXLoadSurfaceFromSurface) {
+    if (int32_t(ctx.r[3]) < 0 || !a[0] || !a[3]) return;
+    gpu::CopyArgs c;
+    SurfaceFetch(a[0], c.dst);
+    SurfaceFetch(a[3], c.src);
+    if (a[2]) c.dst_rect = ReadRect(a[2]);
+    if (a[5]) c.src_rect = ReadRect(a[5]);
+    std::lock_guard lock(g_lock);
+    Backend()->Copy(c);
+}
+#endif
 
 #ifdef SUB_D3DDevice_BeginTiling
 // what the library's own code reads of the tiles: their rects, as given and aligned to 32

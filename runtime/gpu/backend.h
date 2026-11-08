@@ -24,6 +24,8 @@ public:
     virtual void Clear(const State& s, uint32_t flags, const float color[4], float z, uint32_t stencil,
                        const Rect* rect) = 0;
     virtual void Resolve(const State& s, const ResolveArgs& r) = 0;
+    // the title copies a texture through guest memory, which holds no resolve the renderer keeps
+    virtual void Copy(const CopyArgs&) {}
     // front: the frame buffer's texture fetch constant, host order
     virtual void Present(const uint32_t front[6]) = 0;
     // occlusion: pixels passing between Begin and End, false while the GPU is not past them; the caller numbers them

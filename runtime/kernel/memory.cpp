@@ -425,13 +425,13 @@ uint32_t AllocPhysical(uint32_t size, uint32_t protect, uint32_t lowest, uint32_
     uint32_t shift = page == kPage ? kPage : 0;
     // highest fit first: low memory stays free for requests limited to it
     uint32_t pa = g_physical.Alloc(size + shift, align, lowest, hi, true);
-    if (!pa || !CommitPhysical(pa, size)) {
+    if (!pa || !CommitPhysical(pa, size + shift)) {
         LOGE("memory: physical allocation of %X bytes failed (%X..%X align %X), %llu KB in use", size, lowest,
              highest, align, (unsigned long long)(g_physical.Used() >> 10));
         if (pa) g_physical.Free(pa);
         return 0;
     }
-    for (uint32_t p = pa; p < pa + size; p += kPage) g_physical_committed[p >> 12] = 1;
+    for (uint32_t p = pa; p < pa + size + shift; p += kPage) g_physical_committed[p >> 12] = 1;
     if (shift) MarkWindow4k(pa + kPage, size, 1);
     uint32_t va = WindowOf(page) + pa;
     std::memset(g_base + va, 0, size);

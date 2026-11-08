@@ -274,8 +274,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     RegisterClassExW(&wc);
     app::g_hwnd = CreateWindowExW(0, wc.lpszClassName, app::kGame.title, WS_POPUP, 0, 0, 1280, 720,
                                   nullptr, nullptr, inst, nullptr);
-    // behind a splash the window stays hidden until the game's first frame
-    if (!splash) {
+    // behind a splash the window stays hidden until the game's first frame; handed over, it is set up hidden
+    if (app::HandingOver()) {
+        app::ApplyNow();
+    } else if (!splash) {
         app::ApplyNow();
         ShowWindow(app::g_hwnd, SW_SHOW);
     }

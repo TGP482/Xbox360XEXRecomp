@@ -1690,6 +1690,11 @@ void D3D12Backend::Present(const uint32_t front[6]) {
     cl_->ClearRenderTargetView(rh, black, 0, nullptr);
     cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
     auto resolved = resolved_.find(t.base);
+    static bool logged = false;
+    if (!std::exchange(logged, true)) {
+        const char* from = resolved != resolved_.end() ? "a resolve" : "guest memory";
+        LOGR("D3D12: first present of %08X, %ux%u, from %s", t.base, t.width, t.height, from);
+    }
     if (resolved != resolved_.end()) {
         Resolved& r = resolved->second;
         BlitToSwap(r.res.Get(), r.state, r.format, ComponentMapping(t), uint32_t(std::ceil(r.width * scale_)),

@@ -125,7 +125,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (intptr_t result = 0; kGame.message && kGame.message(hwnd, msg, wp, lp, &result)) return result;
     switch (msg) {
         case WM_KEYDOWN:
-            if (wp == VK_F3) DumpThreads();
+            if (wp == VK_F3) {
+                DumpThreads();
+                WriteCrashDump(nullptr);  // host stacks too, for hangs
+            }
             return 0;
         case WM_ACTIVATE:
             if (LOWORD(wp) == WA_INACTIVE) {

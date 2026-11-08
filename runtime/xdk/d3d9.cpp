@@ -289,7 +289,7 @@ std::vector<gpu::StreamFetch> Streams(uint32_t dev, const ShaderEntry& vs, uint3
         if (up_stride) {
             sf.data = bytes(up_data);
             sf.size = up_bytes;
-            sf.endian = 0;
+            sf.endian = 2;  // 8 in 32, as the library's fetch constant for user pointer data
             sf.fetch = FetchFromElement(de, up_stride);
             continue;
         }

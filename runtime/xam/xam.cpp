@@ -117,7 +117,13 @@ void ReportMessage(uint32_t app, uint32_t message) {
 
 }  // namespace
 
+// the invite app's accepted invite query (XInviteGetAcceptedInfo): none is ever accepted, which the console answers with
+// a failure, else the title offers to join a session that is not there
+constexpr uint32_t kMsgInviteAccepted = 0x58023;
+constexpr uint32_t kHresultFail = 0x80004005;
+
 XAM_EXPORT(0x1F4, XMsgInProcessCall) {
+    if (a[1] == kMsgInviteAccepted) return kHresultFail;
     ReportMessage(a[0], a[1]);
     return kErrorSuccess;
 }

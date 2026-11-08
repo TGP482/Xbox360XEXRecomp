@@ -201,6 +201,7 @@ struct Resolved {
     uint32_t width = 0;  // title texels
     uint32_t height = 0;
     uint32_t view = 0;  // RTV slot
+    int32_t copied = -1;  // the guest format a D3DX copy wrote, which block compressed fetches may read
 };
 
 // everything a pipeline depends on beyond the root signature
@@ -1248,7 +1249,7 @@ Resolved* D3D12Backend::FindResolved(const xenos::TextureFetch& t, const Texture
     auto resolved = resolved_.find(ResolvedKey(t.base, key));
     if (resolved == resolved_.end()) return nullptr;
     // a block compressed fetch never reads a resolve: the address was reused since
-    bool blocks = xenos::Info(t.format).block > 1;
+    bool blocks = xenos::Info(t.format).block > 1 && resolved->second.copied != int32_t(t.format);
     return b.dimension <= 1 && !blocks ? &resolved->second : nullptr;
 }
 
@@ -1795,6 +1796,7 @@ void D3D12Backend::Resolve(const State& s, const ResolveArgs& r) {
         uint32_t w = std::max(r.dst_pitch, 1u);
         uint32_t h = std::max(r.dst_height, 1u);
         Resolved& dst = EnsureResolved(ResolvedKey(r.dst_base, src->key), fi.host, w, h);
+        dst.copied = -1;
         if (dst.res) CopyResolve(*src, dst, r);
     } else if (src) {
         static bool logged = false;
@@ -1854,17 +1856,19 @@ void D3D12Backend::Copy(const CopyArgs& c) {
         if (uint32_t(key) == src.base && !src.mip_min && r.res) keys.push_back(key >> 32);
     }
     const xenos::FormatInfo& fi = xenos::Info(dst.format);
-    if (keys.empty() || fi.block != 1 || fi.convert == xenos::Convert::Unsupported) {
+    if (keys.empty() || fi.convert == xenos::Convert::Unsupported) {
         DropResolved(dst.base);
         return;
     }
+    // a block compressed destination is held uncompressed
+    DXGI_FORMAT host = fi.block > 1 ? DXGI_FORMAT_R8G8B8A8_UNORM : fi.host;
     Rect from = c.src_rect;
     if (from.x2 <= from.x1 || from.y2 <= from.y1) from = {0, 0, int32_t(src.width), int32_t(src.height)};
     Rect to = c.dst_rect;
     if (to.x2 <= to.x1 || to.y2 <= to.y1) to = {0, 0, int32_t(dst.width), int32_t(dst.height)};
-    uint32_t w = dst.pitch ? dst.pitch : dst.width;
     for (uint64_t key : keys) {
-        Resolved& out = EnsureResolved(ResolvedKey(dst.base, key), fi.host, w, dst.height);
+        Resolved& out = EnsureResolved(ResolvedKey(dst.base, key), host, dst.width, dst.height);
+        out.copied = int32_t(dst.format);
         if (out.res) CopyResolved(resolved_[ResolvedKey(src.base, key)], out, from, to);
     }
 }

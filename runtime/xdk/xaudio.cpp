@@ -12,6 +12,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "audio/xaudio2.h"
@@ -41,6 +42,7 @@ constexpr uint32_t kInvalidArg = 0x80070057;  // E_INVALIDARG
 constexpr uint32_t kQueueMin = 3;              // host buffers of a frame kept queued, grown on a starve
 constexpr uint32_t kQueueMax = 10;
 constexpr uint32_t kXmaPacketBytes = audio::XmaDecoder::kPacketBytes;
+constexpr uint32_t kXmaPacketsPerFrame = 16;  // a working stream needs one or two
 constexpr uint8_t kReverbEffect = 3;  // the id of the library's reverb in its effect table
 
 // a title's effect: registered as 12 bytes {u8 id out, GetSize, Create}, its object's vtable has Release at 4 and
@@ -146,6 +148,7 @@ struct Voice {
     std::unique_ptr<audio::XmaDecoder> xma;
     std::vector<int16_t> pcm;  // XMA decoded, interleaved
     uint32_t xma_packet = 0;   // next XMA packet in the current buffer
+    uint32_t xma_budget = 0;   // XMA packets it may still decode this frame
     bool xma_flushed = false;
 };
 
@@ -353,6 +356,8 @@ bool XmaReady(Voice& v, uint32_t f) {
     uint32_t packets = p.bytes / kXmaPacketBytes;
     while (v.pcm.size() / v.channels <= f) {
         if (v.xma_packet < packets) {
+            if (!v.xma_budget) return false;
+            v.xma_budget--;
             v.xma->Packet(static_cast<const uint8_t*>(HostPtr(p.buffer + v.xma_packet++ * kXmaPacketBytes)), v.pcm);
             continue;
         }
@@ -374,15 +379,28 @@ uint32_t PacketEnd(Voice& v) {
 
 bool FrameReady(Voice& v, uint32_t f) { return v.type == kTypeXma ? XmaReady(v, f) : f < PacketEnd(v); }
 
+// decoding stops for the frame and picks up on the next, so the engine never waits on it
+void ReportXmaStall(const Voice& v) {
+    static bool logged = false;
+    if (std::exchange(logged, true)) return;
+    LOGR("xaudio: XMA voice at %u Hz, %u channels, pitch %.2f decodes %u packets a frame without enough samples", v.rate,
+         v.channels, v.pitch, kXmaPacketsPerFrame);
+}
+
 // one output frame of the voice into out (channels interleaved), resampled by its rate and pitch
 void RenderSource(Voice& v, float* out) {
     double step = double(v.rate) / kRate * std::exp2(v.pitch);
     constexpr uint32_t kMaxTurns = 64;  // packets or loops that play nothing
     uint32_t s = 0;
     uint32_t turns = 0;
+    v.xma_budget = kXmaPacketsPerFrame;
     while (s < kFrame && !v.packets.empty()) {
         uint32_t f = uint32_t(v.frame);
         if (!FrameReady(v, f)) {
+            if (v.type == kTypeXma && !v.xma_budget) {
+                ReportXmaStall(v);
+                break;
+            }
             if (++turns > kMaxTurns) {
                 v.packets.clear();
                 break;

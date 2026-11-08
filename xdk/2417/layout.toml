@@ -26,6 +26,12 @@ Device_IndexBuffer = 0x30F4
 Device_RenderTargets = 0x30F8
 Device_DepthStencil = 0x3108
 Device_StreamStrides = 0x3190
+# SetStreamSource's table, 8 bytes per stream {offset, vertex buffer}; the library builds the fetch constants from it
+# only in the flush host draws skip (3529 writes them in SetStreamSource, 821F7630, and has no key)
+Device_Streams = 0x310C
+# vertex buffer: CPU address and size in bytes, each with the fetch constant bits 0 to 1 (type, endian)
+VertexBuffer_Address = 0xC
+VertexBuffer_Size = 0x10
 Device_PixelShader = 0x3290
 Device_VertexShader = 0x3294
 # the command ring, allocated a segment at a time: write pointer, segment end, limit, segment start

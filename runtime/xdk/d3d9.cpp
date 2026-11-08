@@ -48,6 +48,11 @@ constexpr uint32_t kDevIndices = XDK_Device_IndexBuffer;
 constexpr uint32_t kDevTargets = XDK_Device_RenderTargets;  // 4 surfaces
 constexpr uint32_t kDevDepth = XDK_Device_DepthStencil;
 constexpr uint32_t kDevStrides = XDK_Device_StreamStrides;  // a byte per stream, in dwords
+// builds whose SetStreamSource leaves the fetch constants to the flush host draws skip: its table, 8 bytes per
+// stream {offset, vertex buffer}, and the buffer's CPU address and size (fetch type and endian in the low bits)
+constexpr uint32_t kDevStreams = XDK_Device_Streams;
+constexpr uint32_t kVbAddress = XDK_VertexBuffer_Address;
+constexpr uint32_t kVbSize = XDK_VertexBuffer_Size;
 constexpr uint32_t kDevPixelShader = XDK_Device_PixelShader;
 constexpr uint32_t kDevVertexShader = XDK_Device_VertexShader;
 // the register shadow, a bank per 0x80 registers from 0x2000
@@ -321,15 +326,39 @@ gpu::VertexFetchConstant FetchFromElement(const DeclElement& el, uint32_t stride
     return f;
 }
 
-// GPU addresses (fetch constants, index buffers) are physical
+// fetch constant addresses are physical
 const uint8_t* GpuBytes(uint32_t pa) { return static_cast<const uint8_t*>(HostPtr(mem::VirtualFromPhysical(pa))); }
+
+// a stream's bytes from its vertex fetch constant, stream n in slot 95 - n; false without one
+bool FetchStream(uint32_t dev, uint32_t stream, gpu::StreamFetch& sf) {
+    constexpr uint32_t kSlots = 96;
+    uint32_t slot = kSlots - 1 - std::min<uint32_t>(stream, kSlots - 1);
+    uint32_t d0 = R32(dev + kDevFetch + slot * 8);
+    uint32_t d1 = R32(dev + kDevFetch + slot * 8 + 4);
+    sf.data = GpuBytes(d0 & ~3u);
+    sf.endian = d1 & 3;
+    sf.size = (d1 >> 2 & 0xFFFFFF) * 4;
+    return true;
+}
+
+// a stream's bytes from SetStreamSource's table; false when no buffer is set
+bool TableStream(uint32_t dev, uint32_t stream, gpu::StreamFetch& sf) {
+    uint32_t source = dev + kDevStreams + stream * 8;
+    uint32_t vb = R32(source + 4);
+    if (!vb) return false;
+    uint32_t offset = R32(source);
+    uint32_t size = R32(vb + kVbSize) - offset;
+    sf.data = static_cast<const uint8_t*>(HostPtr((R32(vb + kVbAddress) & ~3u) + offset));
+    sf.endian = size & 3;
+    sf.size = (size >> 2 & 0xFFFFFF) * 4;
+    return true;
+}
 
 // where each fetch of the vertex shader reads: the declaration's element for its semantic, from that element's
 // stream; up_data and up_stride stand in for stream 0 in DrawVerticesUP and DrawIndexedVerticesUP
 std::vector<gpu::StreamFetch> Streams(uint32_t dev, const ShaderEntry& vs, uint32_t up_data, uint32_t up_bytes,
                                       uint32_t up_stride) {
     auto bytes = [](uint32_t address) { return static_cast<const uint8_t*>(HostPtr(address)); };
-    constexpr uint32_t kSlots = 96;  // vertex fetch constants, stream n in slot 95 - n
     const gpu::ShaderInfo& info = g_backend->Info(vs.shader);
     uint32_t decl = R32(dev + kDevDecl);
     std::vector<gpu::StreamFetch> out(info.fetches.size());
@@ -347,12 +376,8 @@ std::vector<gpu::StreamFetch> Streams(uint32_t dev, const ShaderEntry& vs, uint3
             sf.fetch = FetchFromElement(de, up_stride);
             continue;
         }
-        uint32_t slot = kSlots - 1 - std::min<uint32_t>(de.stream, kSlots - 1);
-        uint32_t d0 = R32(dev + kDevFetch + slot * 8);
-        uint32_t d1 = R32(dev + kDevFetch + slot * 8 + 4);
-        sf.data = GpuBytes(d0 & ~3u);
-        sf.endian = d1 & 3;
-        sf.size = (d1 >> 2 & 0xFFFFFF) * 4;
+        bool found = kDevStreams != xdk::kUnknown ? TableStream(dev, de.stream, sf) : FetchStream(dev, de.stream, sf);
+        if (!found) continue;
         sf.fetch = FetchFromElement(de, R8(dev + kDevStrides + de.stream) * 4);
     }
     return out;
@@ -533,7 +558,9 @@ HLE_FUNC(D3DDevice_DrawIndexedVertices) {
     } else {
         d.index_endian = d.index32 ? 2 : 1;
     }
-    d.indices = GpuBytes(R32(ib + XDK_IndexBuffer_Address) + a[3] * (d.index32 ? 4 : 2));
+    // the buffer keeps its CPU address, the library converts it for the GPU itself
+    uint32_t first = R32(ib + XDK_IndexBuffer_Address) + a[3] * (d.index32 ? 4 : 2);
+    d.indices = static_cast<const uint8_t*>(HostPtr(first));
     Draw(a[0], d);
     return 0;
 }

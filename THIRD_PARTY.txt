@@ -64,3 +64,10 @@ freely, subject to the following restrictions:
 2. Altered source versions must be plainly marked as such, and must not be
    misrepresented as being the original software.
 3. This notice may not be removed or altered from any source distribution.
+
+
+FFmpeg 8.1 (https://ffmpeg.org): libavcodec, libavutil and libswresample, shipped beside the executables
+
+The unmodified LGPL shared build from https://github.com/BtbN/FFmpeg-Builds, loaded at run time and replaceable by any
+build of the same major versions. FFmpeg is licensed under the GNU Lesser General Public License version 2.1 or later;
+the full license text is FFmpeg-LICENSE.txt beside the executables. Source: https://github.com/FFmpeg/FFmpeg/tree/n8.1

@@ -4,7 +4,7 @@
 #   -n exe name (default: the generated folder's name)
 #   -x regex of sources to leave out (repeatable)   -e extra source file (repeatable)
 #   -G folder for the generated objects (default <out>/gen), shared between builds of the same generated code
-# env: CXX (clang++), JOBS (nproc)
+# env: CXX (clang++), JOBS (nproc), FFMPEG (the folder whose include holds libavcodec, /usr)
 # Leaves out the window, SDL input, XAudio2 and D3D12 parts of the runtime and the sources of the repo's other images
 # (src/<name> for each other folder beside the generated one); the harness supplies their stand ins.
 set -e
@@ -24,7 +24,7 @@ CXX=${CXX:-clang++}; JOBS=${JOBS:-$(nproc)}
 BASE="-std=c++20 -march=x86-64-v2 -fno-strict-aliasing"
 # the game code as the Windows build makes it: PowerPC rounds each step, fma is explicit
 GAME="$BASE -O1 -g0 -w -ffp-contract=off -fno-math-errno"
-HOST="$BASE -O1 -g -I$REPO/src -I$RT -I$GEN -I$H -I$H/compat"
+HOST="$BASE -O1 -g -I$REPO/src -I$RT -I$GEN -I$H -I$H/compat -I${FFMPEG:-/usr}/include"
 
 # generated code, an object rebuilt only when its partition is newer
 export CXX GAME RT GEN GEN_OBJ

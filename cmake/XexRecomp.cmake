@@ -20,7 +20,12 @@ set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
 # guest threads read the pads, which SDL's debug-only main thread checks reject
 set(SDL_ASSERTIONS release CACHE STRING "" FORCE)
 FetchContent_Declare(SDL3 GIT_REPOSITORY https://github.com/libsdl-org/SDL.git GIT_TAG release-3.4.16 GIT_SHALLOW TRUE)
-FetchContent_MakeAvailable(tomlplusplus imgui SDL3)
+# FFmpeg's LGPL shared build for XMA (libavcodec's XMA2 decoder): the runtime loads its DLLs, the headers match them
+FetchContent_Declare(ffmpeg
+    URL https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-lgpl-shared-8.1.zip)
+FetchContent_MakeAvailable(tomlplusplus imgui SDL3 ffmpeg)
+file(GLOB XEX_FFMPEG_DLLS ${ffmpeg_SOURCE_DIR}/bin/avcodec-*.dll ${ffmpeg_SOURCE_DIR}/bin/avutil-*.dll
+    ${ffmpeg_SOURCE_DIR}/bin/swresample-*.dll)
 
 # What the game needs to build its code on the player's PC (runtime/app/game_code.cpp), beside the executables: the
 # recompiler, clang and lld from the toolchain building this, the game's configs, the XDK layouts they include and the
@@ -89,9 +94,11 @@ endif()
 if(NOT XEX_DXC_DIR)
     message(WARNING "dxcompiler.dll and dxil.dll not found, set XEX_DXC_DIR to the folder holding them")
 endif()
-# SDL's headers go to the input code alone (it is linked LINK_ONLY)
+# SDL's headers go to the input code alone (it is linked LINK_ONLY), FFmpeg's to the XMA decoder
 set_source_files_properties(${XEX_SDK_DIR}/runtime/core/input.cpp PROPERTIES
     INCLUDE_DIRECTORIES "${sdl3_SOURCE_DIR}/include")
+set_source_files_properties(${XEX_SDK_DIR}/runtime/audio/xma_decoder.cpp PROPERTIES
+    INCLUDE_DIRECTORIES "${ffmpeg_SOURCE_DIR}/include")
 
 # One executable per recompiled image: the SDK runtime, XEX_HOST_SOURCES shared by every image of the game, and
 # src/<game_dir> hooks only this image has. The image's code goes to <target>.dll beside it, which the executable delay
@@ -136,9 +143,13 @@ function(add_xex_image target xex config partitions game_dir)
     target_compile_options(${target} PRIVATE -fno-strict-aliasing)
     target_compile_definitions(${target} PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
     target_link_libraries(${target} PRIVATE tomlplusplus::tomlplusplus $<LINK_ONLY:SDL3::SDL3-static> d3d12 dxgi dxguid
-        d3dcompiler xaudio2 ole32 windowscodecs dbghelp winmm dwmapi ws2_32 mfplat mfuuid wmcodecdspuuid)
+        d3dcompiler xaudio2 ole32 windowscodecs dbghelp winmm dwmapi ws2_32)
     target_link_libraries(${target} PRIVATE ${GEN}/code.lib delayimp)
     target_link_options(${target} PRIVATE -fuse-ld=lld -g -Wl,/delayload:${target}.dll)
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${XEX_FFMPEG_DLLS} $<TARGET_FILE_DIR:${target}>
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${ffmpeg_SOURCE_DIR}/LICENSE.txt
+                $<TARGET_FILE_DIR:${target}>/FFmpeg-LICENSE.txt)
     if(XEX_DXC_DIR)
         add_custom_command(TARGET ${target} POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different ${XEX_DXC_DIR}/dxcompiler.dll ${XEX_DXC_DIR}/dxil.dll

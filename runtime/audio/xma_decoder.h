@@ -5,8 +5,7 @@
 
 namespace audio {
 
-// XMA to PCM: XMA frames are WMA Pro frames, repacked into WMA Pro packets and decoded by Windows' own WMA Pro
-// decoder; silence where that decoder is missing
+// XMA to PCM through libavcodec's XMA2 decoder; silence where FFmpeg's libraries are missing
 class XmaDecoder {
 public:
     static constexpr uint32_t kPacketBytes = 2048;
@@ -15,7 +14,7 @@ public:
     ~XmaDecoder();
     // one XMA packet; 16 bit samples, interleaved, appended to pcm
     void Packet(const uint8_t* packet, std::vector<int16_t>& pcm);
-    // the frames held back for a full packet, once the input has run dry
+    // the samples the decoder holds back, once the input has run dry; the next packet starts a new stream
     void Flush(std::vector<int16_t>& pcm);
 
 private:

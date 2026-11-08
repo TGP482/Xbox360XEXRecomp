@@ -466,8 +466,11 @@ void ResolveTo(uint32_t dev, const ResolveCall& c) {
     uint32_t d0 = R32(f);
     uint32_t d1 = R32(f + 4);
     uint32_t d2 = R32(f + 8);
-    r.dst_base = d1 & 0xFFFFF000;
+    // the texture header holds a CPU address, draws fetch the GPU address SetTexture makes of it
+    r.dst_base = mem::PhysicalFromVirtual(d1 & 0xFFFFF000);
     r.dst_format = d1 & 0x3F;
+    // the library sets RB_COPY_DEST_INFO's swap when the destination reads red from z
+    r.swap = (R32(f + 12) >> 1 & 7) != 0;
     uint32_t width = (d2 & 0x1FFF) + 1;
     r.dst_height = (d2 >> 13 & 0x1FFF) + 1;
     uint32_t pitch = (d0 >> 22 & 0x1FF) * 32;
@@ -703,6 +706,7 @@ HLE_FUNC(D3DDevice_Swap) {
         if (a[1]) {
             uint32_t front[6];
             for (uint32_t i = 0; i < 6; i++) front[i] = R32(a[1] + XDK_Texture_FetchConstant + i * 4);
+            front[1] = mem::PhysicalFromVirtual(front[1] & 0xFFFFF000) | (front[1] & 0xFFF);
             Backend()->Present(front);
         }
     }

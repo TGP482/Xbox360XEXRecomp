@@ -108,12 +108,13 @@ enum : uint32_t { kClearColors = 0xF, kClearZ = 0x10, kClearStencil = 0x20 };
 struct ResolveArgs {
     uint32_t source = 0;  // colour target 0 to 3, 4 the depth target
     Rect rect{};          // in the target's pixels
-    uint32_t dst_base = 0;  // CPU address
+    uint32_t dst_base = 0;  // GPU address
     uint32_t dst_format = 6;  // xenos::TexFormat
     uint32_t dst_pitch = 0;   // texels
     uint32_t dst_height = 0;
     int32_t dst_x = 0;
     int32_t dst_y = 0;
+    bool swap = false;   // red and blue exchanged on the way
     uint32_t clear = 0;  // kClear* after the copy
     float clear_color[4] = {};
     float clear_z = 1;

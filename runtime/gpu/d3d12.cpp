@@ -1712,6 +1712,7 @@ void D3D12Backend::CopyResolve(Target& src, Resolved& dst, const ResolveArgs& r)
     v.Format = src.depth ? DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS : ColorReadFormat(src.format);
     v.ViewDimension = ms ? D3D12_SRV_DIMENSION_TEXTURE2DMS : D3D12_SRV_DIMENSION_TEXTURE2D;
     v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    if (r.swap && !src.depth) v.Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(2, 1, 0, 3);
     v.Texture2D.MipLevels = 1;
     Transition(src.res.Get(), src.state, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
     dev_->CreateShaderResourceView(src.res.Get(), &v, ViewCpu(views));

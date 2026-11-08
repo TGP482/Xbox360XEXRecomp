@@ -1369,6 +1369,14 @@ Rect D3D12Backend::GuestScissor(const State& s, uint32_t w, uint32_t h) const {
         y1 += SignedBits(wo, 16, 15);
         y2 += SignedBits(wo, 16, 15);
     }
+    // a draw predicated to some tiles covers only them
+    const Rect& p = s.predicated;
+    if (p.x2 > p.x1) {
+        x1 = std::max(x1, p.x1);
+        y1 = std::max(y1, p.y1);
+        x2 = std::max(std::min(x2, p.x2), x1);
+        y2 = std::max(std::min(y2, p.y2), y1);
+    }
     auto clamp = [](int32_t v, uint32_t limit) { return std::clamp(v, 0, int32_t(limit)); };
     return {clamp(x1, w), clamp(y1, h), clamp(x2, w), clamp(y2, h)};
 }

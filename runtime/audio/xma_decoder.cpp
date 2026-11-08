@@ -106,8 +106,10 @@ struct XmaDecoder::Impl {
     bool Open();
     void Decode(const uint8_t* data, std::vector<int16_t>& pcm);
 #ifdef _WIN32
-    bool Configure(IMFTransform* t) const;
-    HRESULT Feed(IMFTransform* t, const uint8_t* data, std::vector<int16_t>& pcm, HRESULT& out);  // input result
+    bool Configure(IMFTransform* t, uint16_t flags, DWORD avg_bytes, bool float_out) const;
+    // input result; index numbers the packet for its sample time, -1 for none
+    HRESULT Feed(IMFTransform* t, const uint8_t* data, std::vector<int16_t>& pcm, HRESULT& out, int64_t index);
+    void Probe(const std::vector<uint8_t>& packets);
     HRESULT Drain(IMFTransform* t, std::vector<int16_t>& pcm);  // the last ProcessOutput result
 #endif
 };
@@ -179,7 +181,7 @@ bool XmaDecoder::Impl::Open() {
         if (!std::exchange(logged, true)) LOGE("XMA: the Windows WMA Pro decoder is missing, XMA plays as silence");
         return false;
     }
-    if (!Configure(mft.Get())) {
+    if (!Configure(mft.Get(), kXmaDecodeFlags, rate * channels * 2, false)) {
         LOGE("XMA: the WMA Pro decoder takes no %u Hz %u channel stream", rate, channels);
         mft.Reset();
         return false;
@@ -188,7 +190,7 @@ bool XmaDecoder::Impl::Open() {
 }
 
 // the input and output types, then streaming starts
-bool XmaDecoder::Impl::Configure(IMFTransform* t) const {
+bool XmaDecoder::Impl::Configure(IMFTransform* t, uint16_t flags, DWORD avg_bytes, bool float_out) const {
     // WAVEFORMATEX then the WMA Pro extra data: bits per sample, channel mask, 8 reserved bytes, decode flags
     constexpr uint32_t kExtraBytes = 18;
     constexpr uint32_t kMaskOffset = 2;
@@ -202,7 +204,7 @@ bool XmaDecoder::Impl::Configure(IMFTransform* t) const {
     in.wfx.wFormatTag = WAVE_FORMAT_WMAUDIO3;
     in.wfx.nChannels = WORD(channels);
     in.wfx.nSamplesPerSec = rate;
-    in.wfx.nAvgBytesPerSec = rate * channels * 2;
+    in.wfx.nAvgBytesPerSec = avg_bytes;
     in.wfx.nBlockAlign = WORD(kPacketBytes);
     in.wfx.wBitsPerSample = 16;
     in.wfx.cbSize = kExtraBytes;
@@ -210,8 +212,11 @@ bool XmaDecoder::Impl::Configure(IMFTransform* t) const {
     uint32_t mask = channels == 2 ? SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT : SPEAKER_FRONT_CENTER;
     std::memcpy(in.extra, &bits, 2);
     std::memcpy(in.extra + kMaskOffset, &mask, 4);
-    std::memcpy(in.extra + kFlagsOffset, &kXmaDecodeFlags, 2);
-    WAVEFORMATEX out{WAVE_FORMAT_PCM, WORD(channels), rate, rate * channels * 2, WORD(channels * 2), 16, 0};
+    std::memcpy(in.extra + kFlagsOffset, &flags, 2);
+    WORD out_bits = float_out ? 32 : 16;
+    WORD out_align = WORD(channels * out_bits / 8);
+    WORD out_tag = float_out ? WAVE_FORMAT_IEEE_FLOAT : WAVE_FORMAT_PCM;
+    WAVEFORMATEX out{out_tag, WORD(channels), rate, rate * out_align, out_align, out_bits, 0};
 
     ComPtr<IMFMediaType> in_type;
     ComPtr<IMFMediaType> out_type;
@@ -225,10 +230,63 @@ bool XmaDecoder::Impl::Configure(IMFTransform* t) const {
     return true;
 }
 
+// diagnostic: the first packets through fresh decoders in several setups, results to the log
+void XmaDecoder::Impl::Probe(const std::vector<uint8_t>& packets) {
+    struct Setup {
+        const char* name;
+        uint16_t flags;
+        DWORD avg_bytes;
+        bool times;
+        bool float_out;
+    };
+    const DWORD packet_rate = kPacketBytes * rate / 1024;  // bytes a second at two 512 sample frames a packet
+    const Setup setups[] = {
+        {"as now", kXmaDecodeFlags, rate * channels * 2, false, false},
+        {"sample times", kXmaDecodeFlags, rate * channels * 2, true, false},
+        {"packet byte rate", kXmaDecodeFlags, packet_rate, true, false},
+        {"float output", kXmaDecodeFlags, packet_rate, true, true},
+        {"flags 0056", 0x0056, packet_rate, true, false},
+        {"flags 00D0", 0x00D0, packet_rate, true, false},
+        {"flags 10D6", 0x10D6, packet_rate, true, false},
+    };
+    size_t count = packets.size() / kPacketBytes;
+    for (const Setup& u : setups) {
+        ComPtr<IMFTransform> t;
+        if (FAILED(CoCreateInstance(CLSID_CWMADecMediaObject, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&t))) ||
+            !Configure(t.Get(), u.flags, u.avg_bytes, u.float_out)) {
+            LOGR("XMA probe %s: no decoder for this setup", u.name);
+            continue;
+        }
+        std::vector<int16_t> out;
+        HRESULT first_bad_input = S_OK;
+        HRESULT last_output = S_OK;
+        int first_output = -1;
+        for (size_t i = 0; i < count; i++) {
+            HRESULT o = S_OK;
+            HRESULT in = Feed(t.Get(), &packets[i * kPacketBytes], out, o, u.times ? int64_t(i) : -1);
+            if (FAILED(in) && first_bad_input == S_OK) first_bad_input = in;
+            last_output = o;
+            if (!out.empty() && first_output < 0) first_output = int(i);
+        }
+        LOGR("XMA probe %s: %zu packets, first input failure %08lX, last output %08lX, %zu bytes out, first after "
+             "packet %d", u.name, count, first_bad_input, last_output, out.size() * 2, first_output);
+    }
+}
+
 void XmaDecoder::Impl::Decode(const uint8_t* data, std::vector<int16_t>& pcm) {
+    constexpr size_t kProbePackets = 64;
+    static std::vector<uint8_t> probe;
+    static bool probed = false;
+    if (!probed) {
+        probe.insert(probe.end(), data, data + kPacketBytes);
+        if (probe.size() == kProbePackets * kPacketBytes) {
+            probed = true;
+            Probe(probe);
+        }
+    }
     size_t before = pcm.size();
     HRESULT out = E_FAIL;
-    HRESULT in = Feed(mft.Get(), data, pcm, out);
+    HRESULT in = Feed(mft.Get(), data, pcm, out, -1);
     static int logged = 0;
     if (logged < 3) {
         logged++;
@@ -236,7 +294,8 @@ void XmaDecoder::Impl::Decode(const uint8_t* data, std::vector<int16_t>& pcm) {
     }
 }
 
-HRESULT XmaDecoder::Impl::Feed(IMFTransform* t, const uint8_t* data, std::vector<int16_t>& pcm, HRESULT& out) {
+HRESULT XmaDecoder::Impl::Feed(IMFTransform* t, const uint8_t* data, std::vector<int16_t>& pcm, HRESULT& out,
+                               int64_t index) {
     ComPtr<IMFMediaBuffer> buffer;
     ComPtr<IMFSample> sample;
     BYTE* p = nullptr;
@@ -248,6 +307,11 @@ HRESULT XmaDecoder::Impl::Feed(IMFTransform* t, const uint8_t* data, std::vector
     buffer->Unlock();
     buffer->SetCurrentLength(kPacketBytes);
     sample->AddBuffer(buffer.Get());
+    if (index >= 0) {
+        LONGLONG packet_time = 10000000LL * 1024 / rate;  // 100 ns units
+        sample->SetSampleTime(index * packet_time);
+        sample->SetSampleDuration(packet_time);
+    }
     HRESULT in = t->ProcessInput(0, sample.Get(), 0);
     if (in == MF_E_NOTACCEPTING) {
         Drain(t, pcm);

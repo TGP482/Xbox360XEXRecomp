@@ -10,7 +10,6 @@
 #include <windows.h>
 
 #include <algorithm>
-#include <bit>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -60,14 +59,13 @@ constexpr uint32_t kDevRingSegment = XDK_Device_RingSegment;
 constexpr uint32_t kDevRingSegmentStart = XDK_Device_RingSegmentStart;
 constexpr uint32_t kRingReserve = 0xA0;  // bytes the library keeps free at a segment's end
 constexpr uint8_t kGpuFlagCpuFences = uint8_t(XDK_Device_GpuFlagCpuFences);  // the library writes its own fences
-// predicated tiling, where the config knows it: drawn as one target over every tile
-constexpr bool kTiling = XDK_Device_TilingFlags != xdk::kUnknown;
+// predicated tiling, as the library's other code reads it
 constexpr uint32_t kDevTilingFlags = XDK_Device_TilingFlags;
 constexpr uint8_t kTilingOn = uint8_t(XDK_Device_TilingOn);
 constexpr uint32_t kDevTileCount = XDK_Device_TileCount;
+constexpr uint32_t kDevTileRects = XDK_Device_TileRects;
+constexpr uint32_t kDevTileRectsAligned = XDK_Device_TileRectsAligned;
 constexpr uint32_t kDevPredication = XDK_Device_Predication;
-constexpr uint32_t kDevTilingWidth = XDK_Device_TilingWidth;
-constexpr uint32_t kDevTilingHeight = XDK_Device_TilingHeight;
 
 // D3DDevice_ClearF flags, and Resolve's
 constexpr uint32_t kClearDepth = 0x10;
@@ -82,6 +80,15 @@ constexpr uint32_t kHrPending = 1;  // S_FALSE
 std::recursive_mutex g_lock;
 std::unique_ptr<gpu::Backend> g_backend;
 uint32_t g_presents = 0;
+
+// Predicated tiling drawn by the host: every tile is one target, a draw predicated to some tiles is scissored to them
+struct Tiling {
+    bool on = false;
+    std::vector<gpu::Rect> tiles;
+    gpu::Rect extent{};  // from 0, 0 to the furthest tile corner
+    uint32_t select = 0;  // SetPredication's bits, tile i is 3 << 2i, 0 for every tile
+};
+Tiling g_tiling;
 
 void RequireLayout() {
     XDK_REQUIRE("d3d9", XDK_KEY(Device_FetchConstants), XDK_KEY(Device_VsConstants), XDK_KEY(Device_BoolConstants),
@@ -107,6 +114,10 @@ void RequireLayout() {
     if constexpr (kDevRingBase != xdk::kUnknown) {
         XDK_REQUIRE("d3d9", XDK_KEY(Device_RingSegment), XDK_KEY(Device_RingSegmentEnd), XDK_KEY(Device_RingLimit));
     }
+#ifdef SUB_D3DDevice_BeginTiling
+    XDK_REQUIRE("d3d9", XDK_KEY(Device_TilingFlags), XDK_KEY(Device_TilingOn), XDK_KEY(Device_TileCount),
+                XDK_KEY(Device_TileRects), XDK_KEY(Device_TileRectsAligned), XDK_KEY(Device_Predication));
+#endif
 }
 
 gpu::Backend* Backend() {
@@ -229,6 +240,28 @@ void Link(const ShaderEntry& vs, const ShaderEntry* ps, gpu::ShaderOptions& link
 
 // Draw state
 
+gpu::Rect ReadRect(uint32_t va) {
+    return {int32_t(R32(va)), int32_t(R32(va + 4)), int32_t(R32(va + 8)), int32_t(R32(va + 12))};
+}
+
+gpu::Rect Union(const gpu::Rect& a, const gpu::Rect& b) {
+    return {std::min(a.x1, b.x1), std::min(a.y1, b.y1), std::max(a.x2, b.x2), std::max(a.y2, b.y2)};
+}
+
+// the area of the tiles a predicated draw is for, empty when it is for all of them
+gpu::Rect SelectedTiles() {
+    gpu::Rect area{};
+    bool any = false;
+    for (size_t i = 0; i < g_tiling.tiles.size(); i++) {
+        if (!(g_tiling.select >> (2 * i) & 3)) continue;
+        area = any ? Union(area, g_tiling.tiles[i]) : g_tiling.tiles[i];
+        any = true;
+    }
+    if (!g_tiling.select || !any) return {};
+    bool whole = area.x1 <= 0 && area.y1 <= 0 && area.x2 >= g_tiling.extent.x2 && area.y2 >= g_tiling.extent.y2;
+    return whole ? gpu::Rect{} : area;
+}
+
 void ReadRegisters(uint32_t dev, gpu::State& s) {
     constexpr uint32_t kBankRegs = 0x80;
     constexpr uint32_t kBanks = std::size(kDevBanks);
@@ -238,19 +271,11 @@ void ReadRegisters(uint32_t dev, gpu::State& s) {
             s.regs[b * kBankRegs + i] = R32(dev + kDevBanks[b] + i * 4);
         }
     }
-    if (kTiling && (R8(dev + kDevTilingFlags) & kTilingOn)) {
-        s.tiled_width = R32(dev + kDevTilingWidth);
-        s.tiled_height = R32(dev + kDevTilingHeight);
+    if (g_tiling.on) {
+        s.tiled_width = uint32_t(g_tiling.extent.x2);
+        s.tiled_height = uint32_t(g_tiling.extent.y2);
+        s.predicated = SelectedTiles();
     }
-}
-
-// a resolve EndTiling makes for a tile before the last: its clear readies EDRAM for the next tile on the console
-bool TileBeforeLast(uint32_t dev) {
-    if (!kTiling || !(R8(dev + kDevTilingFlags) & kTilingOn)) return false;
-    uint32_t select = R32(dev + kDevPredication);
-    if (!select) return false;
-    uint32_t tile = uint32_t(std::countr_zero(select)) / 2;  // tile i is 3 << 2i
-    return tile + 1 < R32(dev + kDevTileCount);
 }
 
 // the declaration element a fetch reads: usage and usage index as the shader container names them
@@ -356,6 +381,80 @@ void Draw(uint32_t dev, gpu::DrawArgs& a, uint32_t up_data = 0, uint32_t up_byte
 // the library writes its own fences once the device is in the mode that does not wait on a GPU
 void UseCpuFences(uint32_t dev) { W8(dev + kDevGpuFlags, R8(dev + kDevGpuFlags) | kGpuFlagCpuFences); }
 
+// D3DCLEAR flags on the bound targets, within rect or the scissor; colour is a guest float4, 0 for black
+[[maybe_unused]] void ClearBound(uint32_t dev, uint32_t flags, uint32_t color, float z, uint32_t stencil,
+                                 const gpu::Rect* rect) {
+    flags &= gpu::kClearColors | kClearDepth | kClearStencil;
+    for (uint32_t i = 0; i < 4; i++) {
+        if (!R32(dev + kDevTargets + i * 4)) flags &= ~(1u << i);
+    }
+    if (!R32(dev + kDevDepth)) flags &= ~(kClearDepth | kClearStencil);
+    if (!flags) return;
+    std::lock_guard lock(g_lock);
+    gpu::State s;
+    ReadRegisters(dev, s);
+    float rgba[4] = {};
+    if (color) {
+        for (uint32_t i = 0; i < 4; i++) rgba[i] = GF(color + i * 4);
+    }
+    Backend()->Clear(s, flags, rgba, z, stencil, rect);
+}
+
+// a resolve as the library takes it: the source rect (null for the destination's size), where it lands, then the clear
+struct ResolveCall {
+    uint32_t flags = 0;
+    uint32_t tex = 0;  // the destination texture
+    const gpu::Rect* rect = nullptr;
+    int32_t dst_x = 0;
+    int32_t dst_y = 0;
+    uint32_t color = 0;  // the clear's guest float4, 0 for black
+    float z = 1;
+    uint32_t stencil = 0;
+};
+
+void ResolveTo(uint32_t dev, const ResolveCall& c) {
+    if (!c.tex) return;
+    std::lock_guard lock(g_lock);
+    gpu::State s;
+    ReadRegisters(dev, s);
+    gpu::ResolveArgs r;
+    r.source = c.flags & 7;
+    uint32_t f = c.tex + XDK_Texture_FetchConstant;
+    uint32_t d0 = R32(f);
+    uint32_t d1 = R32(f + 4);
+    uint32_t d2 = R32(f + 8);
+    r.dst_base = d1 & 0xFFFFF000;
+    r.dst_format = d1 & 0x3F;
+    uint32_t width = (d2 & 0x1FFF) + 1;
+    r.dst_height = (d2 >> 13 & 0x1FFF) + 1;
+    uint32_t pitch = (d0 >> 22 & 0x1FF) * 32;
+    r.dst_pitch = pitch ? pitch : width;
+    r.rect = c.rect ? *c.rect : gpu::Rect{0, 0, int32_t(width), int32_t(r.dst_height)};
+    r.dst_x = c.dst_x;
+    r.dst_y = c.dst_y;
+    if (c.flags & kResolveClearTarget && r.source != kResolveSourceDepth) r.clear |= 1u << r.source;
+    if (c.flags & kResolveClearDepth) r.clear |= kClearDepth | kClearStencil;
+    if (c.color) {
+        for (uint32_t i = 0; i < 4; i++) r.clear_color[i] = GF(c.color + i * 4);
+    }
+    r.clear_z = c.z;
+    r.clear_stencil = c.stencil;
+    Backend()->Resolve(s, r);
+}
+
+// SetViewport's whole target viewport, which the library's tiling code sets on its way in and out
+[[maybe_unused]] uint32_t WholeViewport() {
+    static uint32_t vp = 0;
+    if (!vp) {
+        constexpr uint32_t kWhole = 0x7FFFFFFF;
+        constexpr uint32_t kOne = 0x3F800000;  // 1.0f
+        vp = mem::AllocSystem(24);
+        const uint32_t v[6] = {0, 0, kWhole, kWhole, 0, kOne};
+        for (uint32_t i = 0; i < 6; i++) W32(vp + i * 4, v[i]);
+    }
+    return vp;
+}
+
 }  // namespace
 
 // Shaders: the library makes its object, the host translates the container's microcode as created
@@ -424,24 +523,9 @@ HLE_FUNC(D3DDevice_DrawIndexedVerticesUP) {
 #ifdef SUB_D3DDevice_ClearF
 // (device, flags, rect, colour float4, f1 z, r8 stencil): flags bits 0 to 3 the colour targets, 0x10 z, 0x20 stencil
 HLE_FUNC(D3DDevice_ClearF) {
-    uint32_t dev = a[0];
-    uint32_t flags = a[1] & 0x3F;
-    for (uint32_t i = 0; i < 4; i++) {
-        if (!R32(dev + kDevTargets + i * 4)) flags &= ~(1u << i);
-    }
-    if (!R32(dev + kDevDepth)) flags &= ~(kClearDepth | kClearStencil);
-    if (!flags) return 0;
-    std::lock_guard lock(g_lock);
-    gpu::Backend* backend = Backend();
-    gpu::State s;
-    ReadRegisters(dev, s);
-    float color[4] = {};
-    if (a[3]) {
-        for (uint32_t i = 0; i < 4; i++) color[i] = GF(a[3] + i * 4);
-    }
     gpu::Rect rect{};
-    if (a[2]) rect = {int32_t(R32(a[2])), int32_t(R32(a[2] + 4)), int32_t(R32(a[2] + 8)), int32_t(R32(a[2] + 12))};
-    backend->Clear(s, flags, color, float(a.Float(0)), a[5], a[2] ? &rect : nullptr);
+    if (a[2]) rect = ReadRect(a[2]);
+    ClearBound(a[0], a[1], a[3], float(a.Float(0)), a[5], a[2] ? &rect : nullptr);
     return 0;
 }
 #endif
@@ -450,44 +534,112 @@ HLE_FUNC(D3DDevice_ClearF) {
 // clear stencil)
 HLE_FUNC(D3DDevice_Resolve) {
     constexpr uint32_t kClearStencilArg = 9;  // after the float's slot
-    uint32_t dev = a[0];
-    uint32_t flags = a[1];
-    uint32_t tex = a[3];
-    std::lock_guard lock(g_lock);
-    gpu::Backend* backend = Backend();
-    gpu::State s;
-    ReadRegisters(dev, s);
-    gpu::ResolveArgs r;
-    r.source = flags & 7;
-    if (tex) {
-        uint32_t f = tex + XDK_Texture_FetchConstant;
-        uint32_t d0 = R32(f);
-        uint32_t d1 = R32(f + 4);
-        uint32_t d2 = R32(f + 8);
-        r.dst_base = d1 & 0xFFFFF000;
-        r.dst_format = d1 & 0x3F;
-        uint32_t width = (d2 & 0x1FFF) + 1;
-        r.dst_height = (d2 >> 13 & 0x1FFF) + 1;
-        uint32_t pitch = (d0 >> 22 & 0x1FF) * 32;
-        r.dst_pitch = pitch ? pitch : width;
-        r.rect = {0, 0, int32_t(width), int32_t(r.dst_height)};
-    }
-    if (a[2]) r.rect = {int32_t(R32(a[2])), int32_t(R32(a[2] + 4)), int32_t(R32(a[2] + 8)), int32_t(R32(a[2] + 12))};
+    gpu::Rect rect{};
+    if (a[2]) rect = ReadRect(a[2]);
+    ResolveCall c;
+    c.flags = a[1];
+    c.tex = a[3];
+    c.rect = a[2] ? &rect : nullptr;
     if (a[4]) {
-        r.dst_x = int32_t(R32(a[4]));
-        r.dst_y = int32_t(R32(a[4] + 4));
+        c.dst_x = int32_t(R32(a[4]));
+        c.dst_y = int32_t(R32(a[4] + 4));
     }
-    if (flags & kResolveClearTarget && r.source != kResolveSourceDepth) r.clear |= 1u << r.source;
-    if (flags & kResolveClearDepth) r.clear |= kClearDepth | kClearStencil;
-    if (a[7]) {
-        for (uint32_t i = 0; i < 4; i++) r.clear_color[i] = GF(a[7] + i * 4);
-    }
-    r.clear_z = float(a.Float(0));
-    r.clear_stencil = a[kClearStencilArg];
-    if (TileBeforeLast(dev)) r.clear = 0;
-    if (tex) backend->Resolve(s, r);
+    c.color = a[7];
+    c.z = float(a.Float(0));
+    c.stencil = a[kClearStencilArg];
+    ResolveTo(a[0], c);
     return 0;
 }
+
+#ifdef SUB_D3DDevice_BeginTiling
+// what the library's own code reads of the tiles: their rects, as given and aligned to 32
+void WriteTileRects(uint32_t dev) {
+    auto align = [](int32_t v, int32_t round) { return uint32_t((v + round) & ~31); };
+    for (size_t i = 0; i < g_tiling.tiles.size(); i++) {
+        const gpu::Rect& r = g_tiling.tiles[i];
+        uint32_t at = uint32_t(i) * 16;
+        const uint32_t exact[4] = {uint32_t(r.x1), uint32_t(r.y1), uint32_t(r.x2), uint32_t(r.y2)};
+        const uint32_t aligned[4] = {align(r.x1, 0), align(r.y1, 0), align(r.x2, 31), align(r.y2, 31)};
+        for (uint32_t k = 0; k < 4; k++) {
+            W32(dev + kDevTileRects + at + k * 4, exact[k]);
+            W32(dev + kDevTileRectsAligned + at + k * 4, aligned[k]);
+        }
+    }
+    W32(dev + kDevTileCount, uint32_t(g_tiling.tiles.size()));
+}
+
+// (device, flags, tile count, tile rects, clear colour, f1 clear z, clear stencil): the tiles become one host target,
+// cleared over them unless the flags skip the first tile's clear
+HLE_FUNC(D3DDevice_BeginTiling) {
+    constexpr uint32_t kSkipFirstClear = 1;
+    constexpr uint32_t kMaxTiles = 15;  // the device's rect arrays
+    uint32_t dev = a[0];
+    uint32_t count = std::min(a[2], kMaxTiles);
+    {
+        std::lock_guard lock(g_lock);
+        g_tiling = {};
+        for (uint32_t i = 0; i < count; i++) {
+            gpu::Rect r = ReadRect(a[3] + i * 16);
+            g_tiling.tiles.push_back(r);
+            g_tiling.extent.x2 = std::max(g_tiling.extent.x2, r.x2);
+            g_tiling.extent.y2 = std::max(g_tiling.extent.y2, r.y2);
+        }
+        g_tiling.on = count > 0;
+        WriteTileRects(dev);
+        W32(dev + kDevPredication, 0);
+        if (g_tiling.on) W8(dev + kDevTilingFlags, uint8_t(R8(dev + kDevTilingFlags) | kTilingOn));
+        if (g_tiling.on && !(a[1] & kSkipFirstClear)) {
+            uint32_t all = gpu::kClearColors | kClearDepth | kClearStencil;
+            ClearBound(dev, all, a[4], float(a.Float(0)), a[6], &g_tiling.extent);
+        }
+    }
+    CallGuest(ctx, SYM(D3DDevice_SetViewport), {dev, WholeViewport()});
+    return 0;
+}
+#endif
+
+#ifdef SUB_D3DDevice_EndTiling
+// (device, resolve flags, resolve rects, destination texture, clear colour, f1 clear z, clear stencil, parameters):
+// one resolve over every tile, then the clear the flags ask for
+HLE_FUNC(D3DDevice_EndTiling) {
+    uint32_t dev = a[0];
+    {
+        std::lock_guard lock(g_lock);
+        gpu::Rect area{};
+        for (size_t i = 0; i < g_tiling.tiles.size(); i++) {
+            gpu::Rect r = a[2] ? ReadRect(a[2] + uint32_t(i) * 16) : g_tiling.tiles[i];
+            area = i ? Union(area, r) : r;
+        }
+        if (!g_tiling.tiles.empty()) {
+            ResolveCall c;
+            c.flags = a[1];
+            c.tex = a[3];
+            c.rect = &area;
+            c.dst_x = area.x1;
+            c.dst_y = area.y1;
+            c.color = a[4];
+            c.z = float(a.Float(0));
+            c.stencil = a[6];
+            ResolveTo(dev, c);
+        }
+        g_tiling = {};
+        W8(dev + kDevTilingFlags, uint8_t(R8(dev + kDevTilingFlags) & ~kTilingOn));
+        W32(dev + kDevPredication, 0);
+    }
+    CallGuest(ctx, SYM(D3DDevice_SetViewport), {dev, WholeViewport()});
+    return 0;
+}
+#endif
+
+#ifdef SUB_D3DDevice_SetPredication
+// (device, tile bits): tile i is 3 << 2i; the draws that follow cover only the selected tiles
+HLE_FUNC(D3DDevice_SetPredication) {
+    W32(a[0] + kDevPredication, a[1]);
+    std::lock_guard lock(g_lock);
+    g_tiling.select = a[1];
+    return 0;
+}
+#endif
 
 // (device, front buffer texture, parameters)
 HLE_FUNC(D3DDevice_Swap) {

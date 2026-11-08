@@ -40,6 +40,10 @@ enum : uint32_t {
 // a translated shader the renderer made from the title's microcode
 struct Shader;
 
+struct Rect {
+    int32_t x1, y1, x2, y2;
+};
+
 struct State {
     uint32_t regs[kRegCount] = {};  // host order, from kRegFirst
     // guest memory, big endian: float constants (vertex 256 then pixel 256), bools 8 dwords, loops 32 dwords,
@@ -54,6 +58,7 @@ struct State {
     // predicated tiling drawn as one target: the tiles' whole extent while the title draws tiled, else 0
     uint32_t tiled_width = 0;
     uint32_t tiled_height = 0;
+    Rect predicated{};  // the tiles a predicated draw is for, empty for all of them
 
     uint32_t Reg(uint32_t r) const { return regs[r - kRegFirst]; }
     float RegF(uint32_t r) const {
@@ -98,10 +103,6 @@ struct DrawArgs {
 
 // D3DDevice_ClearF flags: a bit per colour target, then depth and stencil
 enum : uint32_t { kClearColors = 0xF, kClearZ = 0x10, kClearStencil = 0x20 };
-
-struct Rect {
-    int32_t x1, y1, x2, y2;
-};
 
 // a copy out of a render target into a texture in guest memory, as D3D Resolve describes it
 struct ResolveArgs {

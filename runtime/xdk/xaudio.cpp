@@ -1,7 +1,9 @@
 // XAudio (the XDK's audio engine) entry points the title calls, implemented on a host mixer that plays through
 // XAudio2. The library's own engine programs the audio hardware, so none of it runs: voices, packets, submixes and
-// the reverb live here, a frame of 256 samples at 48 kHz at a time, as the console mixes.
+// the reverb live here, a frame of 256 samples at 48 kHz at a time, as the console mixes. Effects a title registers
+// are its own code and run as such.
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -15,6 +17,7 @@
 #include "audio/xaudio2.h"
 #include "audio/xma_decoder.h"
 #include "core/log.h"
+#include "cpu/dispatch.h"
 #include "kernel/memory.h"
 #include "xdk/hle.h"
 
@@ -39,6 +42,21 @@ constexpr uint32_t kQueueMin = 3;              // host buffers of a frame kept q
 constexpr uint32_t kQueueMax = 10;
 constexpr uint32_t kXmaPacketBytes = audio::XmaDecoder::kPacketBytes;
 constexpr uint8_t kReverbEffect = 3;  // the id of the library's reverb in its effect table
+
+// a title's effect: registered as 12 bytes {u8 id out, GetSize, Create}, its object's vtable has Release at 4 and
+// Process(this, buffer context, 0) at 0x18
+constexpr uint32_t kRegisteredCreate = 0x08;
+constexpr uint32_t kEffectRelease = 0x04;
+constexpr uint32_t kEffectProcess = 0x18;
+// the library's effect buffer: effects get the address 8 bytes in, samples are planar floats, 256 per channel
+constexpr uint32_t kBufferContext = 0x08;
+constexpr uint32_t kBufferRefs = 0x04;
+constexpr uint32_t kBufferFormatChannels = 0x0D;
+constexpr uint32_t kBufferFormatRate = 0x10;
+constexpr uint32_t kBufferChannels = 0x15;
+constexpr uint32_t kBufferRate = 0x18;
+constexpr uint32_t kBufferSamples = 0x1C;
+constexpr uint32_t kBufferHeader = 0x80;  // the samples follow, 128 byte aligned
 
 // source voice init
 constexpr uint32_t kSourceType = 0x00;  // 1 16 bit PCM, 3 XMA
@@ -91,9 +109,21 @@ struct Packet {
 // the library's reverb, run as the host's
 struct Reverb {
     std::unique_ptr<audio::Reverb> host;
+    uint32_t index = 0;  // in the voice's effect chain
     bool enabled = true;
     std::vector<float> in;
     std::vector<float> out;
+};
+
+// a title's own effect, made by its Create and run by its Process on the mixer thread
+struct GuestEffect {
+    uint32_t object = 0;  // zero once released
+    uint32_t buffer = 0;
+    uint32_t index = 0;
+    std::atomic<bool> enabled = true;
+    ~GuestEffect() {
+        if (buffer) mem::FreeSystem(buffer);
+    }
 };
 
 struct Voice {
@@ -107,6 +137,7 @@ struct Voice {
     std::vector<Output> outputs;
     std::vector<float> mix;  // a submix's input this frame
     std::unique_ptr<Reverb> reverb;
+    std::shared_ptr<GuestEffect> effect;  // sources only
     // source
     std::deque<Packet> packets;
     double frame = 0;   // in the current packet, or in the XMA samples decoded
@@ -130,6 +161,8 @@ std::unordered_map<uint32_t, Callback> g_callbacks;
 uint32_t g_next_callback = 1;
 uint32_t g_engine_refs = 0;
 uint32_t g_next_effect = 0x80;
+std::unordered_map<uint8_t, uint32_t> g_effect_create;  // registered id to its Create
+std::mutex g_effect_lock;  // held while effect code runs, never together with g_lock
 std::once_flag g_started;
 
 Voice* Find(uint32_t handle) {
@@ -184,17 +217,100 @@ std::unique_ptr<Reverb> MakeReverb(uint32_t channels) {
     return r;
 }
 
-// {u8 count, entries of pointers to {u8 effect id, init}}
-std::unique_ptr<Reverb> ReadEffects(uint32_t chain, uint32_t channels) {
-    if (!chain) return nullptr;
+void PF(uint32_t va, float f) {
+    uint32_t v;
+    std::memcpy(&v, &f, 4);
+    W32(va, v);
+}
+
+// the allocator object Create takes: alloc(this, size) at 0x14, the other slots do nothing
+void AllocatorAlloc(PPCContext& ctx, uint8_t*) { ctx.r[3] = mem::AllocSystem(uint32_t(ctx.r[4]), 128); }
+void AllocatorNothing(PPCContext& ctx, uint8_t*) { ctx.r[3] = 0; }
+
+uint32_t Allocator() {
+    constexpr uint32_t kSlots = 8;
+    constexpr uint32_t kAllocSlot = 0x14 / 4;
+    static const uint32_t object = [] {
+        uint32_t o = mem::AllocSystem(4 + kSlots * 4);
+        W32(o, o + 4);
+        for (uint32_t i = 0; i < kSlots; i++)
+            W32(o + 4 + i * 4, dispatch::HostThunk(i == kAllocSlot ? AllocatorAlloc : AllocatorNothing));
+        return o;
+    }();
+    return object;
+}
+
+uint32_t NewEffectBuffer(uint32_t channels) {
+    uint32_t b = mem::AllocSystem(kBufferHeader + kMaxChannels * kFrame * 4, 128);
+    std::memset(HostPtr(b), 0, kBufferHeader);
+    W32(b + kBufferRefs, 1);
+    W8(b + kBufferFormatChannels, uint8_t(channels));
+    W32(b + kBufferFormatRate, kRate);
+    W8(b + kBufferChannels, uint8_t(channels));
+    W32(b + kBufferRate, kRate);
+    W32(b + kBufferSamples, b + kBufferHeader);
+    return b;
+}
+
+std::shared_ptr<GuestEffect> MakeGuestEffect(PPCContext& ctx, uint32_t create, uint32_t init, uint32_t channels) {
+    uint32_t out = mem::AllocSystem(4);
+    W32(out, 0);
+    uint32_t hr = uint32_t(CallGuest(ctx, create, {init, Allocator(), out}));
+    uint32_t object = R32(out);
+    mem::FreeSystem(out);
+    if (hr || !object) {
+        LOGR("xaudio: effect %u failed to create (%08X), the voice plays dry", R8(init), hr);
+        return nullptr;
+    }
+    auto e = std::make_shared<GuestEffect>();
+    e->object = object;
+    e->buffer = NewEffectBuffer(channels);
+    return e;
+}
+
+uint32_t RegisteredCreate(uint8_t id) {
+    std::lock_guard lock(g_lock);
+    auto it = g_effect_create.find(id);
+    return it != g_effect_create.end() ? it->second : 0;
+}
+
+// {u8 count, entries of pointers to {u8 effect id, init}}: the library's reverb runs as the host's, a title's own
+// effect as its guest code; called without g_lock
+void ReadEffects(PPCContext& ctx, Voice& v, uint32_t chain) {
+    if (!chain) return;
     uint32_t n = R8(chain);
     uint32_t e = R32(chain + 4);
     for (uint32_t i = 0; i < n && e; i++) {
-        uint8_t id = R8(R32(e + i * 4));
-        if (id == kReverbEffect) return MakeReverb(channels);
-        LOGR("xaudio: effect %u not run, the voice plays dry", id);
+        uint32_t init = R32(e + i * 4);
+        uint8_t id = R8(init);
+        uint32_t create = RegisteredCreate(id);
+        if (id == kReverbEffect && !v.reverb) {
+            v.reverb = MakeReverb(v.channels);
+            if (v.reverb) v.reverb->index = i;
+        } else if (create && v.source && !v.effect) {
+            v.effect = MakeGuestEffect(ctx, create, init, v.channels);
+            if (v.effect) v.effect->index = i;
+        } else {
+            LOGR("xaudio: effect %u not run, the voice plays dry", id);
+        }
     }
-    return nullptr;
+}
+
+// a frame through the effect, in place; with g_effect_lock held
+void RunEffect(PPCContext& ctx, GuestEffect& e, std::vector<float>& samples, uint32_t channels) {
+    uint32_t planar = e.buffer + kBufferHeader;
+    for (uint32_t c = 0; c < channels; c++)
+        for (uint32_t s = 0; s < kFrame; s++) PF(planar + (c * kFrame + s) * 4, samples[s * channels + c]);
+    uint32_t process = R32(R32(e.object) + kEffectProcess);
+    CallGuest(ctx, process, {e.object, e.buffer + kBufferContext, 0});
+    for (uint32_t c = 0; c < channels; c++)
+        for (uint32_t s = 0; s < kFrame; s++) samples[s * channels + c] = GF(planar + (c * kFrame + s) * 4);
+}
+
+void ReleaseEffect(PPCContext& ctx, GuestEffect& e) {
+    std::lock_guard lock(g_effect_lock);
+    CallGuest(ctx, R32(R32(e.object) + kEffectRelease), {e.object});
+    e.object = 0;
 }
 
 // the library's reverb parameters: I3DL2, 12 words
@@ -325,19 +441,39 @@ void RunReverb(Voice& v, std::vector<float>& buf) {
         for (uint32_t c = 0; c < out && c < v.channels; c++) buf[s * v.channels + c] = r.out[s * out + c];
 }
 
-// a frame of the whole graph, downmixed to stereo as the console does
-void MixFrame(float* stereo) {
+// a source voice's frame, rendered under g_lock and run through its effect outside it
+struct Rendered {
+    uint32_t handle;
+    uint32_t channels;
+    std::shared_ptr<GuestEffect> effect;
+    std::vector<float> samples;
+};
+
+// a frame of the whole graph, downmixed to stereo as the console does; effect code runs without g_lock, as it may
+// wait on title locks whose holders call the engine
+void MixFrame(PPCContext& ctx, float* stereo) {
+    std::vector<Rendered> sources;
+    {
+        std::lock_guard lock(g_lock);
+        for (Voice* v : g_order) {
+            if (!v->source || !v->started || v->packets.empty()) continue;
+            Rendered r{v->handle, v->channels, v->effect, std::vector<float>(size_t(kFrame) * v->channels, 0.0f)};
+            RenderSource(*v, r.samples.data());
+            sources.push_back(std::move(r));
+        }
+    }
+    {
+        std::lock_guard lock(g_effect_lock);
+        for (Rendered& r : sources)
+            if (r.effect && r.effect->enabled && r.effect->object) RunEffect(ctx, *r.effect, r.samples, r.channels);
+    }
     std::lock_guard lock(g_lock);
     std::vector<float> master(size_t(kFrame) * kMasterChannels, 0.0f);
     std::vector<float> buf;
     for (Voice* v : g_order)
         if (!v->source) std::fill(v->mix.begin(), v->mix.end(), 0.0f);
-    for (Voice* v : g_order) {
-        if (!v->source || !v->started || v->packets.empty()) continue;
-        buf.assign(size_t(kFrame) * v->channels, 0.0f);
-        RenderSource(*v, buf.data());
-        Route(*v, buf.data(), master);
-    }
+    for (const Rendered& r : sources)
+        if (Voice* v = Find(r.handle)) Route(*v, r.samples.data(), master);
     for (Voice* v : g_order) {
         if (v->source) continue;
         buf = v->mix;
@@ -383,7 +519,7 @@ void StartMixer() {
                 std::this_thread::sleep_until(deadline);
             }
             RunCallbacks(ctx);
-            MixFrame(frame.data());
+            MixFrame(ctx, frame.data());
             audio::SubmitStereo(frame.data(), kFrame);
         }
     });
@@ -457,7 +593,12 @@ HLE_FUNC(XAudioRegisterEffects) {
     std::lock_guard lock(g_lock);
     uint32_t n = R8(a[0]);
     uint32_t e = R32(a[0] + 4);
-    for (uint32_t i = 0; i < n && e; i++) W8(e + i * 12, uint8_t(g_next_effect++));
+    for (uint32_t i = 0; i < n && e; i++) {
+        uint32_t entry = e + i * 12;
+        uint8_t id = uint8_t(g_next_effect++);
+        W8(entry, id);
+        g_effect_create[id] = R32(entry + kRegisteredCreate);
+    }
     return kOk;
 }
 #endif
@@ -490,7 +631,7 @@ HLE_FUNC(XAudioCreateSourceVoice) {
     }
     if (!v->channels || v->channels > kMaxChannels || !v->rate) return kInvalidArg;
     v->outputs = DefaultOutputs(v->channels);
-    v->reverb = ReadEffects(R32(init + kSourceEffects), v->channels);
+    ReadEffects(ctx, *v, R32(init + kSourceEffects));
     std::lock_guard lock(g_lock);
     uint32_t h = NewHandle();
     if (!h) return kFail;
@@ -511,10 +652,10 @@ HLE_FUNC(XAudioCreateSubmixVoice) {
     v->rate = R32(init + kSubmixRate);
     if (v->rate != kRate) LOGR("xaudio: submix at %u Hz mixes at %u", v->rate, kRate);
     v->mix.assign(size_t(kFrame) * v->channels, 0.0f);
+    ReadEffects(ctx, *v, R32(init + kSubmixEffects));
     std::lock_guard lock(g_lock);
     uint32_t output = R32(init + kSubmixOutput);
     v->outputs = output ? ReadOutputs(output) : DefaultOutputs(v->channels);
-    v->reverb = ReadEffects(R32(init + kSubmixEffects), v->channels);
     uint32_t h = NewHandle();
     if (!h) return kFail;
     v->handle = h;
@@ -527,8 +668,13 @@ HLE_FUNC(XAudioCreateSubmixVoice) {
 
 #ifdef SUB_XAudioVoice_Release
 HLE_FUNC(XAudioVoice_Release) {
-    std::lock_guard lock(g_lock);
-    Remove(a[0]);
+    std::shared_ptr<GuestEffect> effect;
+    {
+        std::lock_guard lock(g_lock);
+        if (Voice* v = Find(a[0])) effect = v->effect;
+        Remove(a[0]);
+    }
+    if (effect) ReleaseEffect(ctx, *effect);
     return 0;
 }
 #endif
@@ -536,9 +682,11 @@ HLE_FUNC(XAudioVoice_Release) {
 #ifdef SUB_XAudioVoice_SetEffectState
 // (voice, effect, state): 0 bypasses it
 HLE_FUNC(XAudioVoice_SetEffectState) {
+    uint32_t index = a[1];
     uint32_t state = a[2];
     return WithVoice(a[0], [&](Voice& v) {
-        if (v.reverb) v.reverb->enabled = state != 0;
+        if (v.reverb && v.reverb->index == index) v.reverb->enabled = state != 0;
+        if (v.effect && v.effect->index == index) v.effect->enabled = state != 0;
         return kOk;
     });
 }

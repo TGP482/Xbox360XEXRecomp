@@ -221,20 +221,21 @@ const ShaderEntry* FindShader(uint32_t object) {
     return it != g_shaders.end() && it->second.shader ? &it->second : nullptr;
 }
 
-// D3D links the pair by semantic: each vertex export goes to the register the pixel shader reads it from, the rest
-// to registers nothing reads
+// D3D links the pair as the library's linker does (827448F8): both lists sorted by semantic, each pixel input takes
+// the first vertex export at or past its semantic, whether equal or not; the rest go to registers nothing reads
 void Link(const ShaderEntry& vs, const ShaderEntry* ps, gpu::ShaderOptions& link) {
     bool taken[16] = {};
     bool linked[16] = {};
     for (uint32_t i = 0; i < 16; i++) link.export_map[i] = uint8_t(i);
     if (!ps) return;
+    size_t next = 0;
     for (uint32_t in : ps->outputs) {
-        for (uint32_t out : vs.outputs) {
-            if (Semantic(out) != Semantic(in)) continue;
-            link.export_map[SemanticReg(out)] = uint8_t(SemanticReg(in));
-            linked[SemanticReg(out)] = true;
-            taken[SemanticReg(in)] = true;
-        }
+        while (next < vs.outputs.size() && Semantic(vs.outputs[next]) < Semantic(in)) next++;
+        if (next == vs.outputs.size()) break;
+        uint32_t out = vs.outputs[next++];
+        link.export_map[SemanticReg(out)] = uint8_t(SemanticReg(in));
+        linked[SemanticReg(out)] = true;
+        taken[SemanticReg(in)] = true;
     }
     uint32_t spare = 15;
     for (uint32_t i = 0; i < 16; i++) {
@@ -615,6 +616,11 @@ HLE_FUNC(D3DDevice_BeginTiling) {
     constexpr uint32_t kMaxTiles = 15;  // the device's rect arrays
     uint32_t dev = a[0];
     uint32_t count = std::min(a[2], kMaxTiles);
+    uint32_t color = a[4];
+    float z = float(a.Float(0));
+    uint32_t stencil = a[6];
+    bool clear = false;
+    gpu::Rect extent{};
     {
         std::lock_guard lock(g_lock);
         g_tiling = {};
@@ -628,12 +634,12 @@ HLE_FUNC(D3DDevice_BeginTiling) {
         WriteTileRects(dev);
         W32(dev + kDevPredication, 0);
         if (g_tiling.on) W8(dev + kDevTilingFlags, uint8_t(R8(dev + kDevTilingFlags) | kTilingOn));
-        if (g_tiling.on && !(a[1] & kSkipFirstClear)) {
-            uint32_t all = gpu::kClearColors | kClearDepth | kClearStencil;
-            ClearBound(dev, all, a[4], float(a.Float(0)), a[6], &g_tiling.extent);
-        }
+        clear = g_tiling.on && !(a[1] & kSkipFirstClear);
+        extent = g_tiling.extent;
     }
+    // the scissor sized to the extent first: the clear keeps within it, and the last pass's may be smaller
     CallGuest(ctx, SYM(D3DDevice_SetViewport), {dev, WholeViewport()});
+    if (clear) ClearBound(dev, gpu::kClearColors | kClearDepth | kClearStencil, color, z, stencil, &extent);
     return 0;
 }
 #endif

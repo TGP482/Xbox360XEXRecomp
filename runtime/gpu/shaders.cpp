@@ -115,7 +115,7 @@ enum : uint32_t {
     kKillGte = 26,
     kKillNe = 27,
     kDst = 28,
-    kMova = 29,
+    kMaxA = 29,
 };
 
 // scalar ALU opcodes
@@ -143,8 +143,8 @@ enum : uint32_t {
     kRecipSqClamp = 20,
     kRecipSqFf = 21,
     kRecipSqIeee = 22,
-    kMovaS = 23,
-    kMovaFloorS = 24,
+    kMaxAS = 23,
+    kMaxAFloorS = 24,
     kSubS = 25,
     kSubPrev = 26,
     kPredSetE = 27,
@@ -178,7 +178,6 @@ uint32_t VectorOperands(uint32_t op) {
         case kTrunc:
         case kFloor:
         case kMax4:
-        case kMova:
             return 1;
         case kMulAdd:
         case kCndE:
@@ -438,7 +437,7 @@ private:
     void EmitExport(const Alu& a, bool vector, bool scalar);
     void EmitWrite(const std::string& dst, uint32_t swizzle, const char* src);
 
-    std::string Source(const Alu& a, int n, int& const_slot, bool force_const);
+    std::string Source(const Alu& a, int n, bool force_const);
     std::string VectorExpr(const Alu& a);
     std::string ScalarExpr(const Alu& a);
     std::string Reg(uint32_t index, bool rel) const;
@@ -459,16 +458,16 @@ std::string Translator::Reg(uint32_t index, bool rel) const {
     return rel ? F("r[(%u + aL) & 63]", index) : F("r[%u]", index);
 }
 
-// source n as a float4 before its swizzle; constants take const_slot in order
-std::string Translator::Source(const Alu& a, int n, int& const_slot, bool force_const) {
+// source n as a float4 before its swizzle; a constant's relative flag is picked by the sources before it, read or not
+std::string Translator::Source(const Alu& a, int n, bool force_const) {
     uint32_t reg = a.Reg(n);
     std::string s;
     if (a.IsReg(n) && !force_const) {
         s = Reg(reg & 63, reg & 64);
         if (reg & 128) s = "abs(" + s + ")";
     } else {
-        int slot = const_slot++;
-        if (slot < 2 && a.ConstRel(slot)) s = F("c[(%u + %s) & 255]", reg, a.ConstRelToA0() ? "a0" : "aL");
+        int slot = n == 1 ? 0 : (n == 2 ? !a.IsReg(1) : !(a.IsReg(1) && a.IsReg(2)));
+        if (a.ConstRel(slot)) s = F("c[(%u + %s) & 255]", reg, a.ConstRelToA0() ? "a0" : "aL");
         else s = F("c[%u]", reg);
         if (a.AbsConstants()) s = "abs(" + s + ")";
     }
@@ -500,16 +499,16 @@ std::string Translator::VectorExpr(const Alu& a) {
         case kDot2Add: return "(xmul(s1.x, s2.x) + xmul(s1.y, s2.y) + s3.x).xxxx";
         case kCube: return "Cube(s1)";
         case kMax4: return "max(max(s1.x, s1.y), max(s1.z, s1.w)).xxxx";
-        case kPredSetEPush: return "PredPush(s1.w == 0 && s2.w == 0, s1)";
-        case kPredSetNePush: return "PredPush(s1.w != 0 && s2.w == 0, s1)";
-        case kPredSetGtPush: return "PredPush(s1.w > 0 && s2.w == 0, s1)";
-        case kPredSetGtePush: return "PredPush(s1.w >= 0 && s2.w == 0, s1)";
+        case kPredSetEPush: return "PredPush(s1.w == 0 && s2.w == 0, s1.x == 0 && s2.x == 0, s1)";
+        case kPredSetNePush: return "PredPush(s1.w == 0 && s2.w != 0, s1.x == 0 && s2.x != 0, s1)";
+        case kPredSetGtPush: return "PredPush(s1.w == 0 && s2.w > 0, s1.x == 0 && s2.x > 0, s1)";
+        case kPredSetGtePush: return "PredPush(s1.w == 0 && s2.w >= 0, s1.x == 0 && s2.x >= 0, s1)";
         case kKillE: return "Kill(any(s1 == s2))";
         case kKillGt: return "Kill(any(s1 > s2))";
         case kKillGte: return "Kill(any(s1 >= s2))";
         case kKillNe: return "Kill(any(s1 != s2))";
         case kDst: return "float4(1, xmul(s1.y, s2.y), s1.z, s2.w)";
-        case kMova: return "MovA(s1)";
+        case kMaxA: return "MaxA(s1, s2)";
         default:
             info_.unknown++;
             return "(float4)0";
@@ -542,8 +541,8 @@ std::string Translator::ScalarExpr(const Alu& a) {
         case kRecipSqClamp: return "clamp(rsqrt(sa), -kFltMax, kFltMax)";
         case kRecipSqFf: return "Ff(rsqrt(sa))";
         case kRecipSqIeee: return "rsqrt(sa)";
-        case kMovaS: return "MovAS(sa, false)";
-        case kMovaFloorS: return "MovAS(sa, true)";
+        case kMaxAS: return "MaxAS(sa, sb, false)";
+        case kMaxAFloorS: return "MaxAS(sa, sb, true)";
         case kSubS: return "sa - sb";
         case kSubPrev: return "sa - ps";
         case kPredSetE: return "PredSet(sa == 0)";
@@ -580,15 +579,14 @@ void Translator::EmitAlu(const Alu& a) {
     Open(a.Predicated() ? (a.PredCondition() ? "if (p)" : "if (!p)") : "");
     uint32_t vop = a.VectorOp();
     uint32_t sop = a.ScalarOp();
-    bool vector = a.VectorMask() || (vop >= kPredSetEPush && vop <= kKillNe) || vop == kMova;
+    bool vector = a.VectorMask() || (vop >= kPredSetEPush && vop <= kKillNe) || vop == kMaxA;
     bool scalar = sop != kRetainPrev || a.ScalarMask();
     uint32_t used = vector ? VectorOperands(vop) : 0;
     bool const_op = ScalarConstOp(sop);
-    int const_slot = 0;
     for (int n = 1; n <= 3; n++) {
         bool scalar_reads = n == 3 && scalar && ScalarReadsSource(sop);
         if (uint32_t(n) <= used || scalar_reads) {
-            Line(F("float4 s%d = %s;", n, Source(a, n, const_slot, n == 3 && const_op).c_str()));
+            Line(F("float4 s%d = %s;", n, Source(a, n, n == 3 && const_op).c_str()));
         }
     }
     if (scalar && ScalarReadsSource(sop)) {
@@ -597,7 +595,11 @@ void Translator::EmitAlu(const Alu& a) {
             // the register's number hides in the opcode's low bit, the source select and the middle swizzle bits
             uint32_t swz = a.Swizzle(3);
             uint32_t reg = (sop & 1) | uint32_t(a.IsReg(3)) << 1 | (swz & 0x3C);
-            Line(F("float sb = r[%u].%c;", reg, kComp[Bits(swz, 0, 2)]));
+            std::string sb = F("r[%u].%c", reg, kComp[Bits(swz, 0, 2)]);
+            // the register takes the constant's abs and negate
+            if (a.AbsConstants()) sb = "abs(" + sb + ")";
+            if (a.Negate(3)) sb = "-" + sb;
+            Line("float sb = " + sb + ";");
         } else {
             Line("float sb = s3.x;");
         }
@@ -628,7 +630,8 @@ void Translator::EmitAlu(const Alu& a) {
     Close();
 }
 
-// an export takes the vector result where only its mask is set, the scalar where only the scalar's is, 1 where both are
+// an export takes the vector result where only its mask is set, the scalar where only the scalar's is, 1 where both are;
+// with a relative scalar dest the components neither sets are 0
 void Translator::EmitExport(const Alu& a, bool vector, bool scalar) {
     uint32_t d = a.VectorDest();
     std::string target;
@@ -651,9 +654,11 @@ void Translator::EmitExport(const Alu& a, bool vector, bool scalar) {
     }
     uint32_t vm = vector ? a.VectorMask() : 0;
     uint32_t sm = scalar ? a.ScalarMask() : 0;
+    uint32_t zero = a.ScalarDestRel() ? ~(a.VectorMask() | a.ScalarMask()) : 0;
     for (uint32_t i = 0; i < 4; i++) {
         uint32_t bit = 1u << i;
-        if (vm & sm & bit) Line(F("%s.%c = 1;", target.c_str(), kComp[i]));
+        if (zero & bit) Line(F("%s.%c = 0;", target.c_str(), kComp[i]));
+        else if (vm & sm & bit) Line(F("%s.%c = 1;", target.c_str(), kComp[i]));
         else if (vm & bit) Line(F("%s.%c = vt.%c;", target.c_str(), kComp[i], kComp[i]));
         else if (sm & bit) Line(F("%s.%c = st;", target.c_str(), kComp[i]));
     }
@@ -903,17 +908,18 @@ static bool pn_set;
 static int a0n;
 static bool a0n_set;
 
-float4 PredPush(bool c, float4 s1) { pn = c; pn_set = true; return c ? (float4)0 : (s1.x + 1).xxxx; }
+// the predicate tests w, the result x: src1 w must be 0 and src2 w passes the compare
+float4 PredPush(bool c, bool zero, float4 s1) { pn = c; pn_set = true; return zero ? (float4)0 : (s1.x + 1).xxxx; }
 float PredSet(bool c) { pn = c; pn_set = true; return c ? 0 : 1; }
 float PredSetInv(float a) { pn = a == 1; pn_set = true; return pn ? 0 : (a == 0 ? 1 : a); }
 float PredSetPop(float a) { float v = a - 1; pn = v <= 0; pn_set = true; return pn ? 0 : v; }
 float PredSetClr() { pn = false; pn_set = true; return kFltMax; }
 float PredSetRestore(float a) { pn = a == 0; pn_set = true; return pn ? 0 : a; }
-float4 MovA(float4 s1) { a0n = AddressReg(s1.w); a0n_set = true; return s1; }
-float MovAS(float a, bool floor_only) {
+float4 MaxA(float4 s1, float4 s2) { a0n = AddressReg(s1.w); a0n_set = true; return max(s1, s2); }
+float MaxAS(float a, float b, bool floor_only) {
     a0n = floor_only ? clamp(int(floor(a)), -256, 255) : AddressReg(a);
     a0n_set = true;
-    return a;
+    return max(a, b);
 }
 float Ff(float v) { return isinf(v) ? 0 : v; }
 float MulPrev2(float a, float b) {

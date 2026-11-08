@@ -471,7 +471,8 @@ private:
     void ShaderView(ID3D12Resource* res, DXGI_FORMAT fmt, uint32_t slot);
     void FullScreen(ID3D12PipelineState* pso, uint32_t views, const float p[8]);
 
-    // F3 capture under XEX_CAPTURE_DIR: the next frame's draws listed, each target saved as the frame leaves it
+    // F3 capture under XEX_CAPTURE_DIR, else captures beside the exe: the next frame's draws listed, each target
+    // saved as the frame leaves it
     void StartCapture();
     void FinishCapture(const xenos::TextureFetch& front);
     void CapStep(Target* rt);
@@ -2108,12 +2109,10 @@ void D3D12Backend::Pass(const char* hlsl, const char* entry, DXGI_FORMAT rtv, D3
 // Capture
 
 void D3D12Backend::StartCapture() {
-    if (diag::CaptureDir().empty()) {
-        static bool logged = false;
-        if (!std::exchange(logged, true)) LOGR("capture: set XEX_CAPTURE_DIR to capture a frame with F3");
-        return;
-    }
-    cap_dir_ = diag::CaptureDir() / ("frame_" + std::to_string(presents_));
+    // without XEX_CAPTURE_DIR, beside the exe
+    std::filesystem::path root = diag::CaptureDir();
+    if (root.empty()) root = app::ExeDir() / "captures";
+    cap_dir_ = root / ("frame_" + std::to_string(presents_));
     std::error_code ec;
     std::filesystem::create_directories(cap_dir_, ec);
     cap_ = _wfopen((cap_dir_ / "draws.txt").c_str(), L"w");

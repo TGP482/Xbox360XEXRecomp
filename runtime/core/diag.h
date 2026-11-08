@@ -11,7 +11,7 @@ inline bool Perf() {
     return on;
 }
 
-// XEX_CAPTURE_DIR: where F3 saves a frame, empty: F3 does not capture
+// XEX_CAPTURE_DIR: where F3 saves a frame, empty: a captures folder beside the exe
 inline const std::filesystem::path& CaptureDir() {
     static const std::filesystem::path dir = [] {
 #ifdef _WIN32

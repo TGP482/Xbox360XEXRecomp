@@ -33,6 +33,14 @@ Device_RingWrite = 0x0
 Device_RingSegmentEnd = 0x4
 Device_RingLimit = 0x8
 Device_RingSegmentStart = 0x36CC
+# predicated tiling (BeginTiling 8273D320, EndTiling 8273D758): flags byte and its tiling bit, tile count,
+# predication select (EndTiling's tile i is 3 << 2i), the tiles' whole extent
+Device_TilingFlags = 0x28C0
+Device_TilingOn = 0x10
+Device_TileCount = 0x32C4
+Device_Predication = 0x32A0
+Device_TilingWidth = 0x34A8
+Device_TilingHeight = 0x34AC
 Texture_FetchConstant = 0x10
 VertexDeclaration_Count = 0x8
 VertexDeclaration_Elements = 0x24

@@ -60,6 +60,9 @@ XAM_EXPORT(0x2EE, XamUserCreateAchievementEnumerator) {
     return kErrorSuccess;
 }
 
+// (user, title, small picture id, large picture id, count, overlapped): XUserAwardGamerPicture, no pictures to award
+XAM_EXPORT(0x2F0, XamWriteGamerTile) { return Complete(a[5], kErrorSuccess); }
+
 namespace {
 
 // A setting id carries its data type in bits 28 to 31 and its largest size in bits 16 to 27. Values the title wrote

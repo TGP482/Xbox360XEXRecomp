@@ -187,7 +187,8 @@ struct Target {
     uint32_t base = 0;    // EDRAM tile
     uint32_t format = 0;  // RB_COLOR_INFO or RB_DEPTH_INFO format
     uint32_t samples = 1;
-    uint32_t width = 0;  // title pixels
+    uint32_t pitch = 0;  // EDRAM pitch in title pixels
+    uint32_t width = 0;  // title pixels, wider than the pitch when tiles are drawn as one
     uint32_t height = 0;
     uint32_t view = 0;  // RTV or DSV slot
 };
@@ -332,7 +333,7 @@ private:
 
     // targets
     uint32_t TargetHeight(const State& s) const;
-    Target* EnsureTarget(uint32_t base, uint32_t format, bool depth, uint32_t samples, uint32_t width,
+    Target* EnsureTarget(uint32_t base, uint32_t format, bool depth, uint32_t samples, uint32_t pitch, uint32_t width,
                          uint32_t height);
     Target* ColorTarget(const State& s, uint32_t i, uint32_t height);
     Target* DepthTarget(const State& s, uint32_t height);
@@ -764,7 +765,7 @@ void D3D12Backend::Transition(ID3D12Resource* r, D3D12_RESOURCE_STATES& cur, D3D
 // the title never says how tall a target is: the scissor it draws with is its height
 uint32_t D3D12Backend::TargetHeight(const State& s) const {
     uint32_t br = s.Reg(kPaScWindowScissorBr);
-    return std::max<uint32_t>(Bits(br, 16, 15), 1);
+    return std::max<uint32_t>({Bits(br, 16, 15), s.tiled_height, 1});
 }
 
 uint64_t TargetKey(uint32_t base, uint32_t format, bool depth, uint32_t samples, uint32_t width) {
@@ -772,8 +773,8 @@ uint64_t TargetKey(uint32_t base, uint32_t format, bool depth, uint32_t samples,
            uint64_t(width) << 24;
 }
 
-Target* D3D12Backend::EnsureTarget(uint32_t base, uint32_t format, bool depth, uint32_t samples, uint32_t width,
-                                   uint32_t height) {
+Target* D3D12Backend::EnsureTarget(uint32_t base, uint32_t format, bool depth, uint32_t samples, uint32_t pitch,
+                                   uint32_t width, uint32_t height) {
     if (width == 0) return nullptr;
     Target& t = targets_[TargetKey(base, format, depth, samples, width)];
     if (t.res && t.height >= height) return &t;
@@ -783,6 +784,7 @@ Target* D3D12Backend::EnsureTarget(uint32_t base, uint32_t format, bool depth, u
     t.base = base;
     t.format = format;
     t.samples = samples;
+    t.pitch = pitch;
     t.width = width;
     t.height = std::max(height, old.height);
     uint32_t hw = uint32_t(std::ceil(t.width * scale_));
@@ -835,17 +837,20 @@ Target* D3D12Backend::EnsureTarget(uint32_t base, uint32_t format, bool depth, u
 // RB_SURFACE_INFO: pitch in pixels, samples 1, 2 or 4
 uint32_t SurfacePitch(const State& s) { return Bits(s.Reg(kRbSurfaceInfo), 0, 14); }
 uint32_t SurfaceSamples(const State& s) { return 1u << std::min<uint32_t>(Bits(s.Reg(kRbSurfaceInfo), 16, 2), 2); }
+uint32_t TargetWidth(const State& s) { return std::max(SurfacePitch(s), s.tiled_width); }
 
 uint32_t ColorInfo(const State& s, uint32_t i) { return s.Reg(i == 0 ? kRbColorInfo : kRbColor1Info + i - 1); }
 
 Target* D3D12Backend::ColorTarget(const State& s, uint32_t i, uint32_t height) {
     uint32_t info = ColorInfo(s, i);
-    return EnsureTarget(Bits(info, 0, 12), Bits(info, 16, 4), false, SurfaceSamples(s), SurfacePitch(s), height);
+    return EnsureTarget(Bits(info, 0, 12), Bits(info, 16, 4), false, SurfaceSamples(s), SurfacePitch(s), TargetWidth(s),
+                        height);
 }
 
 Target* D3D12Backend::DepthTarget(const State& s, uint32_t height) {
     uint32_t info = s.Reg(kRbDepthInfo);
-    return EnsureTarget(Bits(info, 0, 12), Bits(info, 16, 1), true, SurfaceSamples(s), SurfacePitch(s), height);
+    return EnsureTarget(Bits(info, 0, 12), Bits(info, 16, 1), true, SurfaceSamples(s), SurfacePitch(s), TargetWidth(s),
+                        height);
 }
 
 // EDRAM tiles hold 80 x 16 samples of 32 bits, 40 x 16 of 64
@@ -853,7 +858,7 @@ uint32_t D3D12Backend::SpanTiles(const Target& t) const {
     uint32_t tile_w = !t.depth && WideColor(t.format) ? 40 : 80;
     uint32_t sx = t.samples == 4 ? 2 : 1;
     uint32_t sy = t.samples >= 2 ? 2 : 1;
-    uint32_t cols = (t.width * sx + tile_w - 1) / tile_w;
+    uint32_t cols = (t.pitch * sx + tile_w - 1) / tile_w;
     uint32_t rows = (t.height * sy + kTileRows - 1) / kTileRows;
     return cols * rows;
 }
@@ -1268,7 +1273,7 @@ bool D3D12Backend::BindTargets(const State& s, const ShaderInfo& ps, PipelineKey
     uint32_t height = TargetHeight(s);
     D3D12_CPU_DESCRIPTOR_HANDLE rtv[4];
     uint32_t count = 0;
-    w = SurfacePitch(s);
+    w = TargetWidth(s);
     h = height;
     k.samples = SurfaceSamples(s);
     for (uint32_t i = 0; i < 4; i++) {
@@ -1592,7 +1597,7 @@ void D3D12Backend::Clear(const State& s, uint32_t flags, const float color[4], f
                          const Rect* rect) {
     draw_stats_.clears++;
     uint32_t height = TargetHeight(s);
-    uint32_t width = SurfacePitch(s);
+    uint32_t width = TargetWidth(s);
     Rect r = GuestScissor(s, width, height);
     if (rect) {
         r = {std::max(r.x1, rect->x1), std::max(r.y1, rect->y1), std::min(r.x2, rect->x2), std::min(r.y2, rect->y2)};

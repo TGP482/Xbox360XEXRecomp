@@ -51,6 +51,9 @@ struct State {
     Shader* vs = nullptr;
     Shader* ps = nullptr;
     ShaderOptions link;  // export_map and vpos_reg, as the title's Direct3D links the pair
+    // predicated tiling drawn as one target: the tiles' whole extent while the title draws tiled, else 0
+    uint32_t tiled_width = 0;
+    uint32_t tiled_height = 0;
 
     uint32_t Reg(uint32_t r) const { return regs[r - kRegFirst]; }
     float RegF(uint32_t r) const {

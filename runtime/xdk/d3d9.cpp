@@ -10,6 +10,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <bit>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -59,6 +60,14 @@ constexpr uint32_t kDevRingSegment = XDK_Device_RingSegment;
 constexpr uint32_t kDevRingSegmentStart = XDK_Device_RingSegmentStart;
 constexpr uint32_t kRingReserve = 0xA0;  // bytes the library keeps free at a segment's end
 constexpr uint8_t kGpuFlagCpuFences = uint8_t(XDK_Device_GpuFlagCpuFences);  // the library writes its own fences
+// predicated tiling, where the config knows it: drawn as one target over every tile
+constexpr bool kTiling = XDK_Device_TilingFlags != xdk::kUnknown;
+constexpr uint32_t kDevTilingFlags = XDK_Device_TilingFlags;
+constexpr uint8_t kTilingOn = uint8_t(XDK_Device_TilingOn);
+constexpr uint32_t kDevTileCount = XDK_Device_TileCount;
+constexpr uint32_t kDevPredication = XDK_Device_Predication;
+constexpr uint32_t kDevTilingWidth = XDK_Device_TilingWidth;
+constexpr uint32_t kDevTilingHeight = XDK_Device_TilingHeight;
 
 // D3DDevice_ClearF flags, and Resolve's
 constexpr uint32_t kClearDepth = 0x10;
@@ -229,6 +238,19 @@ void ReadRegisters(uint32_t dev, gpu::State& s) {
             s.regs[b * kBankRegs + i] = R32(dev + kDevBanks[b] + i * 4);
         }
     }
+    if (kTiling && (R8(dev + kDevTilingFlags) & kTilingOn)) {
+        s.tiled_width = R32(dev + kDevTilingWidth);
+        s.tiled_height = R32(dev + kDevTilingHeight);
+    }
+}
+
+// a resolve EndTiling makes for a tile before the last: its clear readies EDRAM for the next tile on the console
+bool TileBeforeLast(uint32_t dev) {
+    if (!kTiling || !(R8(dev + kDevTilingFlags) & kTilingOn)) return false;
+    uint32_t select = R32(dev + kDevPredication);
+    if (!select) return false;
+    uint32_t tile = uint32_t(std::countr_zero(select)) / 2;  // tile i is 3 << 2i
+    return tile + 1 < R32(dev + kDevTileCount);
 }
 
 // the declaration element a fetch reads: usage and usage index as the shader container names them
@@ -462,6 +484,7 @@ HLE_FUNC(D3DDevice_Resolve) {
     }
     r.clear_z = float(a.Float(0));
     r.clear_stencil = a[kClearStencilArg];
+    if (TileBeforeLast(dev)) r.clear = 0;
     if (tex) backend->Resolve(s, r);
     return 0;
 }

@@ -126,6 +126,24 @@ constexpr bool AllKnown(const LayoutKey (&keys)[N]) {
 #ifndef XDK_Device_RingSegmentStart
 #define XDK_Device_RingSegmentStart 0xFFFFFFFFu
 #endif
+#ifndef XDK_Device_TilingFlags
+#define XDK_Device_TilingFlags 0xFFFFFFFFu
+#endif
+#ifndef XDK_Device_TilingOn
+#define XDK_Device_TilingOn 0xFFFFFFFFu
+#endif
+#ifndef XDK_Device_TileCount
+#define XDK_Device_TileCount 0xFFFFFFFFu
+#endif
+#ifndef XDK_Device_Predication
+#define XDK_Device_Predication 0xFFFFFFFFu
+#endif
+#ifndef XDK_Device_TilingWidth
+#define XDK_Device_TilingWidth 0xFFFFFFFFu
+#endif
+#ifndef XDK_Device_TilingHeight
+#define XDK_Device_TilingHeight 0xFFFFFFFFu
+#endif
 #ifndef XDK_Texture_FetchConstant
 #define XDK_Texture_FetchConstant 0xFFFFFFFFu
 #endif

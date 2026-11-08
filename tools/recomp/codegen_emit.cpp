@@ -8,8 +8,6 @@ using ppc::Op;
 
 namespace {
 
-constexpr uint32_t kSprCtr = 9;
-
 const char* const kCrBits[] = {"lt", "gt", "eq", "so"};
 
 bool Always(uint32_t bo) { return (bo & 0x14) == 0x14; }

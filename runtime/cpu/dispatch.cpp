@@ -68,7 +68,6 @@ PPCFunc* HostThunkFn(uint32_t va) {
 }
 
 struct Export {
-    const char* name = nullptr;
     kernel::ExportFn fn = nullptr;
     uint32_t data = 0;
 };
@@ -198,24 +197,16 @@ Library LibraryFromName(const char* name) {
     return Library::Unknown;
 }
 
-const char* LibraryName(Library lib) {
-    if (lib == Library::Kernel) return "xboxkrnl.exe";
-    if (lib == Library::Xam) return "xam.xex";
-    return "unknown";
-}
-
-void RegisterExport(Library lib, uint32_t ordinal, const char* name, ExportFn fn) {
+void RegisterExport(Library lib, uint32_t ordinal, ExportFn fn) {
     Export& e = Exports()[Key(lib, ordinal)];
-    e.name = name;
     e.fn = fn;
 }
 
 // bump allocated in the kernel data megabyte, which holds nothing else
-uint32_t RegisterData(Library lib, uint32_t ordinal, const char* name, uint32_t size) {
+uint32_t RegisterData(Library lib, uint32_t ordinal, uint32_t size) {
     static uint32_t next = mem::kKernelDataBase;
     Export& e = Exports()[Key(lib, ordinal)];
     if (e.data) return e.data;
-    e.name = name;
     e.data = next;
     next += (size + 15) & ~15u;
     return e.data;
@@ -231,11 +222,6 @@ uint32_t ExportAddress(Library lib, uint32_t ordinal) {
     if (!e) return 0;
     if (e->data) return e->data;
     return e->fn ? dispatch::HostThunk(e->fn) : 0;
-}
-
-const char* ExportName(Library lib, uint32_t ordinal) {
-    const Export* e = FindEntry(lib, ordinal);
-    return e && e->name ? e->name : "?";
 }
 
 // the callee gets a frame with its back chain and the stack argument slots, and the registers Args reads come back

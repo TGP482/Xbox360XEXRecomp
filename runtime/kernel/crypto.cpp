@@ -1,7 +1,6 @@
 #include "kernel/crypto.h"
 
 #include <cstring>
-#include <utility>
 
 namespace crypto {
 
@@ -78,59 +77,6 @@ void ShaFinal(void* ctx, uint8_t digest[20]) {
     for (int i = 0; i < 5; i++)
         for (int j = 0; j < 4; j++) digest[i * 4 + j] = uint8_t(s.h[i] >> (24 - j * 8));
     std::memcpy(ctx, &s, sizeof(s));
-}
-
-void Hmac(const uint8_t* key, size_t key_len, const uint8_t* a, size_t a_len, const uint8_t* b, size_t b_len,
-          uint8_t digest[20]) {
-    uint8_t k[64] = {};
-    Sha s;
-    if (key_len > 64) {
-        ShaInit(&s);
-        ShaUpdate(&s, key, key_len);
-        ShaFinal(&s, k);
-    } else {
-        std::memcpy(k, key, key_len);
-    }
-    uint8_t ipad[64], opad[64];
-    for (int i = 0; i < 64; i++) {
-        ipad[i] = k[i] ^ 0x36;
-        opad[i] = k[i] ^ 0x5C;
-    }
-    uint8_t inner[20];
-    ShaInit(&s);
-    ShaUpdate(&s, ipad, 64);
-    if (a) ShaUpdate(&s, a, a_len);
-    if (b) ShaUpdate(&s, b, b_len);
-    ShaFinal(&s, inner);
-    ShaInit(&s);
-    ShaUpdate(&s, opad, 64);
-    ShaUpdate(&s, inner, 20);
-    ShaFinal(&s, digest);
-}
-
-void Rc4Key(void* ks, const uint8_t* key, size_t len) {
-    auto* s = static_cast<uint8_t*>(ks);
-    for (int i = 0; i < 256; i++) s[i] = uint8_t(i);
-    uint8_t j = 0;
-    for (int i = 0; i < 256; i++) {
-        j = uint8_t(j + s[i] + key[i % len]);
-        std::swap(s[i], s[j]);
-    }
-    s[256] = 0;  // the i and j indices live after the table
-    s[257] = 0;
-}
-
-void Rc4Crypt(void* ks, uint8_t* data, size_t len) {
-    auto* s = static_cast<uint8_t*>(ks);
-    uint8_t i = s[256], j = s[257];
-    for (size_t n = 0; n < len; n++) {
-        i++;
-        j = uint8_t(j + s[i]);
-        std::swap(s[i], s[j]);
-        data[n] ^= s[uint8_t(s[i] + s[j])];
-    }
-    s[256] = i;
-    s[257] = j;
 }
 
 }  // namespace crypto

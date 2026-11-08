@@ -117,15 +117,13 @@ inline uint64_t CallGuest(PPCContext& ctx, uint32_t fn, std::initializer_list<ui
 // the libraries a title imports from
 enum class Library : uint8_t { Kernel, Xam, Unknown };
 Library LibraryFromName(const char* name);
-const char* LibraryName(Library lib);
 
 using ExportFn = PPCFunc*;
-void RegisterExport(Library lib, uint32_t ordinal, const char* name, ExportFn fn);
-uint32_t RegisterData(Library lib, uint32_t ordinal, const char* name, uint32_t size);  // allocates, returns address
+void RegisterExport(Library lib, uint32_t ordinal, ExportFn fn);
+uint32_t RegisterData(Library lib, uint32_t ordinal, uint32_t size);  // allocates, returns address
 ExportFn FindExport(Library lib, uint32_t ordinal);
 // what an import variable holds: a data export's address, or an address that calls the function; 0 if missing
 uint32_t ExportAddress(Library lib, uint32_t ordinal);
-const char* ExportName(Library lib, uint32_t ordinal);  // the host implementation's name, "?" if none
 
 // objects
 enum class ObjType : uint8_t { Event, Semaphore, Mutant, Timer, Thread, File, SymLink, Device, Queue, Other };
@@ -164,7 +162,6 @@ void SetSignal(Object& o, int32_t v);
 uint32_t Wait(const std::vector<ObjectRef>& objs, bool wait_all, int64_t timeout_100ns, bool alertable);
 int32_t SetEvent(Object& o);
 int32_t ResetEvent(Object& o);
-int32_t PulseEvent(Object& o);
 int32_t ReleaseSemaphore(Object& o, int32_t count, uint32_t& status);
 int32_t ReleaseMutant(Object& o, uint32_t& status);
 int64_t Now100ns();                     // system time, 100 ns since 1601
@@ -212,7 +209,6 @@ struct ThreadStart {
 
 Thread* Current();
 ThreadRef CurrentRef();
-PPCContext& CurrentContext();
 void SetTlsTemplate(uint32_t raw_data, uint32_t raw_size, uint32_t data_size);  // the image's TLS directory
 ThreadRef CreateThread(const ThreadStart& start);
 void StartThread(ThreadRef t);

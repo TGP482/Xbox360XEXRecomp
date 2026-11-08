@@ -166,7 +166,6 @@ uint64_t RunStart(PPCContext& ctx, const ThreadStart& s) {
 
 Thread* Current() { return t_current.get(); }
 ThreadRef CurrentRef() { return t_current; }
-PPCContext& CurrentContext() { return *t_current->ctx; }
 uint32_t CurrentProcessor() { return t_current ? t_current->processor.load() : 0; }
 
 std::vector<ThreadRef> Threads() {
@@ -208,6 +207,7 @@ void StartThread(ThreadRef t) {
         LOGR("thread %X returned %08X", t->id, code);
         MarkExited(*t, code);
         Unregister(t.get());
+        mem::FreeStack(t->stack_top);
         t_current.reset();
     });
 }
@@ -231,6 +231,7 @@ void ExitThread(uint32_t code) {
         LOGR("thread %X exits with %08X", t->id, code);
         MarkExited(*t, code);
         Unregister(t);
+        mem::FreeStack(t->stack_top);
     }
     t_current.reset();
 #ifdef _WIN32

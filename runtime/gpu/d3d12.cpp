@@ -198,7 +198,6 @@ struct Resolved {
     ComPtr<ID3D12Resource> res;
     D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
     DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
-    uint32_t guest_format = 0;
     uint32_t width = 0;  // title texels
     uint32_t height = 0;
     uint32_t view = 0;  // RTV slot
@@ -420,7 +419,6 @@ private:
     void ClearTarget(Target& t, uint32_t flags, const float color[4], float z, uint8_t stencil, const D3D12_RECT* rects,
                      uint32_t count);
     void ClearSpan(const Target& cleared, uint32_t flags, const float color[4], float z, uint8_t stencil);
-    void ReleaseTargetView(Target& t);
 
     // shaders and pipelines
     Variant* EnsureVariant(Shader* s, const ShaderOptions& opt);
@@ -531,44 +529,6 @@ private:
     uint32_t fps_frames_ = 0;
     double fps_ = 0;
 
-    // what the title's draws came to, logged early on and every 600 presents so a black picture shows its cause
-    struct DrawStats {
-        uint32_t calls = 0;
-        uint32_t drawn = 0;
-        uint32_t no_state = 0;
-        uint32_t culled = 0;
-        uint32_t no_shader = 0;
-        uint32_t no_target = 0;
-        uint32_t no_indices = 0;
-        uint32_t no_pipeline = 0;
-        uint32_t clears = 0;
-        uint32_t resolves = 0;
-    };
-    DrawStats draw_stats_;
-    void LogDrawStats();
-
-    // the GPU's counts for the first draws of one present, logged once it has finished
-    static constexpr uint64_t kMeasuredPresent = 420;
-    static constexpr uint32_t kMeasuredDraws = 16;
-    struct MeasuredDraw {
-        uint32_t count;
-        uint32_t width;
-        uint32_t height;
-        bool pixel_shader;
-        bool depth_target;
-        uint32_t depth_control;
-        uint32_t su_mode;
-        uint32_t color_mask;
-        uint32_t vte;
-        D3D12_RECT scissor;
-    };
-    ComPtr<ID3D12QueryHeap> measure_heap_;
-    ComPtr<ID3D12Resource> measure_read_;
-    MeasuredDraw measured_[kMeasuredDraws] = {};
-    uint32_t measured_count_ = 0;
-    bool BeginMeasure();
-    void EndMeasure(const MeasuredDraw& d);
-    void LogMeasured();
 };
 
 D3D12Backend::~D3D12Backend() {
@@ -1284,10 +1244,6 @@ Resolved* D3D12Backend::FindResolved(const xenos::TextureFetch& t, const Texture
     if (resolved == resolved_.end()) return nullptr;
     // a block compressed fetch never reads a resolve: the address was reused since
     bool blocks = xenos::Info(t.format).block > 1;
-    if (blocks) {
-        static bool logged = false;
-        if (!std::exchange(logged, true)) LOGR("D3D12: format %u texture at %08X was a resolve", uint32_t(t.format), t.base);
-    }
     return b.dimension <= 1 && !blocks ? &resolved->second : nullptr;
 }
 
@@ -1711,41 +1667,10 @@ D3D12_PRIMITIVE_TOPOLOGY_TYPE TopologyType(D3D12_PRIMITIVE_TOPOLOGY topo) {
     return D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
 }
 
-// diagnostic: the shaders of the first draws of one present, microcode and translation, into CrashDumps
-void DumpShaders(uint64_t present, const State& s, const ShaderOptions& vs_opt, const ShaderOptions& ps_opt) {
-    constexpr uint64_t kPresent = 420;
-    constexpr int kDraws = 24;
-    static int dumped = 0;
-    if (present != kPresent || dumped >= kDraws) return;
-    auto dir = app::ExeDir() / "CrashDumps";
-    std::error_code e;
-    std::filesystem::create_directories(dir, e);
-    int draw = dumped++;
-    auto write = [&](const Shader* sh, const ShaderOptions& opt, const char* stage) {
-        if (!sh) return;
-        ShaderInfo info;
-        std::string hlsl = TranslateShader(sh->stage, sh->code.data(), sh->code.size(), opt, info);
-        std::string name = "draw" + std::to_string(draw) + "_" + stage;
-        std::ofstream(dir / (name + ".hlsl")) << hlsl;
-        std::ofstream(dir / (name + ".bin"), std::ios::binary)
-            .write(reinterpret_cast<const char*>(sh->code.data()), std::streamsize(sh->code.size() * 4));
-    };
-    write(s.vs, vs_opt, "vs");
-    write(s.ps, ps_opt, "ps");
-}
-
 void D3D12Backend::Draw(const State& s, const DrawArgs& a) {
-    DrawStats& st = draw_stats_;
-    st.calls++;
-    if (!s.vs || !s.consts || !s.fetch || !a.count) {
-        st.no_state++;
-        return;
-    }
+    if (!s.vs || !s.consts || !s.fetch || !a.count) return;
     // a cull of both faces draws nothing
-    if (Bits(s.Reg(kPaSuScModeCntl), 0, 2) == 3) {
-        st.culled++;
-        return;
-    }
+    if (Bits(s.Reg(kPaSuScModeCntl), 0, 2) == 3) return;
     if (cap_) CapStep(ColorTarget(s, 0, TargetHeight(s)));
     // EndDraw on every way out
     struct DrawScope {
@@ -1764,14 +1689,10 @@ void D3D12Backend::Draw(const State& s, const DrawArgs& a) {
         TexFlags(s, s.vs->info, ShaderStage::Vertex, vs_opt.tex_flags);
         if (s.ps) TexFlags(s, s.ps->info, ShaderStage::Pixel, ps_opt.tex_flags);
     }
-    DumpShaders(presents_, s, vs_opt, ps_opt);
     Variant* vs = EnsureVariant(s.vs, vs_opt);
     // no pixel shader: a depth only draw
     Variant* ps = s.ps ? EnsureVariant(s.ps, ps_opt) : nullptr;
-    if (!vs || (s.ps && !ps) || (!vs->info.fetches.empty() && !a.streams)) {
-        st.no_shader++;
-        return;
-    }
+    if (!vs || (s.ps && !ps) || (!vs->info.fetches.empty() && !a.streams)) return;
     static const ShaderInfo kNoPixelShader;
     const ShaderInfo& ps_info = ps ? ps->info : kNoPixelShader;
     BindViews(s, vs->info, ps_info);
@@ -1781,16 +1702,10 @@ void D3D12Backend::Draw(const State& s, const DrawArgs& a) {
     k.ps = ps ? Hash64(&ps_opt, sizeof(ps_opt), uintptr_t(s.ps)) : 0;
     Bound bound;
     PipelineKey unbound = k;
-    if (!BindTargets(s, ps_info, k, bound)) {
-        st.no_target++;
-        return;
-    }
+    if (!BindTargets(s, ps_info, k, bound)) return;
     if (ext_ && ext_->Bound(*this, s, bound.rt, bound.ds)) {
         k = unbound;
-        if (!BindTargets(s, ps_info, k, bound)) {
-            st.no_target++;
-            return;
-        }
+        if (!BindTargets(s, ps_info, k, bound)) return;
     }
     FillKeyStates(s, k);
     if (!k.ds_format) k.depth_control = 0;
@@ -1798,20 +1713,13 @@ void D3D12Backend::Draw(const State& s, const DrawArgs& a) {
     uint32_t count = 0;
     uint32_t min = 0;
     uint32_t max = 0;
-    if (!UploadIndices(a, topo, count, min, max)) {
-        st.no_indices++;
-        return;
-    }
+    if (!UploadIndices(a, topo, count, min, max)) return;
     k.topology = TopologyType(topo);
     bool strip = topo == D3D_PRIMITIVE_TOPOLOGY_LINESTRIP || topo == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
     // PA_SU_SC_MODE_CNTL multi_prim_ib_ena: strips restart at an all ones index
     if (strip && Bits(s.Reg(kPaSuScModeCntl), 21, 1)) k.strip_cut = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF;
     ID3D12PipelineState* pso = EnsurePipeline(k, *vs, ps);
-    if (!pso) {
-        st.no_pipeline++;
-        return;
-    }
-    st.drawn++;
+    if (!pso) return;
     g_perf.draws++;
 
     DrawConstants c;
@@ -1830,13 +1738,7 @@ void D3D12Backend::Draw(const State& s, const DrawArgs& a) {
     cl_->OMSetStencilRef(Bits(s.Reg(kRbStencilRefMask), 0, 8));
     cl_->SetPipelineState(pso);
     cl_->IASetPrimitiveTopology(topo);
-    bool measured = BeginMeasure();
     cl_->DrawIndexedInstanced(count, 1, 0, a.base_vertex, 0);
-    if (measured) {
-        uint32_t vte = s.Reg(kPaClVteCntl);
-        EndMeasure({count, bound.w, bound.h, ps != nullptr, k.ds_format != 0, k.depth_control, k.su_mode, k.color_mask,
-                    vte, sc});
-    }
     if (cap_) {
         uint32_t rt = bound.rt ? bound.rt->surface.base : 0;
         uint32_t ds = bound.ds ? bound.ds->surface.base : 0;
@@ -1849,7 +1751,6 @@ void D3D12Backend::Draw(const State& s, const DrawArgs& a) {
 // D3D Clear, within the scissor: a whole target clear also clears the targets its EDRAM range holds
 void D3D12Backend::Clear(const State& s, uint32_t flags, const float color[4], float z, uint32_t stencil,
                          const Rect* rect) {
-    draw_stats_.clears++;
     g_perf.clears++;
     uint32_t height = TargetHeight(s);
     uint32_t width = TargetWidth(s);
@@ -1873,7 +1774,6 @@ void D3D12Backend::Clear(const State& s, uint32_t flags, const float color[4], f
 
 // D3D Resolve: the target's rect to the texture at dst_base, held on the host and read in place of guest memory
 void D3D12Backend::Resolve(const State& s, const ResolveArgs& r) {
-    draw_stats_.resolves++;
     g_perf.resolves++;
     uint32_t height = std::max<uint32_t>(TargetHeight(s), uint32_t(r.rect.y2));
     Target* src = r.source < 4 ? ColorTarget(s, r.source, height) : DepthTarget(s, height);
@@ -1898,7 +1798,6 @@ void D3D12Backend::Resolve(const State& s, const ResolveArgs& r) {
                 free_rtv_.pop_back();
             }
             dst.format = fi.host;
-            dst.guest_format = r.dst_format;
             dst.width = w;
             dst.height = h;
             uint32_t hw = uint32_t(std::ceil(w * scale_));
@@ -1914,11 +1813,6 @@ void D3D12Backend::Resolve(const State& s, const ResolveArgs& r) {
     } else if (src) {
         static bool logged = false;
         if (!std::exchange(logged, true)) LOGR("D3D12: resolve to format %u left out", r.dst_format);
-    }
-    static bool clear_logged = false;
-    if (src && r.clear && !std::exchange(clear_logged, true)) {
-        LOGR("D3D12: first resolve clear: flags %X, z %f, stencil %u, colour %f %f %f %f", r.clear, r.clear_z,
-             r.clear_stencil, r.clear_color[0], r.clear_color[1], r.clear_color[2], r.clear_color[3]);
     }
     if (src && r.clear) {
         ClearTarget(*src, r.clear, r.clear_color, r.clear_z, uint8_t(r.clear_stencil), nullptr, 0);
@@ -2026,57 +1920,6 @@ void D3D12Backend::RenderUi() {
     ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), cl_.Get());
 }
 
-void D3D12Backend::LogDrawStats() {
-    const DrawStats& d = draw_stats_;
-    LOGR("D3D12: by present %llu, %u draws: %u drawn, skipped %u no state, %u culled, %u no shader, %u no target, %u no indices, %u no pipeline; %u clears, %u resolves",
-         static_cast<unsigned long long>(presents_), d.calls, d.drawn, d.no_state, d.culled, d.no_shader, d.no_target,
-         d.no_indices, d.no_pipeline, d.clears, d.resolves);
-    draw_stats_ = {};
-}
-
-// one pipeline statistics query per draw: a query must begin and end in one command list
-bool D3D12Backend::BeginMeasure() {
-    if (presents_ != kMeasuredPresent || measured_count_ >= kMeasuredDraws) return false;
-    if (!measure_heap_) {
-        D3D12_QUERY_HEAP_DESC qd{D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS, kMeasuredDraws, 0};
-        D3D12_HEAP_PROPERTIES readback{D3D12_HEAP_TYPE_READBACK};
-        D3D12_RESOURCE_DESC rd = BufferDesc(kMeasuredDraws * sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS));
-        if (FAILED(dev_->CreateQueryHeap(&qd, IID_PPV_ARGS(&measure_heap_))) ||
-            FAILED(dev_->CreateCommittedResource(&readback, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST,
-                                                 nullptr, IID_PPV_ARGS(&measure_read_)))) {
-            measured_count_ = kMeasuredDraws;
-            return false;
-        }
-    }
-    cl_->BeginQuery(measure_heap_.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, measured_count_);
-    return true;
-}
-
-void D3D12Backend::EndMeasure(const MeasuredDraw& d) {
-    uint32_t i = measured_count_++;
-    cl_->EndQuery(measure_heap_.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, i);
-    cl_->ResolveQueryData(measure_heap_.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, i, 1, measure_read_.Get(),
-                          i * sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS));
-    measured_[i] = d;
-}
-
-void D3D12Backend::LogMeasured() {
-    D3D12_QUERY_DATA_PIPELINE_STATISTICS* q = nullptr;
-    D3D12_RANGE range{0, measured_count_ * sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS)};
-    if (FAILED(measure_read_->Map(0, &range, reinterpret_cast<void**>(&q)))) return;
-    for (uint32_t i = 0; i < measured_count_; i++) {
-        const MeasuredDraw& d = measured_[i];
-        LOGR("D3D12: present %llu draw %u: %u indices into %ux%u, %s pixel shader: %llu vertices, %llu primitives, %llu after clipping, %llu pixel shader runs",
-             static_cast<unsigned long long>(kMeasuredPresent), i, d.count, d.width, d.height,
-             d.pixel_shader ? "a" : "no", q[i].IAVertices, q[i].IAPrimitives, q[i].CPrimitives, q[i].PSInvocations);
-        LOGR("D3D12:   depth target %s, depth control %08X, su mode %08X, colour mask %08X, vte %08X, scissor %ld,%ld to %ld,%ld",
-             d.depth_target ? "yes" : "no", d.depth_control, d.su_mode, d.color_mask, d.vte, d.scissor.left,
-             d.scissor.top, d.scissor.right, d.scissor.bottom);
-    }
-    D3D12_RANGE none{0, 0};
-    measure_read_->Unmap(0, &none);
-}
-
 void D3D12Backend::Present(const uint32_t front[6]) {
     xenos::TextureFetch t = xenos::DecodeTextureFetch(front);
     if (cap_) {
@@ -2093,11 +1936,6 @@ void D3D12Backend::Present(const uint32_t front[6]) {
     cl_->ClearRenderTargetView(rh, black, 0, nullptr);
     cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
     auto resolved = resolved_.find(ResolvedKey(t.base, 0));
-    static bool logged = false;
-    if (!std::exchange(logged, true)) {
-        const char* from = resolved != resolved_.end() ? "a resolve" : "guest memory";
-        LOGR("D3D12: first present of %08X, %ux%u, from %s", t.base, t.width, t.height, from);
-    }
     if (resolved != resolved_.end()) {
         Resolved& r = resolved->second;
         BlitToSwap(r.res.Get(), r.state, r.format, ComponentMapping(t), uint32_t(std::ceil(r.width * scale_)),
@@ -2115,11 +1953,6 @@ void D3D12Backend::Present(const uint32_t front[6]) {
     g_perf.upload_bytes += CurrentFrame().used;
     presents_++;
     frame_++;
-    if (presents_ == 120 || presents_ % 600 == 0) LogDrawStats();
-    if (presents_ == kMeasuredPresent + 1 && measured_count_) {
-        WaitFence(fence_value_);
-        LogMeasured();
-    }
     Frame& next = CurrentFrame();
     WaitFence(next.fence);
     next.alloc->Reset();

@@ -308,15 +308,6 @@ int32_t ResetEvent(Object& o) {
     return old;
 }
 
-int32_t PulseEvent(Object& o) {
-    // waiters already blocked cannot be told apart here, so a pulse behaves like set for one pass
-    std::lock_guard<std::mutex> lock(g_dispatch);
-    int32_t old = o.signal;
-    SetSignal(o, 1);
-    Wake(o);
-    return old;
-}
-
 int32_t ReleaseSemaphore(Object& o, int32_t count, uint32_t& status) {
     std::lock_guard<std::mutex> lock(g_dispatch);
     int32_t old = o.signal;

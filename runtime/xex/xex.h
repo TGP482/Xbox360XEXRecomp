@@ -106,12 +106,6 @@ struct Image {
         const Section* s = SectionAt(va);
         return s && (s->flags & kExecute);
     }
-
-    const Library* FindLibrary(const std::string& name) const {
-        for (auto& l : libraries)
-            if (l.name == name) return &l;
-        return nullptr;
-    }
 };
 
 }  // namespace xex

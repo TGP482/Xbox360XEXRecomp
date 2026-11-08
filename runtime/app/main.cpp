@@ -21,6 +21,7 @@
 #include "app/app.h"
 #include "core/input.h"
 #include "core/log.h"
+#include "gpu/backend.h"
 #include "image_symbols.h"
 #include "kernel/kernel.h"
 
@@ -68,6 +69,7 @@ LONG WINAPI WriteCrashDump(EXCEPTION_POINTERS* e) {
 }
 
 void DumpThreads() {
+    gpu::g_capture = true;
     for (auto& t : kernel::Threads()) {
         if (!t->ctx) continue;
         LOGR("thread %X", t->id);

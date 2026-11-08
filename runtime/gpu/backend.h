@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <cstdint>
 #include <memory>
 
@@ -34,5 +35,8 @@ public:
 std::unique_ptr<Backend> CreateBackend();
 // records on the title's thread and runs inner on a render thread (threaded.cpp)
 std::unique_ptr<Backend> Threaded(std::unique_ptr<Backend> inner);
+
+// F3: save the next frame, every draw and target, under diag::CaptureDir
+inline std::atomic<bool> g_capture{false};
 
 }  // namespace gpu

@@ -273,6 +273,11 @@ constexpr uint32_t kMemExportLast = 37;
 constexpr uint32_t kInterpolators = 16;
 constexpr uint32_t kColorTargets = 4;
 
+const ShaderHooks& Hooks() {
+    static const ShaderHooks plain;
+    return g_shader_hooks ? *g_shader_hooks : plain;
+}
+
 const char* kPrelude = R"(cbuffer Consts : register(b0) { float4 c[256]; };
 cbuffer Flow : register(b1) { uint4 g_bools[2]; uint4 g_loops[8]; };
 cbuffer Draw : register(b2) {
@@ -282,7 +287,8 @@ cbuffer Draw : register(b2) {
     float g_alpha_ref;
     float g_vpos_scale;
     uint g_vtx_fmt;
-};
+)";
+const char* kPreludeEnd = R"(};
 
 static float4 r[64];
 static float ps;
@@ -749,6 +755,8 @@ void Translator::EmitTextureFetch(const Fetch& f) {
             fetch = F("t%u.Sample(s%u, %s)", t, t, at.c_str());
         }
         Line("float4 ft = " + fetch + ";");
+        std::string fetched = op == kTextureFetch ? Hooks().Fetched(t, opt_.tex_flags[t & 31]) : std::string();
+        if (!fetched.empty()) Line(fetched);
         EmitWrite(Reg(f.Dst(), f.DstRel()), f.DstSwizzle(), "ft");
     } else {
         info_.unknown++;
@@ -888,7 +896,7 @@ void Translator::EmitDispatch(const std::vector<Cf>& cfs) {
 
 // helpers the ALU expressions call, which set the pending predicate, address register and kill
 std::string Translator::Head() const {
-    std::string s = kPrelude;
+    std::string s = kPrelude + Hooks().Constants() + kPreludeEnd;
     s += Pixel() ? kPixelPrelude : kVertexPrelude;
     s += R"(static bool pn;
 static bool pn_set;
@@ -941,7 +949,7 @@ VOut main(uint id : SV_VertexID) {
     r[0].x = float(id);
     Run();
     float4 pos = o_pos;
-    // VTX_W0_FMT clear: w is given as 1/w
+)" + Hooks().Position() + R"(    // VTX_W0_FMT clear: w is given as 1/w
     if (!(g_vtx_fmt & 4)) pos.w = 1 / pos.w;
     if ((g_vtx_fmt & 1) && (pos.w == 0 || !isfinite(pos.w))) pos.w = 1;
     // xy and z given already divided by w go back to clip space so the host's divide returns them
@@ -982,6 +990,7 @@ POut main(PIn i) {
         s += F("    r[%d] = float4(i.front ? vpos.x : -vpos.x, vpos.y, 0, 0);\n", opt_.vpos_reg & 63);
     }
     s += "    Run();\n";
+    s += Hooks().Output();
     if (opt_.alpha_test) {
         s += R"(    float a = oC[0].a;
     bool pass = true;

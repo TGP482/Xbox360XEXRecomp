@@ -46,7 +46,22 @@ struct ShaderOptions {
     uint8_t export_map[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
     int8_t vpos_reg = -1;  // pixel: register the shader reads VPOS and VFACE from, -1 none
     bool alpha_test = false;
+    uint8_t tex_flags[32] = {};  // per ShaderInfo::textures entry, an extension's (Extension::Sampled)
 };
+
+// what a renderer extension adds to every translated shader
+struct ShaderHooks {
+    virtual ~ShaderHooks() = default;
+    // the Draw cbuffer's line for DrawConstants::ext
+    virtual std::string Constants() const { return "    float4 g_ext;\n"; }
+    // after a fetch from texture i with the flags Sampled gave it: the result in ft
+    virtual std::string Fetched(uint32_t /*i*/, uint8_t /*flags*/) const { return {}; }
+    // the vertex position in pos before the host maps it
+    virtual std::string Position() const { return {}; }
+    // the colours in oC[0..3] before the alpha test
+    virtual std::string Output() const { return {}; }
+};
+inline const ShaderHooks* g_shader_hooks = nullptr;
 
 std::string TranslateShader(ShaderStage stage, const uint32_t* code, size_t dwords, const ShaderOptions& opt,
                             ShaderInfo& info);
@@ -65,6 +80,7 @@ struct DrawConstants {
     float alpha_ref;
     float vpos_scale;  // title pixels per host pixel
     uint32_t vtx_fmt;  // PA_CL_VTE_CNTL bits 8 to 10: xy and z already divided by w, w given as w (clear: 1/w)
+    float ext[4];      // a renderer extension's, declared by ShaderHooks::Constants
 };
 
 // b3, per fetch instruction

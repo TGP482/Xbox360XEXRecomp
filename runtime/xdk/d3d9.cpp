@@ -11,8 +11,11 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -378,7 +381,16 @@ void LogDrawInputs(uint32_t dev, const gpu::DrawArgs& a, const std::vector<gpu::
     constexpr int kDraws = 24;
     static int logged = 0;
     if (g_presents != kPresent || logged >= kDraws) return;
-    LOGR("d3d9: present %u draw %d: prim %u, count %u, up stride %u", kPresent, logged++, a.prim, a.count, up_stride);
+    LOGR("d3d9: present %u draw %d: prim %u, count %u, up stride %u", kPresent, logged, a.prim, a.count, up_stride);
+    if (up_stride && !streams.empty() && streams[0].data) {
+        auto dir = app::ExeDir() / "CrashDumps";
+        std::error_code e;
+        std::filesystem::create_directories(dir, e);
+        std::string name = "draw" + std::to_string(logged) + "_vertices.bin";
+        std::ofstream(dir / name, std::ios::binary)
+            .write(reinterpret_cast<const char*>(streams[0].data), std::streamsize(streams[0].size));
+    }
+    logged++;
     for (size_t k = 0; k < streams.size(); k++) {
         const gpu::StreamFetch& sf = streams[k];
         const gpu::VertexFetchConstant& f = sf.fetch;

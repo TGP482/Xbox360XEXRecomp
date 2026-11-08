@@ -129,6 +129,8 @@ XAM_EXPORT(0x1F7, XMsgStartIORequest) {
     return Complete(a[2], kErrorSuccess);
 }
 
+XAM_EXPORT(0x1F8, XMsgCancelIORequest) { return kErrorSuccess; }
+
 XAM_EXPORT(0x1FC, XMsgStartIORequestEx) {
     ReportMessage(a[0], a[1]);
     if (a[3]) std::memset(HostPtr(a[3]), 0, a[4]);
@@ -264,6 +266,33 @@ XAM_EXPORT(0x2BC, XamShowSigninUI) {
     return kErrorSuccess;
 }
 
+XAM_EXPORT(0x2BF, XamShowFriendsUI) {
+    ShowUi();
+    return kErrorSuccess;
+}
+
+XAM_EXPORT(0x2C6, XamShowPlayerReviewUI) {
+    ShowUi();
+    return kErrorSuccess;
+}
+
+XAM_EXPORT(0x2D5, XamShowGamerCardUIForXUID) {
+    ShowUi();
+    return kErrorSuccess;
+}
+
+// (user, flags, default text, title, description, result, result length, overlapped): the default text
+XAM_EXPORT(0x2C1, XamShowKeyboardUI) {
+    ShowUi();
+    uint32_t n = 0;
+    while (a[2] && n + 1 < a[6] && R16(a[2] + n * 2)) {
+        W16(a[5] + n * 2, R16(a[2] + n * 2));
+        n++;
+    }
+    if (a[6]) W16(a[5] + n * 2, 0);
+    return Complete(a[7], kErrorSuccess);
+}
+
 // (user, content type, content flags, bytes requested, device out, overlapped): the hard disk
 XAM_EXPORT(0x2CB, XamShowDeviceSelectorUI) {
     constexpr uint32_t kHardDisk = 1;
@@ -299,5 +328,32 @@ XAM_EXPORT(0x2D9, XamShowDirtyDiscErrorUI) {
     LOGE("the title reported a disc read error");
     Shutdown(1);
 }
+
+// sessions: a handle to an object nothing reads
+
+XAM_EXPORT(0x316, XamSessionCreateHandle) {
+    auto o = std::make_shared<Object>(ObjType::Other);
+    Bind(o, mem::AllocSystem(16));
+    W32(a[0], NewHandle(o));
+    return kErrorSuccess;
+}
+
+// (handle, object out)
+XAM_EXPORT(0x317, XamSessionRefObjByHandle) {
+    ObjectRef o = FromHandle(a[0]);
+    if (!o) return kInvalidHandle;
+    W32(a[1], o->guest);
+    return kErrorSuccess;
+}
+
+// voice: no headset, so no voice object; the third argument of XamVoiceCreate is the voice out
+XAM_EXPORT(0x30C, XamVoiceCreate) {
+    if (a[2]) W32(a[2], 0);
+    return kErrorDeviceNotConnected;
+}
+
+XAM_EXPORT(0x30D, XamVoiceHeadsetPresent) { return 0; }
+XAM_EXPORT(0x30E, XamVoiceSubmitPacket) { return kErrorDeviceNotConnected; }
+XAM_EXPORT(0x30F, XamVoiceClose) { return kErrorSuccess; }
 
 }  // namespace kernel

@@ -26,6 +26,29 @@ XAM_EXPORT(0x20A, XamUserGetXUID) {
 
 XAM_EXPORT(0x210, XamUserGetSigninState) { return SignedIn(a[0]) ? kSignedInLocally : 0; }
 
+// (user, buffer, size): the offline profile's gamertag
+XAM_EXPORT(0x20E, XamUserGetName) {
+    constexpr char kName[] = "Player";
+    if (!SignedIn(a[0])) return kErrorNoSuchUser;
+    uint32_t n = std::min<uint32_t>(a[2], sizeof(kName));
+    std::memcpy(HostPtr(a[1]), kName, n);
+    if (n) W8(a[1] + n - 1, 0);
+    return kErrorSuccess;
+}
+
+// (user, privilege, result out): an offline profile has no parental limits
+XAM_EXPORT(0x212, XamUserCheckPrivilege) {
+    if (!SignedIn(a[0])) return kErrorNoSuchUser;
+    W32(a[2], 1);
+    return kErrorSuccess;
+}
+
+// (user, XUIDs, count, result out, overlapped): no friends offline
+XAM_EXPORT(0x213, XamUserAreUsersFriends) {
+    if (a[3]) W32(a[3], 0);
+    return Complete(a[4], kErrorSuccess);
+}
+
 // achievements: none
 // (title, user, XUID, flags, offset, count, buffer size out, handle out)
 XAM_EXPORT(0x2EE, XamUserCreateAchievementEnumerator) {

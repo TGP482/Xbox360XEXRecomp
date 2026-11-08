@@ -84,23 +84,33 @@ std::string RootLink(const std::string& root) { return "\\??\\" + root + ":"; }
 
 }  // namespace
 
-// (user, root name, XCONTENT_DATA, flags, disposition out, license mask out, cache size, content size, overlapped):
-// root: becomes a link to the package's folder
-XAM_EXPORT(0x259, XamContentCreateEx) {
+namespace {
+
+// XamContentCreate and XamContentCreateEx share their first six arguments
+uint32_t CreateContent(const Args& a, uint32_t overlapped) {
     std::string root = ReadCString(a[1]);
     std::string console = PackagePath(a[0], a[2]);
     std::string host = ResolvePath(console, 0);
-    if (host.empty()) return Complete(a[8], kErrorPathNotFound);
+    if (host.empty()) return Complete(overlapped, kErrorPathNotFound);
     std::error_code ec;
     uint32_t reported = 0;
     uint32_t result = Create(host, a[3] & 0xFF, fs::exists(host, ec), reported);
-    if (result != kErrorSuccess) return Complete(a[8], result);
+    if (result != kErrorSuccess) return Complete(overlapped, result);
     std::ofstream(host + ".name") << DisplayNameOf(a[2]);
     CreateSymbolicLink(RootLink(root), console);
     if (a[4]) W32(a[4], reported);
     if (a[5]) W32(a[5], 0);
-    return Complete(a[8], kErrorSuccess);
+    return Complete(overlapped, kErrorSuccess);
 }
+
+}  // namespace
+
+// (user, root name, XCONTENT_DATA, flags, disposition out, license mask out, overlapped):
+// root: becomes a link to the package's folder
+XAM_EXPORT(0x258, XamContentCreate) { return CreateContent(a, a[6]); }
+
+// as XamContentCreate with cache size and content size before the overlapped
+XAM_EXPORT(0x259, XamContentCreateEx) { return CreateContent(a, a[8]); }
 
 // (root name, overlapped)
 XAM_EXPORT(0x25A, XamContentClose) {
@@ -166,6 +176,17 @@ XAM_EXPORT(0x25E, XamContentGetDeviceData) {
     for (uint32_t i = 0; kName[i]; i++) W16(d + 0x18 + i * 2, uint8_t(kName[i]));
     return kErrorSuccess;
 }
+
+// (device, name out, length in characters)
+XAM_EXPORT(0x25F, XamContentGetDeviceName) {
+    constexpr char kName[] = "Hard Drive";
+    if (a[2] < sizeof(kName)) return kErrorInsufficientBuffer;
+    for (uint32_t i = 0; i < sizeof(kName); i++) W16(a[1] + i * 2, uint8_t(kName[i]));
+    return kErrorSuccess;
+}
+
+// (root name, image, size, overlapped)
+XAM_EXPORT(0x260, XamContentSetThumbnail) { return Complete(a[3], kErrorSuccess); }
 
 // (device, overlapped): the hard disk is always there
 XAM_EXPORT(0x265, XamContentGetDeviceState) { return Complete(a[1], kErrorSuccess); }

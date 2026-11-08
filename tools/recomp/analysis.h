@@ -113,6 +113,7 @@ private:
     void Branch(uint32_t entry, uint32_t target, Walked& w, std::vector<uint32_t>& todo) const;
     bool ResolveTable(uint32_t bctr);
     uint32_t BoundBefore(uint32_t start, uint32_t reg) const;
+    uint32_t InlineTableCount(uint32_t table) const;
     void FindLabels();
     bool AddFunction(uint32_t va);
     uint32_t PdataOwner(uint32_t va) const;

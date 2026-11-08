@@ -449,6 +449,7 @@ bool Analysis::ResolveTable(uint32_t bctr) {
     else if (v.id <= 32) count = BoundBefore(start, uint32_t(v.id - 1));
     bool by_max = !count && v.max;
     if (by_max) count = v.max + 1;
+    if (!count && v.size == 4 && !v.relative && v.value == bctr + 4) count = InlineTableCount(v.value);
     JumpTable jt{bctr, {}};
     for (uint32_t k = 0; count && count <= kMaxTableEntries && k < count; k++) {
         uint32_t at = v.value + k * v.scale;
@@ -469,6 +470,18 @@ bool Analysis::ResolveTable(uint32_t bctr) {
         if (a >= lo_ && a < hi_ && CoverAt(a) == kFree) CoverAt(a) = kData;
     jump_tables[bctr] = std::move(jt);
     return true;
+}
+
+// An unbounded table of addresses right after its bctr ends where the first case after it starts.
+uint32_t Analysis::InlineTableCount(uint32_t table) const {
+    uint32_t end = 0xFFFFFFFF;
+    uint32_t n = 0;
+    for (uint32_t at = table; at < end && n < kMaxTableEntries && img.Contains(at, 4); at += 4, n++) {
+        uint32_t target = img.U32(at);
+        if (!IsCode(target)) return 0;
+        if (target > table) end = std::min(end, target);
+    }
+    return end == 0xFFFFFFFF ? 0 : n;
 }
 
 // A switch variable live into the table's block: the cmpli on its register before it, while nothing rewrites it.

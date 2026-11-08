@@ -21,6 +21,7 @@
 #include "cpu/dispatch.h"
 #include "kernel/memory.h"
 #include "xdk/hle.h"
+#include "xdk/layout.h"
 
 // a title with no XAudio named leaves the engine out
 #ifdef SUB_XAudioInitialize
@@ -60,16 +61,19 @@ constexpr uint32_t kBufferRate = 0x18;
 constexpr uint32_t kBufferSamples = 0x1C;
 constexpr uint32_t kBufferHeader = 0x80;  // the samples follow, 128 byte aligned
 
-// source voice init
-constexpr uint32_t kSourceType = 0x00;  // 1 16 bit PCM, 3 XMA
+// source voice init: type, then PCM channels and rate, or the XMA streams of 8 bytes {rate, u8 channels}
+constexpr uint32_t kSourceType = 0x00;
 constexpr uint32_t kPcmChannels = 0x04;
 constexpr uint32_t kPcmRate = 0x08;
 constexpr uint32_t kXmaStreams = 0x04;
-constexpr uint32_t kXmaRate = 0x08;  // the first stream's, then its channels
-constexpr uint32_t kXmaChannels = 0x0C;
+constexpr uint32_t kXmaStream = 0x08;
+constexpr uint32_t kXmaStreamBytes = 8;
+constexpr uint32_t kXmaStreamChannels = 0x04;
 constexpr uint32_t kSourceEffects = 0x44;
-constexpr uint8_t kTypePcm = 1;
-constexpr uint8_t kTypeXma = 3;
+// 16 bit PCM is 1 in every build, the other numbers move between builds
+constexpr uint32_t kTypePcm = 1;
+constexpr uint32_t kTypePcm8 = XDK_XAudio_SourcePcm8;
+constexpr uint32_t kTypeXma = XDK_XAudio_SourceXma;
 // submix voice init
 constexpr uint32_t kSubmixRate = 0x04;
 constexpr uint32_t kSubmixChannels = 0x09;
@@ -325,7 +329,7 @@ void SetReverb(Reverb& r, uint32_t p) {
 
 // Sources
 
-uint32_t BlockAlign(const Voice& v) { return v.channels * 2; }
+uint32_t BlockAlign(const Voice& v) { return v.channels * (v.type == kTypePcm8 ? 1 : 2); }
 
 // the voice's current packet starts over, or the next one; false once the queue is empty
 bool NextPacket(Voice& v) {
@@ -347,6 +351,7 @@ bool NextPacket(Voice& v) {
 float SourceSample(Voice& v, uint32_t f, uint32_t c) {
     if (v.type == kTypeXma) return v.pcm[size_t(f) * v.channels + c] / 32768.0f;
     const Packet& p = v.packets.front();
+    if (v.type == kTypePcm8) return (int(R8(p.buffer + f * BlockAlign(v) + c)) - 128) / 128.0f;
     return int16_t(R16(p.buffer + f * BlockAlign(v) + c * 2)) / 32768.0f;
 }
 
@@ -543,6 +548,18 @@ void StartMixer() {
     });
 }
 
+// every stream's channels; libavcodec splits the packets between streams of two channels, an odd one last
+uint32_t XmaChannels(uint32_t init) {
+    uint32_t streams = R8(init + kXmaStreams);
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < streams; i++) {
+        uint32_t channels = R8(init + kXmaStream + i * kXmaStreamBytes + kXmaStreamChannels);
+        if (channels == 1 && i + 1 < streams) LOGR("xaudio: XMA voice with a mono stream before its last one");
+        total += channels;
+    }
+    return total;
+}
+
 uint32_t NewHandle() {
     uint32_t h = mem::AllocSystem(kHandleBytes);
     if (h) std::memset(HostPtr(h), 0, kHandleBytes);
@@ -634,14 +651,13 @@ HLE_FUNC(XAudioCreateSourceVoice) {
     auto v = std::make_unique<Voice>();
     v->source = true;
     v->type = R8(init + kSourceType);
-    if (v->type == kTypePcm) {
+    if (v->type == kTypePcm || v->type == kTypePcm8) {
         v->channels = R8(init + kPcmChannels);
         v->rate = R32(init + kPcmRate);
     } else if (v->type == kTypeXma) {
-        uint32_t streams = R8(init + kXmaStreams);
-        if (streams > 1) LOGR("xaudio: XMA voice with %u streams, the first plays", streams);
-        v->channels = R8(init + kXmaChannels);
-        v->rate = R32(init + kXmaRate);
+        v->channels = XmaChannels(init);
+        v->rate = R32(init + kXmaStream);
+        if (!v->channels || v->channels > kMaxChannels) return kInvalidArg;
         v->xma = std::make_unique<audio::XmaDecoder>(v->rate, v->channels);
     } else {
         LOGE("xaudio: source voice type %u not understood", v->type);

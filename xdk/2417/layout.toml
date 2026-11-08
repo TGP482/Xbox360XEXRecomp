@@ -64,3 +64,6 @@ PixelInfo_Inputs = 0x20
 VertexInfo_Skip = 0x18
 VertexInfo_ElementCount = 0x1C
 VertexInfo_Elements = 0x28
+# XAudio source voice types past 1 (16 bit PCM): 8 bit PCM (Bink 828715B8), XMA
+XAudio_SourcePcm8 = 2
+XAudio_SourceXma = 3

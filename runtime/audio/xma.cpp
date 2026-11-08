@@ -21,6 +21,8 @@ constexpr uint32_t kPacketBytes = audio::XmaDecoder::kPacketBytes;
 constexpr uint32_t kBlockBytes = 256;        // the output buffer's offsets count these
 constexpr uint32_t kSubframeSamples = 128;  // per channel, the unit the output is written in
 constexpr uint32_t kSampleRates[] = {24000, 32000, 44100, 48000};
+constexpr uint32_t kPacketBits = kPacketBytes * 8;
+constexpr uint32_t kLoopForever = 255;
 
 // XMA_CONTEXT_INIT
 constexpr uint32_t kInitInput0 = 0x00;
@@ -31,6 +33,10 @@ constexpr uint32_t kInitOutput = 0x14;
 constexpr uint32_t kInitOutputBlocks = 0x18;
 constexpr uint32_t kInitStereo = 0x24;
 constexpr uint32_t kInitSampleRate = 0x28;
+// the loop region in bits from the start of the input buffer, and its count
+constexpr uint32_t kInitLoopStart = 0x2C;
+constexpr uint32_t kInitLoopEnd = 0x30;
+constexpr uint32_t kInitLoopCount = 0x34;
 
 struct Context {
     uint32_t input[2] = {};
@@ -45,6 +51,9 @@ struct Context {
     bool output_valid = false;
     bool enabled = false;
     uint32_t channels = 1;
+    uint32_t loops = 0;
+    uint32_t loop_start = 0;  // packets
+    uint32_t loop_end = 0;    // the packet holding the region's last bit
     std::unique_ptr<audio::XmaDecoder> decoder;
     std::vector<int16_t> pcm;  // decoded and not yet written, from pcm_at
     size_t pcm_at = 0;
@@ -63,10 +72,20 @@ Context* Find(uint32_t handle) {
     return it != g_contexts.end() ? it->second.get() : nullptr;
 }
 
+// the read goes back to the region's start once its last packet is decoded, whole packets at a time
+bool LoopBack(Context& c) {
+    if (!c.loops || c.packet != c.loop_end) return false;
+    if (c.loops != kLoopForever) c.loops--;
+    c.packet = c.loop_start;
+    c.decoder->Flush(c.pcm);
+    return true;
+}
+
 // the next packet decoded; false once both input buffers are spent
 bool ReadPacket(Context& c) {
     if (!c.input_valid[c.current]) return false;
     c.decoder->Packet(static_cast<const uint8_t*>(HostPtr(c.input[c.current] + c.packet * kPacketBytes)), c.pcm);
+    if (LoopBack(c)) return true;
     if (++c.packet >= c.packets[c.current]) {
         c.input_valid[c.current] = false;
         c.current ^= 1;
@@ -145,6 +164,12 @@ KERNEL_EXPORT(0x225, XMAInitializeContext) {
     c->output = Virtual(R32(init + kInitOutput));
     c->blocks = R32(init + kInitOutputBlocks);
     c->channels = R32(init + kInitStereo) ? 2 : 1;
+    uint32_t loop_end = R32(init + kInitLoopEnd);
+    if (loop_end) {
+        c->loops = R8(init + kInitLoopCount);
+        c->loop_start = R32(init + kInitLoopStart) / kPacketBits;
+        c->loop_end = (loop_end - 1) / kPacketBits;
+    }
     c->decoder = std::make_unique<audio::XmaDecoder>(kSampleRates[R32(init + kInitSampleRate) & 3], c->channels);
     return kOk;
 }

@@ -17,7 +17,7 @@ This tool was originally created for porting [Far Cry Instincts Predator](https:
    list(FILTER XEX_HOST_SOURCES EXCLUDE REGEX "/src/game/")
    add_xex_image(MyGame default.xex game.toml 64 game)
    ```
-- Build with Clang and Ninja (`clang++`, `-fuse-ld=lld`). toml++, Dear ImGui and SDL3 are fetched by CMake.
+- Build with Clang and Ninja (`clang++`, `-fuse-ld=lld`). toml++, Dear ImGui, SDL3 and FFmpeg's LGPL libraries are fetched by CMake.
 
 ## Game Setup
 
@@ -58,8 +58,8 @@ A new XDK build needs `xdk/<build>/layout.toml` and signatures made from titles 
 - **Renderer Extensions** - Allows a game to change render targets, add passes and add to the generated shaders through `gpu::Extension`, set with `gpu::SetExtension` from `GameInfo::init`.
 
 ### Audio
-- **XMA** - Decodes XMA through the kernel's XMA functions at the API level, with Windows' own WMA Pro decoder.
-- **XAudio** - Implements the XDK's XAudio engine at the API level on a host mixer, with source and submix voices, packets and the reverb on XAudio2's own, found in each game by signatures.
+- **XMA** - Decodes XMA through the kernel's XMA functions at the API level, with FFmpeg's libavcodec, including multi stream voices and loop regions.
+- **XAudio** - Implements the XDK's XAudio engine at the API level on a host mixer, with PCM and XMA source voices, submix voices, packets and the reverb on XAudio2's own, found in each game by signatures.
 
 ### Input
 - **Controller** - Supports Xbox, PlayStation and Switch controllers through SDL3, with hot plugging and rumble.
@@ -76,5 +76,5 @@ A new XDK build needs `xdk/<build>/layout.toml` and signatures made from titles 
 
 ## Credits
 
-- [toml++](https://github.com/marzer/tomlplusplus) for the configs, [Dear ImGui](https://github.com/ocornut/imgui) for the settings overlay and [SDL](https://github.com/libsdl-org/SDL) for the window, input and controllers.
+- [toml++](https://github.com/marzer/tomlplusplus) for the configs, [Dear ImGui](https://github.com/ocornut/imgui) for the settings overlay, [SDL](https://github.com/libsdl-org/SDL) for the window, input and controllers and [FFmpeg](https://ffmpeg.org)'s libavcodec for decoding XMA.
 - The public a2xx documentation of [Mesa](https://gitlab.freedesktop.org/mesa/mesa)'s freedreno driver as a reference for the Xenos GPU's instruction formats. This project does not use emulation or any emulator code.

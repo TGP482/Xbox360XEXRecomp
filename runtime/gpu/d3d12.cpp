@@ -1144,7 +1144,13 @@ void D3D12Backend::FillTextureView(const TextureBinding& b, const uint32_t fetch
     D3D12_SHADER_RESOURCE_VIEW_DESC v{};
     v.Shader4ComponentMapping = ComponentMapping(t);
     auto resolved = resolved_.find(t.base);
-    if (resolved != resolved_.end() && b.dimension <= 1) {
+    // a block compressed fetch never reads a resolve: the address was reused since
+    bool blocks = xenos::Info(t.format).block > 1;
+    if (resolved != resolved_.end() && blocks) {
+        static bool logged = false;
+        if (!std::exchange(logged, true)) LOGR("D3D12: format %u texture at %08X was a resolve", uint32_t(t.format), t.base);
+    }
+    if (resolved != resolved_.end() && b.dimension <= 1 && !blocks) {
         Resolved& r = resolved->second;
         Transition(r.res.Get(), r.state, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
         v.Format = r.format;

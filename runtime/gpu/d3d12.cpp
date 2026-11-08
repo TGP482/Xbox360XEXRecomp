@@ -83,8 +83,8 @@ uint32_t Be32(const uint8_t* p) {
     return __builtin_bswap32(v);
 }
 
-// the title's Direct3D keeps CPU addresses in its fetch constants and objects
-const uint8_t* Guest(uint32_t address) { return mem::Base() + address; }
+// GPU addresses are physical, read through the 4 KB page window
+const uint8_t* Guest(uint32_t address) { return mem::Base() + mem::VirtualFromPhysical(address); }
 
 D3D12_RESOURCE_DESC BufferDesc(uint64_t bytes) {
     D3D12_RESOURCE_DESC d{};
@@ -1060,7 +1060,7 @@ void D3D12Backend::UploadTexture(Texture& tex, const xenos::TextureFetch& t) {
     std::vector<xenos::Level> levels = xenos::Levels(t);
     bool volume = t.dimension == xenos::Dimension::D3;
     uint32_t faces = volume ? 1 : t.depth;
-    const uint8_t* memory = mem::Base();
+    const uint8_t* memory = Guest(0);  // the physical window, each level adds its address
     Transition(tex.res.Get(), tex.state, D3D12_RESOURCE_STATE_COPY_DEST);
     D3D12_RESOURCE_DESC desc = tex.res->GetDesc();
     std::vector<uint8_t> rows;

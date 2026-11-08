@@ -267,6 +267,9 @@ gpu::VertexFetchConstant FetchFromElement(const DeclElement& el, uint32_t stride
     return f;
 }
 
+// GPU addresses (fetch constants, index buffers) are physical
+const uint8_t* GpuBytes(uint32_t pa) { return static_cast<const uint8_t*>(HostPtr(mem::VirtualFromPhysical(pa))); }
+
 // where each fetch of the vertex shader reads: the declaration's element for its semantic, from that element's
 // stream; up_data and up_stride stand in for stream 0 in DrawVerticesUP and DrawIndexedVerticesUP
 std::vector<gpu::StreamFetch> Streams(uint32_t dev, const ShaderEntry& vs, uint32_t up_data, uint32_t up_bytes,
@@ -293,7 +296,7 @@ std::vector<gpu::StreamFetch> Streams(uint32_t dev, const ShaderEntry& vs, uint3
         uint32_t slot = kSlots - 1 - std::min<uint32_t>(de.stream, kSlots - 1);
         uint32_t d0 = R32(dev + kDevFetch + slot * 8);
         uint32_t d1 = R32(dev + kDevFetch + slot * 8 + 4);
-        sf.data = bytes(d0 & ~3u);
+        sf.data = GpuBytes(d0 & ~3u);
         sf.endian = d1 & 3;
         sf.size = (d1 >> 2 & 0xFFFFFF) * 4;
         sf.fetch = FetchFromElement(de, R8(dev + kDevStrides + de.stream) * 4);
@@ -363,7 +366,7 @@ HLE_FUNC(D3DDevice_DrawIndexedVertices) {
     } else {
         d.index_endian = d.index32 ? 2 : 1;
     }
-    d.indices = static_cast<const uint8_t*>(HostPtr(R32(ib + XDK_IndexBuffer_Address) + a[3] * (d.index32 ? 4 : 2)));
+    d.indices = GpuBytes(R32(ib + XDK_IndexBuffer_Address) + a[3] * (d.index32 ? 4 : 2));
     Draw(a[0], d);
     return 0;
 }

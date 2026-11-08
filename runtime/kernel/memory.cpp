@@ -270,6 +270,9 @@ static void EnsureRanges() {
 
 static Ranges& SpaceOf(uint32_t va) { return va >= kLargeBase ? g_large : g_virtual; }
 
+// commits and decommits cover whole pages of the space they fall in
+static uint32_t PageSize(uint32_t va) { return va >= kLargeBase ? kLargePage : kPage; }
+
 void ReserveImage(uint32_t base, uint32_t size) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     EnsureRanges();
@@ -313,8 +316,9 @@ static uint32_t CommitVirtual(uint32_t& base, uint32_t& size) {
     uint32_t start;
     Reservation* r = FindReservation(base, &start);
     if (!r) return kStatusNotCommitted;
-    uint32_t first = base & ~(kPage - 1);
-    uint32_t end = (base + size + kPage - 1) & ~(kPage - 1);
+    uint32_t page = PageSize(base);
+    uint32_t first = base & ~(page - 1);
+    uint32_t end = (base + size + page - 1) & ~(page - 1);
     if (end > start + r->size) return kStatusConflictingAddresses;
     if (!Commit(first, end - first)) return kStatusNoMemory;
     for (uint32_t p = first; p < end; p += kPage) r->commit[(p - start) / kPage] = 1;
@@ -350,9 +354,10 @@ uint32_t FreeVirtual(uint32_t& base, uint32_t& size, uint32_t type) {
         size = sz;
         return 0;
     }
-    uint32_t first = base & ~(kPage - 1);
+    uint32_t page = PageSize(base);
+    uint32_t first = base & ~(page - 1);
     uint32_t end = start + r->size;
-    if (size) end = (base + size + kPage - 1) & ~(kPage - 1);
+    if (size) end = (base + size + page - 1) & ~(page - 1);
     Decommit(first, end - first);
     for (uint32_t p = first; p < end; p += kPage) r->commit[(p - start) / kPage] = 0;
     base = first;

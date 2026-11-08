@@ -281,7 +281,7 @@ cbuffer Draw : register(b2) {
     uint g_alpha_func;
     float g_alpha_ref;
     float g_vpos_scale;
-    uint g_pad;
+    uint g_vtx_fmt;
 };
 
 static float4 r[64];
@@ -941,6 +941,12 @@ VOut main(uint id : SV_VertexID) {
     r[0].x = float(id);
     Run();
     float4 pos = o_pos;
+    // VTX_W0_FMT clear: w is given as 1/w
+    if (!(g_vtx_fmt & 4)) pos.w = 1 / pos.w;
+    if ((g_vtx_fmt & 1) && (pos.w == 0 || !isfinite(pos.w))) pos.w = 1;
+    // xy and z given already divided by w go back to clip space so the host's divide returns them
+    if (g_vtx_fmt & 1) pos.xy *= pos.w;
+    if (g_vtx_fmt & 2) pos.z *= pos.w;
     pos.xyz = pos.xyz * g_ndc_scale.xyz + g_ndc_offset.xyz * pos.w;
     // depth stored reversed
     pos.z = pos.w - pos.z;

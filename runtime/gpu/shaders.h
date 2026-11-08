@@ -64,7 +64,7 @@ struct DrawConstants {
     uint32_t alpha_func;  // compare function, 0 never to 7 always
     float alpha_ref;
     float vpos_scale;  // title pixels per host pixel
-    uint32_t pad;
+    uint32_t vtx_fmt;  // PA_CL_VTE_CNTL bits 8 to 10: xy and z already divided by w, w given as w (clear: 1/w)
 };
 
 // b3, per fetch instruction

@@ -446,6 +446,12 @@ private:
         uint32_t width;
         uint32_t height;
         bool pixel_shader;
+        bool depth_target;
+        uint32_t depth_control;
+        uint32_t su_mode;
+        uint32_t color_mask;
+        uint32_t vte;
+        D3D12_RECT scissor;
     };
     ComPtr<ID3D12QueryHeap> measure_heap_;
     ComPtr<ID3D12Resource> measure_read_;
@@ -1322,6 +1328,7 @@ void D3D12Backend::FillDrawConstants(const State& s, uint32_t w, uint32_t h, Dra
     c.alpha_func = Bits(cc, 3, 1) ? Bits(cc, 0, 3) : 7;
     c.alpha_ref = s.RegF(kRbAlphaRef);
     c.vpos_scale = 1 / scale_;
+    c.vtx_fmt = Bits(vte, 8, 3);
 }
 
 // the window scissor in the target's pixels, within w x h
@@ -1573,7 +1580,10 @@ void D3D12Backend::Draw(const State& s, const DrawArgs& a) {
     if (ext_) ext_->BeginDraw(*this, s);
     bool measured = BeginMeasure();
     cl_->DrawIndexedInstanced(count, 1, 0, a.base_vertex, 0);
-    if (measured) EndMeasure({count, w, h, ps != nullptr});
+    if (measured) {
+        uint32_t vte = s.Reg(kPaClVteCntl);
+        EndMeasure({count, w, h, ps != nullptr, k.ds_format != 0, k.depth_control, k.su_mode, k.color_mask, vte, sc});
+    }
     if (ext_) ext_->EndDraw(*this, s);
 }
 
@@ -1635,6 +1645,11 @@ void D3D12Backend::Resolve(const State& s, const ResolveArgs& r) {
     } else if (src) {
         static bool logged = false;
         if (!std::exchange(logged, true)) LOGR("D3D12: resolve to format %u left out", r.dst_format);
+    }
+    static bool clear_logged = false;
+    if (src && r.clear && !std::exchange(clear_logged, true)) {
+        LOGR("D3D12: first resolve clear: flags %X, z %f, stencil %u, colour %f %f %f %f", r.clear, r.clear_z,
+             r.clear_stencil, r.clear_color[0], r.clear_color[1], r.clear_color[2], r.clear_color[3]);
     }
     if (src && r.clear) {
         ClearTarget(*src, r.clear, r.clear_color, r.clear_z, uint8_t(r.clear_stencil), nullptr, 0);
@@ -1780,6 +1795,9 @@ void D3D12Backend::LogMeasured() {
         LOGR("D3D12: present %llu draw %u: %u indices into %ux%u, %s pixel shader: %llu vertices, %llu primitives, %llu after clipping, %llu pixel shader runs",
              static_cast<unsigned long long>(kMeasuredPresent), i, d.count, d.width, d.height,
              d.pixel_shader ? "a" : "no", q[i].IAVertices, q[i].IAPrimitives, q[i].CPrimitives, q[i].PSInvocations);
+        LOGR("D3D12:   depth target %s, depth control %08X, su mode %08X, colour mask %08X, vte %08X, scissor %ld,%ld to %ld,%ld",
+             d.depth_target ? "yes" : "no", d.depth_control, d.su_mode, d.color_mask, d.vte, d.scissor.left,
+             d.scissor.top, d.scissor.right, d.scissor.bottom);
     }
     D3D12_RANGE none{0, 0};
     measure_read_->Unmap(0, &none);

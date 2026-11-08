@@ -43,7 +43,7 @@ void StartVerticalBlank() {
 
 KERNEL_DATA(0x1BE, VdGlobalDevice, 4);
 KERNEL_DATA(0x1C0, VdGpuClockInMHz, 4);
-KERNEL_DATA(0x1C1, VdHSIOCalibrationLock, 0x10);
+KERNEL_DATA(0x1C1, VdHSIOCalibrationLock, kCriticalSectionSize);
 
 // (callback, data): the library's interrupt handler
 KERNEL_EXPORT(0x1D5, VdSetGraphicsInterruptCallback) {

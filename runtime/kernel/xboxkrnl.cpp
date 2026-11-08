@@ -85,6 +85,7 @@ void PutTitleModule(const xex::Image& img) {
 }  // namespace
 
 void InitKernelData(const xex::Image& img) {
+    constexpr uint32_t kVdHSIOCalibrationLock = 0x1C1;  // a critical section the kernel set up at boot
     W32(kdata_XboxHardwareInfo + kHardwareFlags, kHardwareHddPresent);
     W8(kdata_XboxHardwareInfo + kHardwareProcessors, kHardwareThreads);
     for (uint32_t i = 0; i < 4; i++) {
@@ -93,6 +94,7 @@ void InitKernelData(const xex::Image& img) {
     }
     PutString(kdata_ExLoadedImageName, "\\Device\\Cdrom0\\default.xex");
     PutString(kdata_ExLoadedCommandLine, "\"default.xex\"");
+    InitCriticalSection(ExportAddress(Library::Kernel, kVdHSIOCalibrationLock));
     PutTitleModule(img);
     std::thread(RunClock).detach();
 }

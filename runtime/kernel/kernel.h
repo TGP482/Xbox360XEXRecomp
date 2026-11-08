@@ -238,6 +238,8 @@ bool ReadGameFile(const std::string& console_path, std::vector<uint8_t>& out);  
 
 // kernel variables the host keeps current, set up by boot
 void InitKernelData(const xex::Image& img);
+constexpr uint32_t kCriticalSectionSize = 0x1C;
+void InitCriticalSection(uint32_t cs);  // as RtlInitializeCriticalSection
 uint32_t XexHeaderField(uint32_t key);  // as RtlImageXexHeaderField on the title's header, 0 when absent
 
 // boot: the image into guest memory, its imports bound, its first thread started

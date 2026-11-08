@@ -26,14 +26,17 @@ uint32_t Me() { return Current()->kthread; }
 
 // critical sections
 
-KERNEL_EXPORT(0x12E, RtlInitializeCriticalSection) {
-    uint32_t cs = a[0];
-    std::memset(HostPtr(cs), 0, 0x1C);
+void InitCriticalSection(uint32_t cs) {
+    std::memset(HostPtr(cs), 0, kCriticalSectionSize);
     W8(cs, kSynchronizationEvent);
     W8(cs + 2, kCsHeaderDwords);
     W32(cs + 8, cs + 8);  // empty WaitListHead
     W32(cs + 12, cs + 8);
     W32(cs + kCsLockCount, 0xFFFFFFFF);
+}
+
+KERNEL_EXPORT(0x12E, RtlInitializeCriticalSection) {
+    InitCriticalSection(a[0]);
     return 0;
 }
 

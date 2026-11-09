@@ -1218,8 +1218,7 @@ void D3D12Backend::UploadTexture(Texture& tex, const xenos::TextureFetch& t) {
             Alloc a = Upload(total, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
             g_perf.tex_bytes += total;
             uint32_t planes = volume ? fp.Footprint.Depth : 1;
-            // per level: a 4 KB window block's bytes sit one page below its physical address
-            const uint8_t* memory = Guest(levels[l].address) - levels[l].address;
+            const uint8_t* memory = Guest(0);
             for (uint32_t z = 0; z < planes; z++) {
                 uint32_t pitch = 0;
                 xenos::LoadLevel(memory, t, levels[l], volume ? z : face, rows, pitch);

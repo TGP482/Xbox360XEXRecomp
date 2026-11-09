@@ -27,7 +27,6 @@ static uint8_t* g_base = nullptr;
 static std::recursive_mutex g_lock;
 
 constexpr uint64_t kSpace = 1ull << 32;
-constexpr uint32_t kWindows[] = {kPhysical64k, kPhysical16m, kPhysical4k};
 constexpr uint32_t k16mbPage = 0x1000000;
 
 // NTSTATUS results
@@ -42,21 +41,41 @@ uint8_t* Base() { return g_base; }
 bool InPhysical(uint32_t va) { return va >= kPhysical64k; }
 
 #ifdef _WIN32
+// the 4 KB window shows physical memory one page up, its last page wrapping to page 0; a view at a page offset needs a
+// placeholder
+static bool MapWindow4k(uint8_t* b, HANDLE ram) {
+    HMODULE kernel = GetModuleHandleW(L"kernelbase.dll");
+    auto alloc2 = reinterpret_cast<decltype(&VirtualAlloc2)>(GetProcAddress(kernel, "VirtualAlloc2"));
+    auto map3 = reinterpret_cast<decltype(&MapViewOfFile3)>(GetProcAddress(kernel, "MapViewOfFile3"));
+    if (!alloc2 || !map3) return false;
+    HANDLE self = GetCurrentProcess();
+    uint8_t* w = b + kPhysical4k;
+    uint8_t* last = w + kPhysicalSize - kPage;
+    if (!alloc2(self, w, kPhysicalSize, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0)) return false;
+    bool ok = VirtualFree(w, kPhysicalSize - kPage, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+    ok = ok && map3(ram, self, w, kPage, kPhysicalSize - kPage, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0);
+    return ok && map3(ram, self, last, 0, kPage, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0);
+}
+
 static bool MapSpace(uint8_t* b, HANDLE ram) {
     bool ok = ram && VirtualAlloc(b, kPhysical64k, MEM_RESERVE, PAGE_NOACCESS) == b;
-    for (uint32_t w : kWindows)
+    for (uint32_t w : {kPhysical64k, kPhysical16m})
         ok = ok && MapViewOfFileEx(ram, FILE_MAP_ALL_ACCESS, 0, 0, kPhysicalSize, b + w) == b + w;
-    return ok;
+    return ok && MapWindow4k(b, ram);
 }
 
 static void UnmapSpace(uint8_t* b) {
     VirtualFree(b, 0, MEM_RELEASE);
-    for (uint32_t w : kWindows) UnmapViewOfFile(b + w);
+    for (uint32_t w : {kPhysical64k, kPhysical16m}) UnmapViewOfFile(b + w);
+    // a 4 KB window piece is a view or a placeholder left unmapped
+    for (uint8_t* p : {b + kPhysical4k, b + kPhysical4k + kPhysicalSize - kPage}) {
+        if (!UnmapViewOfFile(p)) VirtualFree(p, 0, MEM_RELEASE);
+    }
 }
 
-// physical memory is committed as it is handed out, through any one window
+// physical memory is committed as it is handed out, through the 64 KB window, which shows it at its own address
 static bool CommitPhysical(uint32_t pa, uint32_t size) {
-    return VirtualAlloc(g_base + kPhysical4k + pa, size, MEM_COMMIT, PAGE_READWRITE) != nullptr;
+    return VirtualAlloc(g_base + kPhysical64k + pa, size, MEM_COMMIT, PAGE_READWRITE) != nullptr;
 }
 
 static uint8_t* Reserve() {
@@ -83,9 +102,15 @@ static uint8_t* Reserve() {
     auto* b = static_cast<uint8_t*>(p);
     int fd = memfd_create("ram", 0);
     if (fd < 0 || ftruncate(fd, kPhysicalSize)) return nullptr;
-    for (uint32_t w : kWindows)
-        if (mmap(b + w, kPhysicalSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED)
-            return nullptr;
+    // address, size, physical offset: the 4 KB window one page up, its last page wrapping to page 0
+    const uint64_t views[][3] = {{kPhysical64k, kPhysicalSize, 0},
+                                 {kPhysical16m, kPhysicalSize, 0},
+                                 {kPhysical4k, kPhysicalSize - kPage, kPage},
+                                 {kPhysical4k + kPhysicalSize - kPage, kPage, 0}};
+    for (const auto& v : views) {
+        void* at = mmap(b + v[0], v[1], PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, off_t(v[2]));
+        if (at == MAP_FAILED) return nullptr;
+    }
     return b;
 }
 #endif
@@ -103,12 +128,6 @@ bool Init() {
 // commit maps, one byte per 4 KB page: the virtual space below the windows, and physical memory
 static std::vector<uint8_t> g_committed(kPhysical64k / kPage, 0);
 static std::vector<uint8_t> g_physical_committed(kPhysicalSize / kPage, 0);
-// physical pages handed out through the 4 KB window, which the console shows one page below physical
-static std::vector<uint8_t> g_window4k(kPhysicalSize / kPage, 0);
-
-static void MarkWindow4k(uint32_t pa, uint32_t size, uint8_t on) {
-    for (uint32_t p = pa; p < pa + size; p += kPage) g_window4k[(p & (kPhysicalSize - 1)) >> 12] = on;
-}
 
 bool Commit(uint32_t va, uint32_t size) {
     if (!size || InPhysical(va)) return true;
@@ -143,7 +162,7 @@ void Decommit(uint32_t va, uint32_t size) {
 }
 
 bool IsCommitted(uint32_t va) {
-    if (InPhysical(va)) return g_physical_committed[(va & (kPhysicalSize - 1)) >> 12] != 0;
+    if (InPhysical(va)) return g_physical_committed[PhysicalFromVirtual(va) >> 12] != 0;
     return g_committed[va >> 12] != 0;
 }
 
@@ -408,10 +427,11 @@ static uint32_t PhysicalPage(uint32_t protect) {
     return kPage;
 }
 
-static uint32_t WindowOf(uint32_t page) {
-    if (page == k16mbPage) return kPhysical16m;
-    if (page == kLargePage) return kPhysical64k;
-    return kPhysical4k;
+// physical pa in the window of a page size; the 4 KB window shows it one page lower
+static uint32_t WindowAddress(uint32_t page, uint32_t pa) {
+    if (page == k16mbPage) return kPhysical16m + pa;
+    if (page == kLargePage) return kPhysical64k + pa;
+    return kPhysical4k + pa - kPage;
 }
 
 uint32_t AllocPhysical(uint32_t size, uint32_t protect, uint32_t lowest, uint32_t highest, uint32_t align) {
@@ -421,29 +441,23 @@ uint32_t AllocPhysical(uint32_t size, uint32_t protect, uint32_t lowest, uint32_
     size = std::max((size + page - 1) & ~(page - 1), page);
     align = std::max(align, page);
     uint32_t hi = std::min(highest, kPhysicalSize - 1);
-    // a 4 KB window block is physical memory one page up, so it holds that page too
-    uint32_t shift = page == kPage ? kPage : 0;
     // highest fit first: low memory stays free for requests limited to it
-    uint32_t pa = g_physical.Alloc(size + shift, align, lowest, hi, true);
-    if (!pa || !CommitPhysical(pa, size + shift)) {
+    uint32_t pa = g_physical.Alloc(size, align, lowest, hi, true);
+    if (!pa || !CommitPhysical(pa, size)) {
         LOGE("memory: physical allocation of %X bytes failed (%X..%X align %X), %llu KB in use", size, lowest,
              highest, align, (unsigned long long)(g_physical.Used() >> 10));
         if (pa) g_physical.Free(pa);
         return 0;
     }
-    for (uint32_t p = pa; p < pa + size + shift; p += kPage) g_physical_committed[p >> 12] = 1;
-    if (shift) MarkWindow4k(pa + kPage, size, 1);
-    uint32_t va = WindowOf(page) + pa;
+    for (uint32_t p = pa; p < pa + size; p += kPage) g_physical_committed[p >> 12] = 1;
+    uint32_t va = WindowAddress(page, pa);
     std::memset(g_base + va, 0, size);
     return va;
 }
 
 void FreePhysical(uint32_t va) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
-    if (!InPhysical(va)) return;
-    uint32_t pa = va & (kPhysicalSize - 1);
-    uint32_t size;
-    if (g_physical.Free(pa, &size) && va >= kPhysical4k) MarkWindow4k(pa + kPage, size - kPage, 0);
+    if (InPhysical(va)) g_physical.Free(PhysicalFromVirtual(va));
 }
 
 uint32_t AllocSystem(uint32_t size, uint32_t align) {
@@ -485,11 +499,7 @@ void FreeStack(uint32_t top) {
 
 uint32_t AllocationSize(uint32_t va) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
-    if (va >= kPhysical4k) {
-        uint32_t s = g_physical.SizeOf(va & (kPhysicalSize - 1));
-        return s ? s - kPage : 0;
-    }
-    if (InPhysical(va)) return g_physical.SizeOf(va & (kPhysicalSize - 1));
+    if (InPhysical(va)) return g_physical.SizeOf(PhysicalFromVirtual(va));
     if (uint32_t s = g_system.SizeOf(va)) return s;
     uint32_t start;
     if (Reservation* r = FindReservation(va, &start)) return r->size - (va - start);
@@ -497,17 +507,12 @@ uint32_t AllocationSize(uint32_t va) {
 }
 
 uint32_t PhysicalFromVirtual(uint32_t va) {
-    if (va >= kPhysical4k) return (va & (kPhysicalSize - 1)) + kPage;
+    if (va >= kPhysical4k) return (va + kPage) & (kPhysicalSize - 1);
     if (InPhysical(va)) return va & (kPhysicalSize - 1);
     return va;
 }
 
-// the windows share one mapping, so a 4 KB window block's physical pages sit one page above their bytes
-uint32_t VirtualFromPhysical(uint32_t pa) {
-    pa &= kPhysicalSize - 1;
-    if (g_window4k[pa >> 12]) pa -= kPage;
-    return kPhysical4k | pa;
-}
+uint32_t VirtualFromPhysical(uint32_t pa) { return kPhysical64k | (pa & (kPhysicalSize - 1)); }
 
 Stats Query() {
     std::lock_guard<std::recursive_mutex> lock(g_lock);

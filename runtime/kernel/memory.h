@@ -69,7 +69,7 @@ uint32_t AllocStack(uint32_t size);  // returns the top, guard below the bottom
 void FreeStack(uint32_t top);
 
 uint32_t PhysicalFromVirtual(uint32_t va);
-uint32_t VirtualFromPhysical(uint32_t pa);  // in the 4 KB window
+uint32_t VirtualFromPhysical(uint32_t pa);  // in the 64 KB window, which shows physical memory at its own address
 
 struct Stats {
     uint32_t total_pages;

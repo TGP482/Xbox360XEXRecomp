@@ -15,7 +15,6 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
-#include <map>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -528,6 +527,13 @@ private:
     // the last constant blocks bound, skipped when unchanged; no address means upload again
     uint8_t const_last_[kRootCount][kConstBytes] = {};
     D3D12_GPU_VIRTUAL_ADDRESS const_gpu_[kRootCount] = {};
+
+    // per draw scratch, kept to save allocations
+    std::vector<uint32_t> index_src_;
+    std::vector<uint32_t> index_out_;
+    std::vector<VertexFetchConstant> stream_consts_;
+    std::vector<std::pair<std::pair<const uint8_t*, uint32_t>, uint32_t>> stream_copies_;
+    std::vector<D3D12_SAMPLER_DESC> sampler_descs_;
 
     ComPtr<ID3D12QueryHeap> query_heap_;
     ComPtr<ID3D12Resource> query_read_;
@@ -1384,7 +1390,8 @@ uint32_t D3D12Backend::BindTextures(const State& s, const ShaderInfo& info, Shad
                                     uint32_t slots, D3D12_GPU_DESCRIPTOR_HANDLE& samplers) {
     uint32_t table = AllocViews(first + slots);
     uint32_t used = std::min<uint32_t>(uint32_t(info.textures.size()), slots);
-    std::vector<D3D12_SAMPLER_DESC> descs;
+    std::vector<D3D12_SAMPLER_DESC>& descs = sampler_descs_;
+    descs.clear();
     for (uint32_t i = 0; i < used; i++) {
         const TextureBinding& b = info.textures[i];
         uint32_t fetch[6];
@@ -1525,26 +1532,25 @@ D3D12_RECT D3D12Backend::HostRect(const Rect& r, float scale) const {
 // indices into the upload ring as the host draws them: byte order fixed, fans, quads and loops made lists
 bool D3D12Backend::UploadIndices(const DrawArgs& a, D3D12_PRIMITIVE_TOPOLOGY& topo, uint32_t& count, uint32_t& min,
                                  uint32_t& max) {
-    std::vector<uint32_t> src(a.count);
-    if (a.indices) {
-        const uint8_t* p = a.indices;
+    std::vector<uint32_t>& src = index_src_;
+    src.resize(a.count);
+    if (a.indices && a.index32) {
+        std::memcpy(src.data(), a.indices, size_t(a.count) * 4);
+        xenos::SwapEndian(reinterpret_cast<uint8_t*>(src.data()), size_t(a.count) * 4, xenos::Endian(a.index_endian));
+    } else if (a.indices) {
+        // of the swaps only 8 in 16 stays within a 16 bit index
+        bool swap = xenos::Endian(a.index_endian) == xenos::Endian::Swap8In16;
         for (uint32_t i = 0; i < a.count; i++) {
-            if (a.index32) {
-                uint32_t v;
-                std::memcpy(&v, p + i * 4, 4);
-                xenos::SwapEndian(reinterpret_cast<uint8_t*>(&v), 4, xenos::Endian(a.index_endian));
-                src[i] = v;
-            } else {
-                uint16_t v;
-                std::memcpy(&v, p + i * 2, 2);
-                xenos::SwapEndian(reinterpret_cast<uint8_t*>(&v), 2, xenos::Endian(a.index_endian));
-                src[i] = v == 0xFFFF ? 0xFFFFFFFF : v;  // strip cut as the host's 32 bit cut value
-            }
+            uint16_t v;
+            std::memcpy(&v, a.indices + i * 2, 2);
+            if (swap) v = __builtin_bswap16(v);
+            src[i] = v == 0xFFFF ? 0xFFFFFFFF : v;  // strip cut as the host's 32 bit cut value
         }
     } else {
         for (uint32_t i = 0; i < a.count; i++) src[i] = a.start + i;
     }
-    std::vector<uint32_t> out;
+    std::vector<uint32_t>& out = index_out_;
+    out.clear();
     switch (a.prim) {
         case kPrimPointList: topo = D3D_PRIMITIVE_TOPOLOGY_POINTLIST; break;
         case kPrimLineList: topo = D3D_PRIMITIVE_TOPOLOGY_LINELIST; break;
@@ -1570,20 +1576,20 @@ bool D3D12Backend::UploadIndices(const DrawArgs& a, D3D12_PRIMITIVE_TOPOLOGY& to
             if (!std::exchange(logged, true)) LOGR("D3D12: primitive type %u left out", a.prim);
             return false;
     }
-    if (out.empty()) out = std::move(src);
-    count = uint32_t(out.size());
+    const std::vector<uint32_t>& list = out.empty() ? src : out;
+    count = uint32_t(list.size());
     if (!count) return false;
     min = UINT32_MAX;
     max = 0;
-    for (uint32_t v : out) {
+    for (uint32_t v : list) {
         if (v == 0xFFFF || v == 0xFFFFFFFF) continue;  // strip cuts
         min = std::min(min, v);
         max = std::max(max, v);
     }
     if (min > max) return false;
-    Alloc ib = Upload(out.size() * 4, 4);
-    std::memcpy(ib.cpu, out.data(), out.size() * 4);
-    D3D12_INDEX_BUFFER_VIEW v{ib.gpu, UINT(out.size() * 4), DXGI_FORMAT_R32_UINT};
+    Alloc ib = Upload(list.size() * 4, 4);
+    std::memcpy(ib.cpu, list.data(), list.size() * 4);
+    D3D12_INDEX_BUFFER_VIEW v{ib.gpu, UINT(list.size() * 4), DXGI_FORMAT_R32_UINT};
     cl_->IASetIndexBuffer(&v);
     return true;
 }
@@ -1591,8 +1597,10 @@ bool D3D12Backend::UploadIndices(const DrawArgs& a, D3D12_PRIMITIVE_TOPOLOGY& to
 // the vertices the draw reads, copied raw into the upload ring; the vertex shader decodes them
 D3D12_GPU_VIRTUAL_ADDRESS D3D12Backend::UploadStreams(const DrawArgs& a, const ShaderInfo& vs, uint32_t min,
                                                       uint32_t max) {
-    std::vector<VertexFetchConstant> fetch(std::max<size_t>(vs.fetches.size(), 1));
-    std::map<std::pair<const uint8_t*, uint32_t>, uint32_t> copied;  // stream and stride to ring offset of vertex 0
+    std::vector<VertexFetchConstant>& fetch = stream_consts_;
+    fetch.assign(std::max<size_t>(vs.fetches.size(), 1), {});
+    auto& copied = stream_copies_;  // stream and stride to ring offset of vertex 0
+    copied.clear();
     Frame& f = CurrentFrame();
     for (size_t k = 0; k < vs.fetches.size(); k++) {
         const StreamFetch& sf = a.streams[k];
@@ -1600,7 +1608,7 @@ D3D12_GPU_VIRTUAL_ADDRESS D3D12Backend::UploadStreams(const DrawArgs& a, const S
         c.format |= sf.endian << 8;
         uint32_t stride = std::max(c.stride, 4u);
         auto key = std::make_pair(sf.data, stride);
-        auto it = copied.find(key);
+        auto it = std::find_if(copied.begin(), copied.end(), [&](const auto& c) { return c.first == key; });
         if (it == copied.end()) {
             int64_t low = std::max<int64_t>(int64_t(min) + a.base_vertex, 0);
             int64_t high = std::max<int64_t>(int64_t(max) + a.base_vertex + 1, 0);
@@ -1613,7 +1621,8 @@ D3D12_GPU_VIRTUAL_ADDRESS D3D12Backend::UploadStreams(const DrawArgs& a, const S
                 if (!std::exchange(logged, true)) LOGR("D3D12: vertex data past the upload ring reads as zero");
             }
             if (bytes) std::memcpy(v.cpu, sf.data + (first - sf.first), size_t(bytes));
-            it = copied.emplace(key, uint32_t(v.offset - first)).first;
+            copied.emplace_back(key, uint32_t(v.offset - first));
+            it = copied.end() - 1;
         }
         c.address += it->second;
         fetch[k] = c;

@@ -362,12 +362,12 @@ bool TableStream(uint32_t dev, uint32_t stream, gpu::StreamFetch& sf) {
 
 // where each fetch of the vertex shader reads: the declaration's element for its semantic, from that element's
 // stream; up_data and up_stride stand in for stream 0 in DrawVerticesUP and DrawIndexedVerticesUP
-std::vector<gpu::StreamFetch> Streams(uint32_t dev, const ShaderEntry& vs, uint32_t up_data, uint32_t up_bytes,
-                                      uint32_t up_stride) {
+void Streams(uint32_t dev, const ShaderEntry& vs, uint32_t up_data, uint32_t up_bytes, uint32_t up_stride,
+             std::vector<gpu::StreamFetch>& out) {
     auto bytes = [](uint32_t address) { return static_cast<const uint8_t*>(HostPtr(address)); };
     const gpu::ShaderInfo& info = g_backend->Info(vs.shader);
     uint32_t decl = R32(dev + kDevDecl);
-    std::vector<gpu::StreamFetch> out(info.fetches.size());
+    out.assign(info.fetches.size(), {});
     for (size_t k = 0; k < info.fetches.size(); k++) {
         gpu::StreamFetch& sf = out[k];
         sf.fetch.swizzle = 0x688;  // x y z w: no element reads 0, 0, 0, 1
@@ -386,7 +386,6 @@ std::vector<gpu::StreamFetch> Streams(uint32_t dev, const ShaderEntry& vs, uint3
         if (!found) continue;
         sf.fetch = FetchFromElement(de, R8(dev + kDevStrides + de.stream) * 4);
     }
-    return out;
 }
 
 // the state of a draw from the device; false when its shaders are not known
@@ -411,7 +410,8 @@ void Draw(uint32_t dev, gpu::DrawArgs& a, uint32_t up_data = 0, uint32_t up_byte
     gpu::State s;
     const ShaderEntry* vs = nullptr;
     if (!ReadState(dev, s, vs)) return;
-    std::vector<gpu::StreamFetch> streams = Streams(dev, *vs, up_data, up_bytes, up_stride);
+    static std::vector<gpu::StreamFetch> streams;  // kept from draw to draw, under g_lock
+    Streams(dev, *vs, up_data, up_bytes, up_stride, streams);
     a.streams = streams.data();
     backend->Draw(s, a);
 }

@@ -5,7 +5,6 @@
 #include <condition_variable>
 #include <cstring>
 #include <deque>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -130,20 +129,29 @@ void CopyDraw(const DrawArgs& a, size_t stream_count, Command& c) {
     bool any = VertexRange(a, low, high);
     size_t index_bytes = a.indices ? size_t(a.count) * (a.index32 ? 4 : 2) : 0;
 
+    // a draw has a few streams: a linear search, in memory kept from draw to draw
     struct Span {
+        const uint8_t* data;
+        uint32_t stride;
         uint32_t first, end;
         size_t at;
     };
-    std::map<std::pair<const uint8_t*, uint32_t>, Span> spans;
+    static thread_local std::vector<Span> spans;
+    spans.clear();
+    auto find = [&](const StreamFetch& sf) {
+        uint32_t stride = std::max(sf.fetch.stride, 4u);
+        auto same = [&](const Span& p) { return p.data == sf.data && p.stride == stride; };
+        return std::find_if(spans.begin(), spans.end(), same);
+    };
     size_t total = index_bytes;
     for (const StreamFetch& sf : c.streams) {
         uint32_t stride = std::max(sf.fetch.stride, 4u);
-        auto [it, added] = spans.try_emplace({sf.data, stride});
-        if (!added) continue;
+        if (find(sf) != spans.end()) continue;
+        Span& span = spans.emplace_back();
         uint64_t first = std::max<uint64_t>(uint64_t(std::max<int64_t>(low, 0)) * stride, sf.first);
         uint64_t end = std::min<uint64_t>(uint64_t(std::max<int64_t>(high, 0)) * stride, sf.size);
         if (!sf.data || !any || end <= first) first = end = sf.first;
-        it->second = {uint32_t(first), uint32_t(end), total};
+        span = {sf.data, stride, uint32_t(first), uint32_t(end), total};
         total += end - first;
     }
 
@@ -153,7 +161,7 @@ void CopyDraw(const DrawArgs& a, size_t stream_count, Command& c) {
         c.draw.indices = c.data.data();
     }
     for (StreamFetch& sf : c.streams) {
-        const Span& span = spans[{sf.data, std::max(sf.fetch.stride, 4u)}];
+        const Span& span = *find(sf);
         uint8_t* to = c.data.data() + span.at;
         if (span.end > span.first) std::memcpy(to, sf.data + (span.first - sf.first), span.end - span.first);
         sf.data = to;

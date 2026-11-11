@@ -47,7 +47,7 @@ struct Change {
 // draws and clears wake the render thread once this many wait; every other command wakes it at once
 constexpr size_t kWakeBatch = 32;
 
-enum class Op { Draw, Clear, Resolve, Copy, Present, BeginQuery, EndQuery };
+enum class Op { Draw, Clear, Resolve, Copy, Present, BeginQuery, EndQuery, Poll };
 
 struct Command {
     Op op = Op::Draw;
@@ -68,6 +68,7 @@ struct Command {
     bool has_rect = false;
     uint32_t front[6] = {};
     uint32_t query = 0;
+    uint64_t ended = 0;  // Poll: the EndQuery it asks about
 };
 
 // State's fields after regs
@@ -224,7 +225,10 @@ void CopyDraw(const DrawArgs& a, size_t stream_count, Command& c) {
 
 class ThreadedBackend final : public Backend {
 public:
-    explicit ThreadedBackend(std::unique_ptr<Backend> inner) : inner_(std::move(inner)) {}
+    explicit ThreadedBackend(std::unique_ptr<Backend> inner) : inner_(std::move(inner)) {
+        std::fill(std::begin(answered_), std::end(answered_), kNotEnded);
+        std::fill(std::begin(polled_), std::end(polled_), kNotEnded);
+    }
     ~ThreadedBackend() override {
         {
             std::lock_guard lock(queue_lock_);
@@ -298,14 +302,26 @@ public:
         std::lock_guard lock(queue_lock_);
         ended_[query % kQuerySlots] = seq;
     }
-    // pending until the render thread has ended the query, then the renderer's answer between two commands
+    // pending until the render thread answered a poll of the ended query, which the title queues and never waits on
     bool QueryResult(uint32_t query, uint32_t& samples) override {
+        uint32_t slot = query % kQuerySlots;
+        uint64_t ended;
         {
             std::lock_guard lock(queue_lock_);
-            if (ended_[query % kQuerySlots] > ran_) return false;
+            ended = ended_[slot];
+            if (ended > ran_) return false;
+            if (answered_[slot] == ended) {
+                samples = answers_[slot];
+                return true;
+            }
+            if (polled_[slot] == ended) return false;
+            polled_[slot] = ended;
         }
-        std::lock_guard run(run_lock_);
-        return inner_->QueryResult(query, samples);
+        std::unique_ptr<Command> c = New(Op::Poll);
+        c->query = query;
+        c->ended = ended;
+        Push(std::move(c));
+        return false;
     }
 
 private:
@@ -352,7 +368,21 @@ private:
             case Op::Present: inner_->Present(c.front); break;
             case Op::BeginQuery: inner_->BeginQuery(c.query); break;
             case Op::EndQuery: inner_->EndQuery(c.query); break;
+            case Op::Poll: Answer(c); break;
         }
+    }
+
+    // the renderer's result of a poll, kept for the title unless the query began again since
+    void Answer(const Command& c) {
+        uint32_t samples = 0;
+        bool done = inner_->QueryResult(c.query, samples);
+        uint32_t slot = c.query % kQuerySlots;
+        std::lock_guard lock(queue_lock_);
+        if (ended_[slot] != c.ended) return;
+        polled_[slot] = kNotEnded;
+        if (!done) return;
+        answered_[slot] = c.ended;
+        answers_[slot] = samples;
     }
 
     void Run() {
@@ -365,10 +395,7 @@ private:
                 c = std::move(queue_.front());
                 queue_.pop_front();
             }
-            {
-                std::lock_guard run(run_lock_);
-                Execute(*c);
-            }
+            Execute(*c);
             bool present = c->op == Op::Present;
             {
                 std::lock_guard lock(queue_lock_);
@@ -385,13 +412,15 @@ private:
     Banks ran_banks_;       // as the render thread last ran them, for state_
     State state_;           // the command running
     std::thread thread_;
-    std::mutex run_lock_;    // held while a command runs
     std::mutex queue_lock_;  // the rest below
     std::condition_variable ready_;
     std::condition_variable presented_;
     std::deque<std::unique_ptr<Command>> queue_;
     std::vector<std::unique_ptr<Command>> free_;
     uint64_t ended_[kQuerySlots] = {};  // the command that ends each query
+    uint64_t answered_[kQuerySlots];    // the EndQuery each answer is for
+    uint32_t answers_[kQuerySlots] = {};
+    uint64_t polled_[kQuerySlots];  // the EndQuery a queued poll asks about
     uint64_t recorded_ = 0;
     uint64_t ran_ = 0;
     uint64_t queued_presents_ = 0;

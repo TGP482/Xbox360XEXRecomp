@@ -34,6 +34,7 @@ struct Target {
     D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
     bool depth = false;
     Surface surface;
+    uint32_t samples = 1;  // host samples: the title's, or the MSAA setting's on a multisampled target
     uint32_t width = 0;  // title pixels, wider than the pitch when tiles are drawn as one
     uint32_t height = 0;
     uint32_t w = 0;  // host pixels

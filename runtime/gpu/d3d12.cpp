@@ -582,6 +582,8 @@ private:
     ID3D12PipelineState* FindPipeline(const PipelineKey& k, const Variant& vs, const Variant* ps);
     void FillPipelineDesc(const PipelineKey& k, D3D12_GRAPHICS_PIPELINE_STATE_DESC& d) const;
     ID3D12PipelineState* EnsureResolvePipeline(DXGI_FORMAT rtv, bool ms);
+    uint32_t Samples(uint32_t want);
+    uint32_t HostSamples(uint32_t title) const { return title > 1 && msaa_ ? msaa_ : title; }
 
     // textures
     Resolved* FindResolved(const xenos::TextureFetch& t, const TextureBinding& b, ShaderStage stage, uint32_t slot);
@@ -677,6 +679,8 @@ private:
     uint32_t swap_w_ = 0, swap_h_ = 0;
     uint32_t guest_w_ = 0, guest_h_ = 0;
     float scale_ = 1;
+    uint32_t msaa_ = 0;      // host samples of the title's multisampled targets, 0 the title's
+    uint32_t msaa_set_ = 0;  // app::Settings::msaa they came from
     Extension* ext_ = nullptr;
 
     std::unordered_map<uint64_t, Target> targets_;
@@ -773,6 +777,8 @@ bool D3D12Backend::Init(uint32_t width, uint32_t height) {
     ImGui_ImplDX12_Init(dev_.Get(), kFrames, kSwapFormat, ui_heap_.Get(),
                         ui_heap_->GetCPUDescriptorHandleForHeapStart(), ui_heap_->GetGPUDescriptorHandleForHeapStart());
     scale_ = app::RenderScale(guest_h_);
+    msaa_set_ = app::Get().msaa;
+    msaa_ = Samples(msaa_set_);
     ext_ = g_extension.get();
     if (ext_) {
         ext_->Settings();
@@ -1118,6 +1124,7 @@ Target* D3D12Backend::EnsureTarget(const Surface& sf, bool depth, uint32_t width
     t = {};
     t.depth = depth;
     t.surface = sf;
+    t.samples = HostSamples(sf.samples);
     t.key = key;
     t.width = width;
     t.height = std::max(height, old.height);
@@ -1128,7 +1135,7 @@ Target* D3D12Backend::EnsureTarget(const Surface& sf, bool depth, uint32_t width
     t.h = uint32_t(std::ceil(t.height * t.scale));
     DXGI_FORMAT resource = t.fmt == ColorFormat(sf.format) ? ColorResourceFormat(sf.format) : t.fmt;
     D3D12_RESOURCE_DESC d = TextureDesc(depth ? DXGI_FORMAT_R32G8X24_TYPELESS : resource, t.w, t.h);
-    d.SampleDesc.Count = sf.samples;
+    d.SampleDesc.Count = t.samples;
     d.Flags = depth ? D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL : D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     D3D12_CLEAR_VALUE cv{};
     cv.Format = t.fmt;
@@ -1153,19 +1160,19 @@ Target* D3D12Backend::EnsureTarget(const Surface& sf, bool depth, uint32_t width
     if (depth) {
         D3D12_DEPTH_STENCIL_VIEW_DESC dv{};
         dv.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
-        dv.ViewDimension = sf.samples > 1 ? D3D12_DSV_DIMENSION_TEXTURE2DMS : D3D12_DSV_DIMENSION_TEXTURE2D;
+        dv.ViewDimension = t.samples > 1 ? D3D12_DSV_DIMENSION_TEXTURE2DMS : D3D12_DSV_DIMENSION_TEXTURE2D;
         dev_->CreateDepthStencilView(t.res.Get(), &dv, Dsv(t.view));
         cl_->ClearDepthStencilView(Dsv(t.view), D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0, 0, 0, nullptr);
     } else {
         D3D12_RENDER_TARGET_VIEW_DESC rv{};
         rv.Format = t.fmt;
-        rv.ViewDimension = sf.samples > 1 ? D3D12_RTV_DIMENSION_TEXTURE2DMS : D3D12_RTV_DIMENSION_TEXTURE2D;
+        rv.ViewDimension = t.samples > 1 ? D3D12_RTV_DIMENSION_TEXTURE2DMS : D3D12_RTV_DIMENSION_TEXTURE2D;
         dev_->CreateRenderTargetView(t.res.Get(), &rv, Rtv(t.view));
         float black[4] = {};
         cl_->ClearRenderTargetView(Rtv(t.view), black, 0, nullptr);
     }
     // a grown target keeps what was drawn
-    if (old.res && sf.samples == 1 && old.fmt == t.fmt && old.scale == t.scale) {
+    if (old.res && t.samples == 1 && old.fmt == t.fmt && old.scale == t.scale) {
         Transition(old.res.Get(), old.state, D3D12_RESOURCE_STATE_COPY_SOURCE);
         Transition(t.res.Get(), t.state, D3D12_RESOURCE_STATE_COPY_DEST);
         D3D12_TEXTURE_COPY_LOCATION dst{t.res.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
@@ -1173,6 +1180,25 @@ Target* D3D12Backend::EnsureTarget(const Surface& sf, bool depth, uint32_t width
         cl_->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     }
     return &t;
+}
+
+// want samples, fewer until the GPU has them for every target format; 0 stays 0, the title's
+uint32_t D3D12Backend::Samples(uint32_t want) {
+    static constexpr DXGI_FORMAT kFormats[] = {
+        DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R10G10B10A2_UNORM,
+        DXGI_FORMAT_R16G16_FLOAT,   DXGI_FORMAT_R16G16B16A16_FLOAT,  DXGI_FORMAT_R32_FLOAT,
+        DXGI_FORMAT_R32G32_FLOAT,   DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+    };
+    if (!want) return 0;
+    uint32_t n = std::clamp(want, 1u, 8u);
+    auto has = [&](DXGI_FORMAT f) {
+        D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS q{f, n};
+        HRESULT hr = dev_->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &q, sizeof(q));
+        return SUCCEEDED(hr) && q.NumQualityLevels;
+    };
+    while (n > 1 && !std::all_of(std::begin(kFormats), std::end(kFormats), has)) n /= 2;
+    LOGR("D3D12: MSAA %ux (asked %u)", n, want);
+    return n;
 }
 
 // every target dropped, their views back in the pools
@@ -1834,7 +1860,7 @@ bool D3D12Backend::BindTargets(const State& s, const ShaderInfo& ps, PipelineKey
     D3D12_CPU_DESCRIPTOR_HANDLE rtv[4];
     uint32_t count = 0;
     b = {TargetWidth(s), height, scale_};
-    k.samples = SurfaceSamples(s);
+    k.samples = HostSamples(SurfaceSamples(s));
     for (uint32_t i = 0; i < 4; i++) {
         if (!(ps.exports >> i & 1) || !Bits(s.Reg(kRbColorMask), 4 * i, 4)) continue;
         Target* t = ColorTarget(s, i, height);
@@ -2474,7 +2500,7 @@ void D3D12Backend::CopyResolved(Resolved& from, Resolved& to, const Rect& src, c
 }
 
 void D3D12Backend::CopyResolve(Target& src, Resolved& dst, const ResolveArgs& r) {
-    bool ms = src.surface.samples > 1;
+    bool ms = src.samples > 1;
     ID3D12PipelineState* pso = EnsureResolvePipeline(dst.format, ms);
     if (!pso) return;
     uint32_t views = AllocViews(kPsTextures);
@@ -2491,7 +2517,7 @@ void D3D12Backend::CopyResolve(Target& src, Resolved& dst, const ResolveArgs& r)
     // source in its own host pixels, destination at the render scale
     float ss = src.scale;
     float cb[8] = {r.rect.x1 * ss, r.rect.y1 * ss, (r.rect.x2 - r.rect.x1) * ss, (r.rect.y2 - r.rect.y1) * ss,
-                   float(src.surface.samples), src.depth ? 1.0f : 0.0f, 0, 0};
+                   float(src.samples), src.depth ? 1.0f : 0.0f, 0, 0};
     D3D12_GPU_VIRTUAL_ADDRESS addr = UploadConstants(cb, sizeof(cb));
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = Rtv(dst.view);
     cl_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
@@ -2629,6 +2655,13 @@ void D3D12Backend::Present(const uint32_t front[6]) {
         fps_start_ = now;
     }
     if (diag::Perf()) LogPerf();
+    if (app::Get().msaa != msaa_set_) {
+        Submit(true);
+        DropTargets();
+        msaa_set_ = app::Get().msaa;
+        msaa_ = Samples(msaa_set_);
+        if (ext_) ext_->Reset(*this);
+    }
     if (ext_ && ext_->Settings()) {
         Submit(true);
         DropTargets();
@@ -2647,7 +2680,7 @@ void D3D12Backend::Unbind() {
 // a copy of the target to read while drawing to it; a multisampled one is resolved into it
 ID3D12Resource* D3D12Backend::Feedback(Target& t) {
     if (t.depth) return nullptr;
-    bool ms = t.surface.samples > 1;
+    bool ms = t.samples > 1;
     if (!t.fb) {
         D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
         D3D12_RESOURCE_DESC d = t.res->GetDesc();
@@ -2809,7 +2842,7 @@ void D3D12Backend::CapStep(Target* rt) {
 
 void D3D12Backend::CapSave(Target& t, const std::string& name, float mul) {
     DXGI_FORMAT view = t.depth ? DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS : ReadFormat(t);
-    CapSave(t.res.Get(), t.state, view, t.surface.samples, t.depth, t.w, t.h, t.depth ? 1 : mul, name);
+    CapSave(t.res.Get(), t.state, view, t.samples, t.depth, t.w, t.h, t.depth ? 1 : mul, name);
 }
 
 void D3D12Backend::Capture(Target& t, const char* tag, float mul) {

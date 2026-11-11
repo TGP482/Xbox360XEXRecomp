@@ -472,9 +472,9 @@ struct Rendered {
     std::vector<float> samples;
 };
 
-// a frame of the whole graph, downmixed to stereo as the console does; effect code runs without g_lock, as it may
-// wait on title locks whose holders call the engine
-void MixFrame(PPCContext& ctx, float* stereo) {
+// a frame of the whole graph into the 5.1 master; effect code runs without g_lock, as it may wait on title locks whose
+// holders call the engine
+void MixFrame(PPCContext& ctx, float* out) {
     std::vector<Rendered> sources;
     {
         std::lock_guard lock(g_lock);
@@ -504,12 +504,7 @@ void MixFrame(PPCContext& ctx, float* stereo) {
         for (float& x : buf) x *= v->volume;
         Route(*v, buf.data(), master);
     }
-    constexpr float kSide = 0.7071f;
-    for (uint32_t s = 0; s < kFrame; s++) {
-        const float* m = &master[s * kMasterChannels];
-        stereo[s * 2] = m[0] + kSide * (m[2] + m[4]);
-        stereo[s * 2 + 1] = m[1] + kSide * (m[2] + m[5]);
-    }
+    std::copy(master.begin(), master.end(), out);
 }
 
 void RunCallbacks(PPCContext& ctx) {
@@ -526,7 +521,8 @@ void RunCallbacks(PPCContext& ctx) {
 void StartMixer() {
     StartHostThread("xaudio", [](PPCContext& ctx) {
         bool host = audio::OpenOutput();
-        std::vector<float> frame(size_t(kFrame) * 2);
+        static_assert(kMasterChannels == audio::kChannels);
+        std::vector<float> frame(size_t(kFrame) * kMasterChannels);
         uint32_t target = kQueueMin;
         auto deadline = std::chrono::steady_clock::now();
         for (;;) {
@@ -543,7 +539,7 @@ void StartMixer() {
             }
             RunCallbacks(ctx);
             MixFrame(ctx, frame.data());
-            audio::SubmitStereo(frame.data(), kFrame);
+            audio::Submit(frame.data(), kFrame);
         }
     });
 }

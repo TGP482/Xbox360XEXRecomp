@@ -6,11 +6,23 @@
 namespace audio {
 
 constexpr uint32_t kOutputRate = 48000;
+// the console's master: front left, front right, centre, sub, back left, back right
+constexpr uint32_t kChannels = 6;
 
-// stereo float frames; false and silent when no device opens
+// false and silent when no device opens
 bool OpenOutput();
 uint32_t QueuedBuffers();
+// interleaved float frames of kChannels, played as the audio output setting says
+void Submit(const float* samples, uint32_t frames);
+// stereo float frames on the front pair, for game copies of the XAudio HLE that fold to stereo themselves
 void SubmitStereo(const float* samples, uint32_t frames);
+
+// the audio output setting, any thread; a change applies at the next submit
+constexpr uint32_t kOutputAuto = 0;  // 5.1 when the default device has 5.1 speakers, else stereo
+constexpr uint32_t kOutputStereo = 1;
+constexpr uint32_t kOutputSurround = 2;
+constexpr uint32_t kOutputMono = 3;
+void SetOutputMode(uint32_t mode);
 
 // I3DL2 reverb parameters as the XDK's reverb takes them
 struct I3dl2 {

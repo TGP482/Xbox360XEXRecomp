@@ -585,6 +585,7 @@ private:
     D3D12_GPU_VIRTUAL_ADDRESS UploadStreams(const DrawArgs& a, const ShaderInfo& vs, uint32_t min, uint32_t max);
     void BindConstants(const State& s, D3D12_GPU_VIRTUAL_ADDRESS fetch, DrawConstants& c, const Target* rt,
                        uint32_t src_blend);
+    void BindFloats(uint32_t root, const uint8_t* be, const uint64_t (&read)[2]);
     void FillKeyStates(const State& s, PipelineKey& k) const;
 
     // present
@@ -662,6 +663,7 @@ private:
     // the last constant blocks bound, skipped when unchanged; no address means upload again
     uint8_t const_last_[kRootCount][kConstBytes] = {};
     D3D12_GPU_VIRTUAL_ADDRESS const_gpu_[kRootCount] = {};
+    uint64_t const_held_[kRootCount][2] = {};  // the float constant blocks const_gpu_ holds, as ShaderInfo::constants
 
     // what the last draw set on the command list, set again only where a draw differs; Unbind forgets it
     struct Binds {
@@ -2005,6 +2007,7 @@ void D3D12Backend::BindConstants(const State& s, D3D12_GPU_VIRTUAL_ADDRESS fetch
             }
             std::memcpy(const_last_[root], be, bytes);
             const_gpu_[root] = a.gpu;
+            const_held_[root][0] = const_held_[root][1] = ~0ull;
         }
         if (Latch(binds_.roots[root], const_gpu_[root])) cl_->SetGraphicsRootConstantBufferView(root, const_gpu_[root]);
     };
@@ -2024,16 +2027,49 @@ void D3D12Backend::BindConstants(const State& s, D3D12_GPU_VIRTUAL_ADDRESS fetch
             std::memcpy(be + i, &v, 4);
         }
         bind(kRootVsConsts, be, kConstBytes);
+        bind(kRootPsConsts, s.consts + kConstBytes, kConstBytes);
     } else {
-        bind(kRootVsConsts, s.consts, kConstBytes);
+        static const uint64_t kNone[2] = {};
+        BindFloats(kRootVsConsts, s.consts, s.vs->info.constants);
+        BindFloats(kRootPsConsts, s.consts + kConstBytes, s.ps ? s.ps->info.constants : kNone);
     }
-    bind(kRootPsConsts, s.consts + kConstBytes, kConstBytes);
     uint8_t flow[sizeof(FlowConstants)];
     std::memcpy(flow, s.bools, 32);
     std::memcpy(flow + 32, s.loops, 128);
     bind(kRootFlow, flow, sizeof(flow));
     cl_->SetGraphicsRootConstantBufferView(kRootDraw, UploadConstants(&c, sizeof(c)));
     cl_->SetGraphicsRootConstantBufferView(kRootFetch, fetch);
+}
+
+// a stage's float constants: only the blocks its shader reads are compared and swapped into the ring; an upload is
+// kept while it holds every block a draw reads
+void D3D12Backend::BindFloats(uint32_t root, const uint8_t* be, const uint64_t (&read)[2]) {
+    constexpr uint32_t kBlock = 32;  // two constants, a bit of read
+    uint64_t(&held)[2] = const_held_[root];
+    bool same = const_gpu_[root] && !(read[0] & ~held[0]) && !(read[1] & ~held[1]);
+    for (uint32_t w = 0; w < 2 && same; w++) {
+        for (uint64_t m = read[w]; m && same; m &= m - 1) {
+            uint32_t at = (w * 64 + uint32_t(std::countr_zero(m))) * kBlock;
+            same = std::memcmp(const_last_[root] + at, be + at, kBlock) == 0;
+        }
+    }
+    if (!same) {
+        Alloc a = Upload(kConstBytes, kCbAlign);
+        for (uint32_t w = 0; w < 2; w++) {
+            for (uint64_t m = read[w]; m; m &= m - 1) {
+                uint32_t at = (w * 64 + uint32_t(std::countr_zero(m))) * kBlock;
+                for (uint32_t i = 0; i < kBlock; i += 4) {
+                    uint32_t v = Be32(be + at + i);
+                    std::memcpy(a.cpu + at + i, &v, 4);
+                }
+                std::memcpy(const_last_[root] + at, be + at, kBlock);
+            }
+        }
+        held[0] = read[0];
+        held[1] = read[1];
+        const_gpu_[root] = a.gpu;
+    }
+    if (Latch(binds_.roots[root], const_gpu_[root])) cl_->SetGraphicsRootConstantBufferView(root, const_gpu_[root]);
 }
 
 // the texture tables of both stages and the vertex bytes; first, as running out of descriptors submits the list

@@ -135,14 +135,17 @@ constexpr bool AllKnown(const LayoutKey (&keys)[N]) {
 #ifndef XDK_Device_TileCount
 #define XDK_Device_TileCount 0xFFFFFFFFu
 #endif
-#ifndef XDK_Device_Predication
-#define XDK_Device_Predication 0xFFFFFFFFu
-#endif
 #ifndef XDK_Device_TileRects
 #define XDK_Device_TileRects 0xFFFFFFFFu
 #endif
 #ifndef XDK_Device_TileRectsAligned
 #define XDK_Device_TileRectsAligned 0xFFFFFFFFu
+#endif
+#ifndef XDK_Device_TileRectsAlignedStride
+#define XDK_Device_TileRectsAlignedStride 0xFFFFFFFFu
+#endif
+#ifndef XDK_Device_Vblank
+#define XDK_Device_Vblank 0xFFFFFFFFu
 #endif
 #ifndef XDK_Device_TilingTargets
 #define XDK_Device_TilingTargets 0xFFFFFFFFu

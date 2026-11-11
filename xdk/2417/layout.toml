@@ -41,16 +41,18 @@ Device_RingWrite = 0x0
 Device_RingSegmentEnd = 0x4
 Device_RingLimit = 0x8
 Device_RingSegmentStart = 0x36CC
+# vertical blank (interrupt handler 827373F8): callback, count, count at the swap wait's end, swap wait, swaps
+Device_Vblank = 0x3CFC
 # predicated tiling (BeginTiling 8273D320, EndTiling 8273D758, SetPredication 8273D1E8) as the library's other code
-# reads it: flags byte and its tiling bit, tile count, tile rects (16 bytes each) and the same rects aligned to 32,
-# predication select (tile i is 3 << 2i); SetViewport 8273BCA8 sizes to the extent (x then y) while the targets
-# equal those saved at BeginTiling (the first target, then colour 0 to 3 and depth)
+# reads it: flags byte and its tiling bit, tile count, tile rects (16 bytes each) and the same rects aligned to 32;
+# SetViewport 8273BCA8 sizes to the extent (x then y) while the targets equal those saved at BeginTiling (the first
+# target, then colour 0 to 3 and depth)
 Device_TilingFlags = 0x28C0
 Device_TilingOn = 0x10
 Device_TileCount = 0x32C4
 Device_TileRects = 0x32C8
 Device_TileRectsAligned = 0x33B8
-Device_Predication = 0x32A0
+Device_TileRectsAlignedStride = 16
 Device_TilingTargets = 0x32AC
 Device_TilingExtent = 0x34A8
 Texture_FetchConstant = 0x10

@@ -33,6 +33,20 @@ Device_RingLimit = 0x30
 Device_RingBase = 0x34AC
 Device_RingSegment = 0x34B4
 Device_RingSegmentStart = 0x34C4
+# vertical blank (interrupt handler 821F3620): callback, count, count at the swap wait's end, swap wait, swaps
+Device_Vblank = 0x3B10
+# predicated tiling (BeginTiling 82208230, EndTiling 82208728, SetPredication 822080A8): flags byte and its tiling
+# bit, tile count, tile rects (16 bytes each) and their top left aligned to 32 (8 bytes each); SetViewport 821F73F0
+# sizes to the extent (x then y) while the targets equal those saved at BeginTiling (the first target, then colour 0
+# to 3 and depth)
+Device_TilingFlags = 0x2A38
+Device_TilingOn = 0x20
+Device_TileCount = 0x30B8
+Device_TileRects = 0x30BC
+Device_TileRectsAligned = 0x31AC
+Device_TileRectsAlignedStride = 8
+Device_TilingTargets = 0x30A0
+Device_TilingExtent = 0x3264
 Texture_FetchConstant = 0x1C
 VertexDeclaration_Count = 0x18
 VertexDeclaration_Elements = 0x34
@@ -54,5 +68,6 @@ VertexInfo_Skip = 0x18
 VertexInfo_ElementCount = 0x1C
 VertexInfo_OutputCount = 0x20
 VertexInfo_Elements = 0x24
-# XAudio source voice type of XMA (DARE 8255F1A8)
+# XAudio source voice types past 1 (16 bit PCM): 8 bit PCM (Bink 82C74F60), XMA (DARE 8255F1A8)
+XAudio_SourcePcm8 = 2
 XAudio_SourceXma = 4

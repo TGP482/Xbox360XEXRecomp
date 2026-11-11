@@ -72,7 +72,7 @@ constexpr uint8_t kTilingOn = uint8_t(XDK_Device_TilingOn);
 constexpr uint32_t kDevTileCount = XDK_Device_TileCount;
 constexpr uint32_t kDevTileRects = XDK_Device_TileRects;
 constexpr uint32_t kDevTileRectsAligned = XDK_Device_TileRectsAligned;
-constexpr uint32_t kDevPredication = XDK_Device_Predication;
+constexpr uint32_t kTileAlignedStride = XDK_Device_TileRectsAlignedStride;  // 16 the whole rect, 8 its top left
 constexpr uint32_t kDevTilingTargets = XDK_Device_TilingTargets;
 constexpr uint32_t kDevTilingExtent = XDK_Device_TilingExtent;
 
@@ -124,8 +124,11 @@ void RequireLayout() {
     }
 #ifdef SUB_D3DDevice_BeginTiling
     XDK_REQUIRE("d3d9", XDK_KEY(Device_TilingFlags), XDK_KEY(Device_TilingOn), XDK_KEY(Device_TileCount),
-                XDK_KEY(Device_TileRects), XDK_KEY(Device_TileRectsAligned), XDK_KEY(Device_Predication),
-                XDK_KEY(Device_TilingTargets), XDK_KEY(Device_TilingExtent));
+                XDK_KEY(Device_TileRects), XDK_KEY(Device_TileRectsAligned),
+                XDK_KEY(Device_TileRectsAlignedStride), XDK_KEY(Device_TilingTargets), XDK_KEY(Device_TilingExtent));
+#endif
+#ifdef SUB_D3D_InterruptHandler
+    XDK_REQUIRE("d3d9", XDK_KEY(Device_Vblank));
 #endif
 }
 
@@ -621,10 +624,9 @@ void WriteTileRects(uint32_t dev) {
         uint32_t at = uint32_t(i) * 16;
         const uint32_t exact[4] = {uint32_t(r.x1), uint32_t(r.y1), uint32_t(r.x2), uint32_t(r.y2)};
         const uint32_t aligned[4] = {align(r.x1, 0), align(r.y1, 0), align(r.x2, 31), align(r.y2, 31)};
-        for (uint32_t k = 0; k < 4; k++) {
-            W32(dev + kDevTileRects + at + k * 4, exact[k]);
-            W32(dev + kDevTileRectsAligned + at + k * 4, aligned[k]);
-        }
+        for (uint32_t k = 0; k < 4; k++) W32(dev + kDevTileRects + at + k * 4, exact[k]);
+        for (uint32_t k = 0; k < kTileAlignedStride / 4; k++)
+            W32(dev + kDevTileRectsAligned + uint32_t(i) * kTileAlignedStride + k * 4, aligned[k]);
     }
     W32(dev + kDevTileCount, uint32_t(g_tiling.tiles.size()));
     // SetViewport and SetScissorRect size to the extent while the targets are these
@@ -659,11 +661,11 @@ HLE_FUNC(D3DDevice_BeginTiling) {
         }
         g_tiling.on = count > 0;
         WriteTileRects(dev);
-        W32(dev + kDevPredication, 0);
         if (g_tiling.on) W8(dev + kDevTilingFlags, uint8_t(R8(dev + kDevTilingFlags) | kTilingOn));
         clear = g_tiling.on && !(a[1] & kSkipFirstClear);
         extent = g_tiling.extent;
     }
+    CallGuest(ctx, SYM(D3DDevice_SetPredication), {dev, 0});
     // the scissor sized to the extent first: the clear keeps within it, and the last pass's may be smaller
     CallGuest(ctx, SYM(D3DDevice_SetViewport), {dev, WholeViewport()});
     if (clear) ClearBound(dev, gpu::kClearColors | kClearDepth | kClearStencil, color, z, stencil, &extent);
@@ -697,21 +699,24 @@ HLE_FUNC(D3DDevice_EndTiling) {
         }
         g_tiling = {};
         W8(dev + kDevTilingFlags, uint8_t(R8(dev + kDevTilingFlags) & ~kTilingOn));
-        W32(dev + kDevPredication, 0);
         W32(dev + kDevTilingTargets, 0);
     }
+    CallGuest(ctx, SYM(D3DDevice_SetPredication), {dev, 0});
     CallGuest(ctx, SYM(D3DDevice_SetViewport), {dev, WholeViewport()});
     return 0;
 }
 #endif
 
 #ifdef SUB_D3DDevice_SetPredication
-// (device, tile bits): tile i is 3 << 2i; the draws that follow cover only the selected tiles
-HLE_FUNC(D3DDevice_SetPredication) {
-    W32(a[0] + kDevPredication, a[1]);
+PPC_EXTERN_FUNC(GUEST_ORIG(D3DDevice_SetPredication));
+
+// (device, tile bits): tile i is 3 << 2i; the draws that follow cover only the selected tiles. The library keeps its
+// own fields of it.
+PPC_FUNC(GUEST(D3DDevice_SetPredication)) {
+    uint32_t select = uint32_t(ctx.r[4]);
+    GUEST_ORIG(D3DDevice_SetPredication)(ctx, base);
     std::lock_guard lock(g_lock);
-    g_tiling.select = a[1];
-    return 0;
+    g_tiling.select = select;
 }
 #endif
 
@@ -768,12 +773,12 @@ PPC_EXTERN_FUNC(GUEST_ORIG(D3D_InterruptHandler));
 // (source, device): the host's interrupt 0 is always a vertical blank, so the display status register is not read
 PPC_FUNC(GUEST(D3D_InterruptHandler)) {
     constexpr uint32_t kVerticalBlank = 0;
-    constexpr uint32_t kCount = 0x3D00;      // vertical blanks so far
-    constexpr uint32_t kSwapAt = 0x3D04;     // the count when the presentation wait ran out
-    constexpr uint32_t kWait = 0x3D08;       // vertical blanks the presentation still waits
-    constexpr uint32_t kCallback = 0x3CFC;   // the title's vertical blank callback
-    constexpr uint32_t kSwaps = 0x3D0C;
-    constexpr uint32_t kWaitFlag = 0x2894;   // a block whose word 1 the wait clears
+    constexpr uint32_t kCallback = XDK_Device_Vblank;  // the title's vertical blank callback
+    constexpr uint32_t kCount = kCallback + 4;         // vertical blanks so far
+    constexpr uint32_t kSwapAt = kCallback + 8;        // the count when the presentation wait ran out
+    constexpr uint32_t kWait = kCallback + 12;         // vertical blanks the presentation still waits
+    constexpr uint32_t kSwaps = kCallback + 16;
+    constexpr uint32_t kWaitFlag = kDevWriteback + 4;  // a block whose word 1 the wait clears
     if (uint32_t(ctx.r[3]) != kVerticalBlank) {
         GUEST_ORIG(D3D_InterruptHandler)(ctx, base);
         return;

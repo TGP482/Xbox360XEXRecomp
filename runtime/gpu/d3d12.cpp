@@ -38,13 +38,17 @@ namespace gpu {
 struct Variant {
     ShaderInfo info;
     std::vector<uint8_t> dxil;
+    uint64_t key = 0;  // the microcode and options, the same every run
 };
 
 struct Shader {
     ShaderStage stage;
     std::vector<uint32_t> code;
+    uint64_t hash = 0;  // of code
     ShaderInfo info;  // default options: what the title's Direct3D links and fetches by
     std::unordered_map<uint64_t, std::unique_ptr<Variant>> variants;
+    ShaderOptions last_opt;  // the last variant asked for, found again without a hash
+    Variant* last = nullptr;
 };
 
 namespace {
@@ -235,6 +239,7 @@ struct PipelineKey {
     float poly_offset[2] = {};
     uint32_t topology = 0;
     uint32_t strip_cut = 0;
+    uint32_t unused = 0;  // no padding: the key is hashed and compared as bytes
 };
 
 struct Frame {
@@ -539,7 +544,9 @@ private:
 
     // shaders and pipelines
     Variant* EnsureVariant(Shader* s, const ShaderOptions& opt);
+    Variant* FindVariant(Shader* s, const ShaderOptions& opt);
     ID3D12PipelineState* EnsurePipeline(const PipelineKey& k, const Variant& vs, const Variant* ps);
+    ID3D12PipelineState* FindPipeline(const PipelineKey& k, const Variant& vs, const Variant* ps);
     void FillPipelineDesc(const PipelineKey& k, D3D12_GRAPHICS_PIPELINE_STATE_DESC& d) const;
     ID3D12PipelineState* EnsureResolvePipeline(DXGI_FORMAT rtv, bool ms);
 
@@ -643,6 +650,8 @@ private:
     std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> pass_pipelines_;
     std::vector<std::unique_ptr<Shader>> shaders_;
     std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> pipelines_;
+    PipelineKey last_key_;  // the last draw's, found again without a hash
+    ID3D12PipelineState* last_pso_ = nullptr;
     std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> resolve_pipelines_;
     std::unordered_map<uint64_t, uint32_t> sampler_sets_;
     uint32_t samplers_used_ = 0;
@@ -1181,6 +1190,7 @@ Shader* D3D12Backend::CreateShader(ShaderStage stage, const uint32_t* code, size
     auto s = std::make_unique<Shader>();
     s->stage = stage;
     s->code.assign(code, code + dwords);
+    s->hash = Hash64(code, dwords * 4);
     TranslateShader(stage, code, dwords, ShaderOptions{}, s->info);
     if (s->info.unknown) LOGR("shader: %u instructions not understood", s->info.unknown);
     if (s->info.memexport) LOGR("shader: memory export left out");
@@ -1189,15 +1199,24 @@ Shader* D3D12Backend::CreateShader(ShaderStage stage, const uint32_t* code, size
 }
 
 Variant* D3D12Backend::EnsureVariant(Shader* s, const ShaderOptions& opt) {
-    uint64_t key = Hash64(&opt, sizeof(opt));
+    if (!s->last || std::memcmp(&s->last_opt, &opt, sizeof(opt)) != 0) {
+        s->last = FindVariant(s, opt);
+        s->last_opt = opt;
+    }
+    return s->last->dxil.empty() ? nullptr : s->last;
+}
+
+Variant* D3D12Backend::FindVariant(Shader* s, const ShaderOptions& opt) {
+    uint64_t key = Hash64(&opt, sizeof(opt), s->hash);
     auto& v = s->variants[key];
-    if (v) return v->dxil.empty() ? nullptr : v.get();
+    if (v) return v.get();
     v = std::make_unique<Variant>();
+    v->key = key;
     std::string hlsl = TranslateShader(s->stage, s->code.data(), s->code.size(), opt, v->info);
     const wchar_t* profile = s->stage == ShaderStage::Vertex ? L"vs_6_0" : L"ps_6_0";
     g_perf.shaders++;
     if (!CompileHlsl(hlsl, profile, v->dxil)) v->dxil.clear();
-    return v->dxil.empty() ? nullptr : v.get();
+    return v.get();
 }
 
 void FillBlend(const PipelineKey& k, D3D12_BLEND_DESC& d) {
@@ -1272,6 +1291,13 @@ void D3D12Backend::FillPipelineDesc(const PipelineKey& k, D3D12_GRAPHICS_PIPELIN
 }
 
 ID3D12PipelineState* D3D12Backend::EnsurePipeline(const PipelineKey& k, const Variant& vs, const Variant* ps) {
+    if (last_pso_ && std::memcmp(&k, &last_key_, sizeof(k)) == 0) return last_pso_;
+    last_key_ = k;
+    last_pso_ = FindPipeline(k, vs, ps);
+    return last_pso_;
+}
+
+ID3D12PipelineState* D3D12Backend::FindPipeline(const PipelineKey& k, const Variant& vs, const Variant* ps) {
     uint64_t key = Hash64(&k, sizeof(k));
     auto it = pipelines_.find(key);
     if (it != pipelines_.end()) return it->second.Get();
@@ -2046,8 +2072,8 @@ void D3D12Backend::Draw(const State& s, const DrawArgs& a) {
     BindViews(s, vs->info, ps_info);
 
     PipelineKey k;
-    k.vs = Hash64(&vs_opt, sizeof(vs_opt), uintptr_t(s.vs));
-    k.ps = ps ? Hash64(&ps_opt, sizeof(ps_opt), uintptr_t(s.ps)) : 0;
+    k.vs = vs->key;
+    k.ps = ps ? ps->key : 0;
     Bound bound;
     PipelineKey unbound = k;
     if (!BindTargets(s, ps_info, k, bound)) return;

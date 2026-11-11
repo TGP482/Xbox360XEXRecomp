@@ -54,7 +54,7 @@ struct Change {
     uint8_t bytes[kBlock];
 };
 
-// draws and clears wake the render thread once this many wait; every other command wakes it at once
+// draws, clears and signals go to the render thread this many at a time; every other command at once
 constexpr size_t kWakeBatch = 32;
 constexpr size_t kRunBatch = 32;  // commands the render thread takes per lock
 constexpr uint32_t kSpins = 4096;  // pauses before a fence wait yields, about what a batch takes
@@ -421,6 +421,7 @@ public:
         uint32_t* where;
         uint32_t value;
         uint64_t reading;
+        Flush();
         {
             std::lock_guard lock(queue_lock_);
             if (!signal_where_) return;
@@ -461,19 +462,24 @@ private:
         return c;
     }
 
-    // a wake per draw costs the title a kernel call each time the render thread caught up; whatever the title may
-    // wait on next (present, resolve, copy, query) wakes it at once
+    // a lock and a wake per draw cost the title more than the render thread waits for a batch; whatever the title
+    // may wait on next (present, resolve, copy, query) goes at once
     uint64_t Push(std::unique_ptr<Command> c) {
-        uint64_t seq;
-        bool wake = c->op != Op::Draw && c->op != Op::Clear && c->op != Op::Signal;
+        bool now = c->op != Op::Draw && c->op != Op::Clear && c->op != Op::Signal;
+        uint64_t seq = c->seq = ++recorded_;
+        pending_.push_back(std::move(c));
+        if (now || pending_.size() >= kWakeBatch) Flush();
+        return seq;
+    }
+
+    void Flush() {
+        if (pending_.empty()) return;
         {
             std::lock_guard lock(queue_lock_);
-            seq = c->seq = ++recorded_;
-            queue_.push_back(std::move(c));
-            wake = wake || queue_.size() >= kWakeBatch;
+            for (std::unique_ptr<Command>& c : pending_) queue_.push_back(std::move(c));
         }
-        if (wake) ready_.notify_one();
-        return seq;
+        pending_.clear();
+        ready_.notify_one();
     }
 
     void Execute(Command& c) {
@@ -557,12 +563,14 @@ private:
     std::condition_variable presented_;
     std::deque<std::unique_ptr<Command>> queue_;
     std::vector<std::unique_ptr<Command>> free_;
-    std::vector<std::unique_ptr<Command>> spare_;  // recording's own, outside the lock
+    // recording's own, outside the lock: the caller records from one thread at a time
+    std::vector<std::unique_ptr<Command>> spare_;
+    std::vector<std::unique_ptr<Command>> pending_;  // recorded, not queued yet
+    uint64_t recorded_ = 0;
     uint64_t ended_[kQuerySlots] = {};  // the command that ends each query
     uint64_t answered_[kQuerySlots];    // the EndQuery each answer is for
     uint32_t answers_[kQuerySlots] = {};
     uint64_t polled_[kQuerySlots];  // the EndQuery a queued poll asks about
-    uint64_t recorded_ = 0;
     std::atomic<uint64_t> ran_{0};
     uint64_t queued_presents_ = 0;
     uint64_t presents_ = 0;

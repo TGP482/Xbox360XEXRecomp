@@ -10,7 +10,7 @@ namespace gpu {
 constexpr uint32_t kQuerySlots = 4096;  // occlusion query numbers wrap at this
 
 // what the title's Direct3D hands the renderer: CreateShader and Info on the title's thread, the rest in order on the
-// render thread once Threaded wraps it
+// render thread once Threaded wraps it; calls other than Info come one at a time
 class Backend {
 public:
     virtual ~Backend() = default;

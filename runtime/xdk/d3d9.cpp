@@ -834,8 +834,9 @@ HLE_FUNC(D3D_MakeSpace) {
 
 #ifdef SUB_D3D_WaitForGpu
 // (wait state): a turn of the library's wait on a fence, which gives up once the GPU looks hung; the fence passes
-// now, so the wait goes on to see it
+// now, so the wait goes on to see it. Under g_lock as every other call that records.
 HLE_FUNC(D3D_WaitForGpu) {
+    std::lock_guard lock(g_lock);
     if (g_backend) g_backend->PassSignals();
     return 1;
 }

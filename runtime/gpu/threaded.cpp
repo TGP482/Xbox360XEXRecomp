@@ -27,6 +27,9 @@ constexpr size_t kFetchBytes = 32 * 6 * 4;
 
 constexpr uint64_t kNotEnded = UINT64_MAX;
 
+// draws and clears wake the render thread once this many wait; every other command wakes it at once
+constexpr size_t kWakeBatch = 32;
+
 enum class Op { Draw, Clear, Resolve, Copy, Present, BeginQuery, EndQuery };
 
 struct Command {
@@ -238,14 +241,18 @@ private:
         return c;
     }
 
+    // a wake per draw costs the title a kernel call each time the render thread caught up; whatever the title may
+    // wait on next (present, resolve, copy, query) wakes it at once
     uint64_t Push(std::unique_ptr<Command> c) {
         uint64_t seq;
+        bool wake = c->op != Op::Draw && c->op != Op::Clear;
         {
             std::lock_guard lock(queue_lock_);
             seq = c->seq = ++recorded_;
             queue_.push_back(std::move(c));
+            wake = wake || queue_.size() >= kWakeBatch;
         }
-        ready_.notify_one();
+        if (wake) ready_.notify_one();
         return seq;
     }
 

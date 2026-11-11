@@ -69,13 +69,14 @@ void CopyState(const State& s, Command& c) {
     c.state.fetch = CopyBank(s.fetch, c.fetch, kFetchBytes);
 }
 
-uint32_t IndexAt(const DrawArgs& a, uint32_t i) {
-    uint32_t v = 0;
-    uint32_t size = a.index32 ? 4 : 2;
-    uint8_t* p = reinterpret_cast<uint8_t*>(&v);
-    std::memcpy(p, a.indices + i * size, size);
-    xenos::SwapEndian(p, size, xenos::Endian(a.index_endian));
-    return v;
+// a 32 bit index in host order; the swaps of xenos::SwapEndian, inline
+uint32_t SwapIndex32(uint32_t v, xenos::Endian e) {
+    switch (e) {
+        case xenos::Endian::Swap8In16: return (v & 0xFF00FF00u) >> 8 | (v & 0x00FF00FFu) << 8;
+        case xenos::Endian::Swap8In32: return __builtin_bswap32(v);
+        case xenos::Endian::Swap16In32: return v >> 16 | v << 16;
+        default: return v;
+    }
 }
 
 // the vertices a draw reads, strip cuts left out; false for none
@@ -87,11 +88,33 @@ bool VertexRange(const DrawArgs& a, int64_t& low, int64_t& high) {
     }
     uint32_t min = UINT32_MAX;
     uint32_t max = 0;
-    for (uint32_t i = 0; i < a.count; i++) {
-        uint32_t v = IndexAt(a, i);
-        if (v == 0xFFFF || v == 0xFFFFFFFF) continue;
+    auto take = [&](uint32_t v) {
+        if (v == 0xFFFF || v == 0xFFFFFFFF) return;
         min = std::min(min, v);
         max = std::max(max, v);
+    };
+    xenos::Endian e = xenos::Endian(a.index_endian);
+    if (a.index32) {
+        for (uint32_t i = 0; i < a.count; i++) {
+            uint32_t v;
+            std::memcpy(&v, a.indices + i * 4, 4);
+            take(SwapIndex32(v, e));
+        }
+    } else {
+        // of the swaps only 8 in 16 stays within a 16 bit index; a cut (0xFFFF) never lowers the minimum and counts
+        // as 0 for the maximum, which keeps the loop free of branches
+        bool swap = e == xenos::Endian::Swap8In16;
+        uint16_t lo = 0xFFFF;
+        uint16_t hi = 0;
+        for (uint32_t i = 0; i < a.count; i++) {
+            uint16_t v;
+            std::memcpy(&v, a.indices + i * 2, 2);
+            v = swap ? __builtin_bswap16(v) : v;
+            lo = std::min(lo, v);
+            hi = std::max(hi, uint16_t(v == 0xFFFF ? 0 : v));
+        }
+        min = lo;
+        max = hi;
     }
     low = int64_t(min) + a.base_vertex;
     high = int64_t(max) + a.base_vertex + 1;

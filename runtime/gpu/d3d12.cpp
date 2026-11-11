@@ -525,8 +525,8 @@ private:
     bool library_dirty_ = false;
     std::future<void> saving_;  // the library being written out
 
-    // the last constant blocks bound, skipped when unchanged
-    uint64_t const_hash_[kRootCount] = {};
+    // the last constant blocks bound, skipped when unchanged; no address means upload again
+    uint8_t const_last_[kRootCount][kConstBytes] = {};
     D3D12_GPU_VIRTUAL_ADDRESS const_gpu_[kRootCount] = {};
 
     ComPtr<ID3D12QueryHeap> query_heap_;
@@ -759,7 +759,7 @@ void D3D12Backend::Begin() {
     ID3D12DescriptorHeap* heaps[] = {view_heap_.Get(), sampler_heap_.Get()};
     cl_->SetDescriptorHeaps(2, heaps);
     cl_->SetGraphicsRootSignature(root_.Get());
-    std::fill(std::begin(const_hash_), std::end(const_hash_), 0);
+    std::fill(std::begin(const_gpu_), std::end(const_gpu_), 0);
 }
 
 void D3D12Backend::Submit(bool wait) {
@@ -1625,14 +1625,13 @@ D3D12_GPU_VIRTUAL_ADDRESS D3D12Backend::UploadStreams(const DrawArgs& a, const S
 void D3D12Backend::BindConstants(const State& s, D3D12_GPU_VIRTUAL_ADDRESS fetch, DrawConstants& c, const Target* rt,
                                  uint32_t src_blend) {
     auto bind = [&](uint32_t root, const uint8_t* be, uint32_t bytes) {
-        uint64_t h = Hash64(be, bytes);
-        if (h != const_hash_[root] || !const_gpu_[root]) {
+        if (!const_gpu_[root] || std::memcmp(const_last_[root], be, bytes) != 0) {
             Alloc a = Upload(bytes, kCbAlign);
             for (uint32_t i = 0; i < bytes; i += 4) {
                 uint32_t v = Be32(be + i);
                 std::memcpy(a.cpu + i, &v, 4);
             }
-            const_hash_[root] = h;
+            std::memcpy(const_last_[root], be, bytes);
             const_gpu_[root] = a.gpu;
         }
         cl_->SetGraphicsRootConstantBufferView(root, const_gpu_[root]);
@@ -1945,7 +1944,7 @@ void D3D12Backend::CopyResolve(Target& src, Resolved& dst, const ResolveArgs& r)
     cl_->SetGraphicsRootDescriptorTable(kRootPsViews, ViewGuest(views));
     cl_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
     cl_->DrawInstanced(4, 1, 0, 0);
-    const_hash_[kRootVsConsts] = const_hash_[kRootPsConsts] = 0;
+    const_gpu_[kRootVsConsts] = const_gpu_[kRootPsConsts] = 0;
 }
 
 // Present
@@ -2073,7 +2072,7 @@ void D3D12Backend::Present(const uint32_t front[6]) {
 // Extension passes
 
 // the draw state set since is set again by the next draw
-void D3D12Backend::Unbind() { std::fill(std::begin(const_hash_), std::end(const_hash_), 0); }
+void D3D12Backend::Unbind() { std::fill(std::begin(const_gpu_), std::end(const_gpu_), 0); }
 
 // a copy of the target to read while drawing to it; a multisampled one is resolved into it
 ID3D12Resource* D3D12Backend::Feedback(Target& t) {

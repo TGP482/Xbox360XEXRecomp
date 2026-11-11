@@ -56,6 +56,7 @@ constexpr uint32_t kDsvCount = 256;
 constexpr uint32_t kQueryCount = kQuerySlots;
 constexpr uint32_t kVsTextures = 16;
 constexpr uint32_t kPsTextures = 32;
+constexpr uint32_t kTextureViews = 16384;  // made views kept for copying, started over when full
 constexpr uint32_t kConstBytes = 256 * 16;
 constexpr uint32_t kCbAlign = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
 constexpr uint32_t kEdramTiles = 2048;
@@ -353,6 +354,20 @@ void WriteBmp(const std::filesystem::path& path, uint32_t w, uint32_t h, const s
     f.write(reinterpret_cast<const char*>(bgra.data()), std::streamsize(bgra.size()));
 }
 
+// a texture view as the draw needs it; Texture pointers live as long as the backend
+struct ViewKey {
+    const Texture* tex = nullptr;
+    uint32_t dimension = 0;
+    uint32_t mapping = 0;
+    uint32_t fits = 0;
+    uint32_t unused = 0;  // keeps the hashed bytes defined
+    bool operator==(const ViewKey&) const = default;
+};
+
+struct ViewKeyHash {
+    size_t operator()(const ViewKey& k) const { return size_t(Hash64(&k, sizeof(k))); }
+};
+
 class D3D12Backend final : public Backend, public Context {
 public:
     ~D3D12Backend() override;
@@ -409,6 +424,8 @@ private:
     D3D12_CPU_DESCRIPTOR_HANDLE ViewCpu(uint32_t i) const;
     D3D12_GPU_DESCRIPTOR_HANDLE ViewGuest(uint32_t i) const;
     D3D12_CPU_DESCRIPTOR_HANDLE Rtv(uint32_t i) const;
+    D3D12_CPU_DESCRIPTOR_HANDLE CopyView(uint32_t i) const;
+    D3D12_CPU_DESCRIPTOR_HANDLE TextureView(uint32_t i) const;
     D3D12_CPU_DESCRIPTOR_HANDLE Dsv(uint32_t i) const;
 
     // targets
@@ -496,6 +513,9 @@ private:
     ComPtr<ID3D12Resource> bb_[kFrames];
     ComPtr<ID3D12DescriptorHeap> view_heap_, sampler_heap_, rtv_heap_, dsv_heap_, ui_heap_;
     uint32_t view_inc_ = 0, sampler_inc_ = 0, rtv_inc_ = 0, dsv_inc_ = 0;
+    ComPtr<ID3D12DescriptorHeap> copy_heap_;  // copied into tables: kPsTextures null views, then each frame's raw ring
+    ComPtr<ID3D12DescriptorHeap> texture_view_heap_;
+    std::unordered_map<ViewKey, uint32_t, ViewKeyHash> texture_views_;  // to their slot in texture_view_heap_
     std::vector<uint32_t> free_rtv_, free_dsv_;
     ComPtr<ID3D12RootSignature> root_;
     ComPtr<ID3D12GraphicsCommandList> cl_;
@@ -645,6 +665,14 @@ void D3D12Backend::CreateHeaps() {
     rtv_inc_ = make(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kNullRtv + 1, false, rtv_heap_);
     dsv_inc_ = make(D3D12_DESCRIPTOR_HEAP_TYPE_DSV, kDsvCount, false, dsv_heap_);
     make(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, true, ui_heap_);
+    make(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kPsTextures + kFrames, false, copy_heap_);
+    make(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kTextureViews, false, texture_view_heap_);
+    D3D12_SHADER_RESOURCE_VIEW_DESC nv{};
+    nv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    nv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    nv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    nv.Texture2D.MipLevels = 1;
+    for (uint32_t i = 0; i < kPsTextures; i++) dev_->CreateShaderResourceView(nullptr, &nv, CopyView(i));
     for (uint32_t i = kRtvCount; i-- > 0;) free_rtv_.push_back(i);
     for (uint32_t i = kDsvCount; i-- > 0;) free_dsv_.push_back(i);
     for (int i = 0; i < kFrames; i++) dev_->CreateRenderTargetView(bb_[i].Get(), nullptr, Rtv(kRtvCount + i));
@@ -710,6 +738,16 @@ void D3D12Backend::CreateFrames() {
         dev_->CreateCommittedResource(&upload, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
                                       IID_PPV_ARGS(&f.upload));
         f.upload->Map(0, nullptr, reinterpret_cast<void**>(&f.map));
+    }
+    // the vertex bytes: the whole upload ring, raw
+    D3D12_SHADER_RESOURCE_VIEW_DESC raw{};
+    raw.Format = DXGI_FORMAT_R32_TYPELESS;
+    raw.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    raw.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    raw.Buffer.NumElements = UINT(kUploadSize / 4);
+    raw.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+    for (int i = 0; i < kFrames; i++) {
+        dev_->CreateShaderResourceView(frames_[i].upload.Get(), &raw, CopyView(kPsTextures + i));
     }
     dev_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_));
     event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -838,6 +876,12 @@ D3D12_GPU_DESCRIPTOR_HANDLE D3D12Backend::ViewGuest(uint32_t i) const {
 }
 D3D12_CPU_DESCRIPTOR_HANDLE D3D12Backend::Rtv(uint32_t i) const {
     return {rtv_heap_->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T(i) * rtv_inc_};
+}
+D3D12_CPU_DESCRIPTOR_HANDLE D3D12Backend::CopyView(uint32_t i) const {
+    return {copy_heap_->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T(i) * view_inc_};
+}
+D3D12_CPU_DESCRIPTOR_HANDLE D3D12Backend::TextureView(uint32_t i) const {
+    return {texture_view_heap_->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T(i) * view_inc_};
 }
 D3D12_CPU_DESCRIPTOR_HANDLE D3D12Backend::Dsv(uint32_t i) const {
     return {dsv_heap_->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T(i) * dsv_inc_};
@@ -1323,7 +1367,16 @@ void D3D12Backend::FillTextureView(const TextureBinding& b, const uint32_t fetch
     bool fits = tex && (b.dimension != 3 || t.dimension == xenos::Dimension::Cube) &&
                 (b.dimension != 2 || t.dimension == xenos::Dimension::D3);
     if (fits) Transition(tex->res.Get(), tex->state, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
-    dev_->CreateShaderResourceView(fits ? tex->res.Get() : nullptr, &v, at);
+    // made once, copied after
+    if (texture_views_.size() >= kTextureViews) {
+        static bool logged = false;
+        if (!std::exchange(logged, true)) LOGR("D3D12: %u texture views made, starting over", kTextureViews);
+        texture_views_.clear();
+    }
+    ViewKey key{tex, uint32_t(b.dimension), v.Shader4ComponentMapping, fits};
+    auto [view, added] = texture_views_.try_emplace(key, uint32_t(texture_views_.size()));
+    if (added) dev_->CreateShaderResourceView(fits ? tex->res.Get() : nullptr, &v, TextureView(view->second));
+    dev_->CopyDescriptorsSimple(1, at, TextureView(view->second), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 }
 
 // the fetch constant's filters, overridden by the instruction's where it sets them
@@ -1376,13 +1429,9 @@ D3D12_GPU_DESCRIPTOR_HANDLE D3D12Backend::EnsureSamplers(const std::vector<D3D12
     return {sampler_heap_->GetGPUDescriptorHandleForHeapStart().ptr + UINT64(it->second) * sampler_inc_};
 }
 
+// copied from the ready made ones, count at most kPsTextures
 void D3D12Backend::NullViews(uint32_t first, uint32_t count) {
-    D3D12_SHADER_RESOURCE_VIEW_DESC v{};
-    v.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    v.Texture2D.MipLevels = 1;
-    for (uint32_t i = 0; i < count; i++) dev_->CreateShaderResourceView(nullptr, &v, ViewCpu(first + i));
+    if (count) dev_->CopyDescriptorsSimple(count, ViewCpu(first), CopyView(0), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 }
 
 // a table with texture views from slot first on and their samplers; slots past the shader's hold null views
@@ -1679,14 +1728,8 @@ void D3D12Backend::BindViews(const State& s, const ShaderInfo& vs, const ShaderI
     D3D12_GPU_DESCRIPTOR_HANDLE ps_samplers;
     uint32_t vs_views = BindTextures(s, vs, ShaderStage::Vertex, 1, kVsTextures, vs_samplers);
     uint32_t ps_views = BindTextures(s, ps, ShaderStage::Pixel, 0, kPsTextures, ps_samplers);
-    // the vertex bytes: the whole upload ring, raw
-    D3D12_SHADER_RESOURCE_VIEW_DESC raw{};
-    raw.Format = DXGI_FORMAT_R32_TYPELESS;
-    raw.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-    raw.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    raw.Buffer.NumElements = UINT(kUploadSize / 4);
-    raw.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
-    dev_->CreateShaderResourceView(CurrentFrame().upload.Get(), &raw, ViewCpu(vs_views));
+    uint32_t raw = kPsTextures + uint32_t(frame_ % kFrames);
+    dev_->CopyDescriptorsSimple(1, ViewCpu(vs_views), CopyView(raw), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     cl_->SetGraphicsRootDescriptorTable(kRootVsViews, ViewGuest(vs_views));
     cl_->SetGraphicsRootDescriptorTable(kRootPsViews, ViewGuest(ps_views));
     cl_->SetGraphicsRootDescriptorTable(kRootVsSamplers, vs_samplers);

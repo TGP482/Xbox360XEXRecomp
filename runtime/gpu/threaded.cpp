@@ -386,14 +386,16 @@ public:
     }
 
 private:
+    // spare_ refills with every command the render thread finished, in one lock
     std::unique_ptr<Command> New(Op op) {
-        std::unique_ptr<Command> c;
-        {
+        if (spare_.empty()) {
             std::lock_guard lock(queue_lock_);
-            if (!free_.empty()) {
-                c = std::move(free_.back());
-                free_.pop_back();
-            }
+            std::swap(spare_, free_);
+        }
+        std::unique_ptr<Command> c;
+        if (!spare_.empty()) {
+            c = std::move(spare_.back());
+            spare_.pop_back();
         }
         if (!c) c = std::make_unique<Command>();
         c->op = op;
@@ -447,11 +449,13 @@ private:
         answers_[slot] = samples;
     }
 
+    // one lock per command: the last one finished, the next one taken
     void Run() {
+        std::unique_ptr<Command> c;
         for (;;) {
-            std::unique_ptr<Command> c;
             {
                 std::unique_lock lock(queue_lock_);
+                if (c) Retire(std::move(c));
                 ready_.wait(lock, [&] { return stop_ || !queue_.empty(); });
                 if (queue_.empty()) return;
                 c = std::move(queue_.front());
@@ -459,18 +463,18 @@ private:
                 reading_ = c->op == Op::Draw && c->draw.fenced ? c->seq : 0;
             }
             Execute(*c);
-            bool present = c->op == Op::Present;
-            bool waited_on;
-            {
-                std::lock_guard lock(queue_lock_);
-                ran_ = c->seq;
-                if (present) presents_++;
-                waited_on = waiters_ != 0;
-                free_.push_back(std::move(c));
-            }
-            if (present) presented_.notify_all();
-            if (waited_on) signaled_.notify_all();
         }
+    }
+
+    // under queue_lock_
+    void Retire(std::unique_ptr<Command> c) {
+        ran_ = c->seq;
+        if (c->op == Op::Present) {
+            presents_++;
+            presented_.notify_all();
+        }
+        if (waiters_) signaled_.notify_all();
+        free_.push_back(std::move(c));
     }
 
     std::unique_ptr<Backend> inner_;
@@ -484,6 +488,7 @@ private:
     std::condition_variable signaled_;
     std::deque<std::unique_ptr<Command>> queue_;
     std::vector<std::unique_ptr<Command>> free_;
+    std::vector<std::unique_ptr<Command>> spare_;  // recording's own, outside the lock
     uint64_t ended_[kQuerySlots] = {};  // the command that ends each query
     uint64_t answered_[kQuerySlots];    // the EndQuery each answer is for
     uint32_t answers_[kQuerySlots] = {};

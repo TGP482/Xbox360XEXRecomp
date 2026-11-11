@@ -673,7 +673,15 @@ private:
         uint32_t stencil_ref = 0;
         ID3D12PipelineState* pso = nullptr;
         D3D12_PRIMITIVE_TOPOLOGY topology{};
-        UINT64 roots[kRootCount] = {};  // constant buffers and sampler tables
+        UINT64 roots[kRootCount] = {};  // constant buffers, view and sampler tables
+        // the textures a stage's last draw bound, vertex then pixel
+        struct Stage {
+            const ShaderInfo* info = nullptr;  // null: none kept
+            uint32_t aniso = 0;
+            uint32_t fetch[kPsTextures][6] = {};
+            uint32_t table = 0;
+            D3D12_GPU_DESCRIPTOR_HANDLE samplers{};
+        } stages[2];
     } binds_;
     // true where now differs from what the last draw set, which keeps it
     template <class T>
@@ -1647,19 +1655,32 @@ void D3D12Backend::NullViews(uint32_t first, uint32_t count) {
 // a table with texture views from slot first on and their samplers; slots past the shader's hold null views
 uint32_t D3D12Backend::BindTextures(const State& s, const ShaderInfo& info, ShaderStage stage, uint32_t first,
                                     uint32_t slots, D3D12_GPU_DESCRIPTOR_HANDLE& samplers) {
-    uint32_t table = AllocViews(first + slots);
     uint32_t used = std::min<uint32_t>(uint32_t(info.textures.size()), slots);
+    uint32_t fetch[kPsTextures][6];
+    for (uint32_t i = 0; i < used; i++) ReadFetch(s, info.textures[i].fetch, fetch[i]);
+    size_t fetch_bytes = used * sizeof(fetch[0]);
+    // the shader and fetch constants of the stage's last draw: its tables again. An extension may pick by pass.
+    Binds::Stage& kept = binds_.stages[stage == ShaderStage::Vertex ? 0 : 1];
+    bool same = !ext_ && kept.info == &info && kept.aniso == app::Get().aniso;
+    if (same && std::memcmp(kept.fetch, fetch, fetch_bytes) == 0) {
+        samplers = kept.samplers;
+        return kept.table;
+    }
+    uint32_t table = AllocViews(first + slots);
     std::vector<D3D12_SAMPLER_DESC>& descs = sampler_descs_;
     descs.clear();
     for (uint32_t i = 0; i < used; i++) {
         const TextureBinding& b = info.textures[i];
-        uint32_t fetch[6];
-        ReadFetch(s, b.fetch, fetch);
-        FillTextureView(b, fetch, ViewCpu(table + first + i), stage, i);
-        descs.push_back(SamplerDesc(b, fetch));
+        FillTextureView(b, fetch[i], ViewCpu(table + first + i), stage, i);
+        descs.push_back(SamplerDesc(b, fetch[i]));
     }
     NullViews(table + first + used, slots - used);
     samplers = EnsureSamplers(descs);
+    kept.info = &info;
+    kept.aniso = app::Get().aniso;
+    std::memcpy(kept.fetch, fetch, fetch_bytes);
+    kept.table = table;
+    kept.samplers = samplers;
     return table;
 }
 
@@ -2023,8 +2044,12 @@ void D3D12Backend::BindViews(const State& s, const ShaderInfo& vs, const ShaderI
     uint32_t ps_views = BindTextures(s, ps, ShaderStage::Pixel, 0, kPsTextures, ps_samplers);
     uint32_t raw = kPsTextures + uint32_t(frame_ % kFrames);
     dev_->CopyDescriptorsSimple(1, ViewCpu(vs_views), CopyView(raw), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    cl_->SetGraphicsRootDescriptorTable(kRootVsViews, ViewGuest(vs_views));
-    cl_->SetGraphicsRootDescriptorTable(kRootPsViews, ViewGuest(ps_views));
+    if (Latch(binds_.roots[kRootVsViews], ViewGuest(vs_views).ptr)) {
+        cl_->SetGraphicsRootDescriptorTable(kRootVsViews, ViewGuest(vs_views));
+    }
+    if (Latch(binds_.roots[kRootPsViews], ViewGuest(ps_views).ptr)) {
+        cl_->SetGraphicsRootDescriptorTable(kRootPsViews, ViewGuest(ps_views));
+    }
     if (Latch(binds_.roots[kRootVsSamplers], vs_samplers.ptr)) {
         cl_->SetGraphicsRootDescriptorTable(kRootVsSamplers, vs_samplers);
     }
@@ -2213,6 +2238,8 @@ void D3D12Backend::DropResolved(uint32_t base) {
         }
         return true;
     });
+    // a kept table may show the resolve
+    Unbind();
 }
 
 // D3DX copies through guest memory: a resolve's copy is made here and kept like the resolve, any other copy leaves

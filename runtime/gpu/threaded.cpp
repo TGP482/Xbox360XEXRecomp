@@ -42,10 +42,12 @@ constexpr uint32_t kBankAt[kBankCount] = {0, kRegBytes, kRegBytes + kConstBytes,
 constexpr uint32_t kBankTotal = kBankAt[kFetch] + kFetchBytes;
 constexpr uint32_t kBlock = 32;
 static_assert(kBankTotal <= UINT16_MAX && kBoolBytes % kBlock == 0 && kRegBytes == 128 * kBlock);
-static_assert(kConstBytes == 256 * kBlock);
+static_assert(kConstBytes == 256 * kBlock && kFetchBytes <= 64 * kBlock);
 static_assert(std::is_trivially_copyable_v<State> && offsetof(State, regs) == 0);
 
 constexpr uint64_t kNoConstants[4] = {};  // clears and resolves read none
+constexpr uint64_t kNoFetches[1] = {};
+constexpr uint32_t kFetchConstBytes = 6 * 4;
 
 struct Change {
     uint16_t at;  // in the banks
@@ -100,8 +102,9 @@ const uint8_t* Bank(const State& s, uint32_t b) {
 class Banks {
 public:
     // the title's side: s's blocks that differ from the last recorded, kept as the new last; of the float constants
-    // only the blocks in consts (a bit each, vertex then pixel), as the renderer reads only what the shaders read
-    void Record(const State& s, Command& c, const uint64_t (&consts)[4]) {
+    // and fetch constants only the blocks in consts (a bit each, vertex then pixel) and fetches, as the renderer reads
+    // only what the shaders read
+    void Record(const State& s, Command& c, const uint64_t (&consts)[4], const uint64_t (&fetches)[1]) {
         CopyRest(s, c.state);
         c.banks |= 1u << kRegs;
         TakeBlocks(Bank(s, kRegs), kBankAt[kRegs], s.kept_regs, c);
@@ -111,6 +114,10 @@ public:
             c.banks |= 1u << b;
             if (b == kConsts) {
                 TakeBlocks(from, kBankAt[b], consts, c);
+                continue;
+            }
+            if (b == kFetch) {
+                TakeBlocks(from, kBankAt[b], fetches, c);
                 continue;
             }
             for (uint32_t i = 0; i < kBankBytes[b]; i += kBlock) Take(from + i, kBankAt[b] + i, c);
@@ -155,6 +162,14 @@ private:
 
     alignas(64) uint8_t bytes_[kBankTotal] = {};
 };
+
+// the fetch bank's blocks holding the texture fetch constants a shader samples
+void AddFetchBlocks(const ShaderInfo& info, uint64_t& blocks) {
+    for (const TextureBinding& t : info.textures) {
+        uint32_t first = t.fetch * kFetchConstBytes;
+        for (uint32_t b = first / kBlock; b <= (first + kFetchConstBytes - 1) / kBlock; b++) blocks |= 1ull << b;
+    }
+}
 
 // a 32 bit index in host order; the swaps of xenos::SwapEndian, inline
 uint32_t SwapIndex32(uint32_t v, xenos::Endian e) {
@@ -310,18 +325,22 @@ public:
         std::unique_ptr<Command> c = New(Op::Draw);
         const ShaderInfo& vs = inner_->Info(s.vs);
         uint64_t consts[4] = {vs.constants[0], vs.constants[1]};
+        uint64_t fetches[1] = {};
+        AddFetchBlocks(vs, fetches[0]);
         if (s.ps) {
-            consts[2] = inner_->Info(s.ps).constants[0];
-            consts[3] = inner_->Info(s.ps).constants[1];
+            const ShaderInfo& ps = inner_->Info(s.ps);
+            consts[2] = ps.constants[0];
+            consts[3] = ps.constants[1];
+            AddFetchBlocks(ps, fetches[0]);
         }
-        recorded_banks_.Record(s, *c, consts);
+        recorded_banks_.Record(s, *c, consts, fetches);
         CopyDraw(a, vs.fetches.size(), *c);
         Push(std::move(c));
     }
     void Clear(const State& s, uint32_t flags, const float color[4], float z, uint32_t stencil,
                const Rect* rect) override {
         std::unique_ptr<Command> c = New(Op::Clear);
-        recorded_banks_.Record(s, *c, kNoConstants);
+        recorded_banks_.Record(s, *c, kNoConstants, kNoFetches);
         c->flags = flags;
         std::memcpy(c->color, color, sizeof(c->color));
         c->z = z;
@@ -332,7 +351,7 @@ public:
     }
     void Resolve(const State& s, const ResolveArgs& r) override {
         std::unique_ptr<Command> c = New(Op::Resolve);
-        recorded_banks_.Record(s, *c, kNoConstants);
+        recorded_banks_.Record(s, *c, kNoConstants, kNoFetches);
         c->resolve = r;
         Push(std::move(c));
     }

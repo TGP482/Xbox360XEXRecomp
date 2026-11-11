@@ -10,6 +10,7 @@
 
 // Every guest register a function touches is a C++ local: loaded from the context at entry and after each call,
 // stored back before each call and return. Inside a function the host compiler keeps them in host registers.
+// A store covers the registers some path wrote since the last call on it; the context still holds the others.
 struct RegSet {
     std::bitset<32> gpr;
     std::bitset<32> fpr;
@@ -20,6 +21,14 @@ struct RegSet {
     bool ca = false;
     bool ov = false;
     bool so = false;
+    bool operator==(const RegSet&) const = default;
+};
+
+// the registers that can differ from the context at a point of a function
+struct Sync {
+    bool all = false;  // every one the function writes
+    RegSet dirty;
+    bool operator==(const Sync&) const = default;
 };
 
 class CodeGen {
@@ -40,15 +49,20 @@ private:
     std::set<uint32_t> labels_;
     RegSet used_;
     RegSet written_;
+    Sync sync_;                 // at the line being emitted
+    bool reachable_ = true;     // the line before runs on into it
+    bool conditional_ = false;  // emitting a call the code may skip
+    bool first_pass_ = true;
+    std::map<uint32_t, Sync> label_in_;   // at each label, over every way there, as the pass before found
+    std::map<uint32_t, Sync> label_out_;  // the same, gathered in this pass
     std::string body_;
     int ret_hook_ = 0;
     size_t insn_count_ = 0;
     std::map<std::string, size_t> unimpl_;
 
-    void Line(const std::string& s) {
-        body_ += s;
-        body_ += '\n';
-    }
+    void Line(std::string s);
+    void Flow(uint32_t label);
+    void EnterLabel(uint32_t label);
 
     // operands: reading marks a register used, writing marks it written too
     std::string R(uint32_t n);
@@ -76,7 +90,8 @@ private:
     // functions and their files
     std::string EmitFunction(uint32_t entry);
     std::string EmitImport(uint32_t entry, uint32_t slot);
-    std::string RegisterBlock(bool spill) const;
+    std::string RegisterBlock(const RegSet& set, bool spill) const;
+    void EmitPass(const std::vector<uint32_t>& body, bool entry_first);
     std::string Declarations() const;
     void CollectLabels(const std::vector<uint32_t>& body);
     void EmitBody(const std::vector<uint32_t>& body);

@@ -40,12 +40,62 @@ std::string Fmt(const char* f, ...) {
     return s;
 }
 
+void Merge(Sync& into, const Sync& from) {
+    into.all = into.all || from.all;
+    into.dirty.gpr |= from.dirty.gpr;
+    into.dirty.fpr |= from.dirty.fpr;
+    into.dirty.vr |= from.dirty.vr;
+    into.dirty.cr |= from.dirty.cr;
+    into.dirty.ctr = into.dirty.ctr || from.dirty.ctr;
+    into.dirty.lr = into.dirty.lr || from.dirty.lr;
+    into.dirty.ca = into.dirty.ca || from.dirty.ca;
+    into.dirty.ov = into.dirty.ov || from.dirty.ov;
+    into.dirty.so = into.dirty.so || from.dirty.so;
+}
+
+// PPC_SPILL in a line becomes the stores of the registers that can differ from the context there
+void CodeGen::Line(std::string s) {
+    static const std::string kSpill = "PPC_SPILL;";
+    bool always = s.rfind("\t" + kSpill, 0) == 0 || s.rfind("\tif (true) {", 0) == 0;
+    bool call = always && s.find("PPC_RELOAD;") != std::string::npos;
+    bool every = sync_.all || !reachable_;
+    if (!every) {
+        std::string stores = RegisterBlock(sync_.dirty, true);
+        if (!stores.empty()) stores.erase(0, 1);
+        for (size_t at = s.find(kSpill); at != std::string::npos; at = s.find(kSpill, at + stores.size())) {
+            // without stores the space after the macro goes too
+            size_t drop = stores.empty() && at + kSpill.size() < s.size() ? kSpill.size() + 1 : kSpill.size();
+            s.replace(at, drop, stores);
+        }
+    }
+    // past a call that always runs every local is the context's
+    if (call && !conditional_) sync_ = {};
+    body_ += s;
+    body_ += '\n';
+}
+
+// the line being emitted may go on at label
+void CodeGen::Flow(uint32_t label) {
+    if (reachable_) Merge(label_out_[label], sync_);
+}
+
+void CodeGen::EnterLabel(uint32_t label) {
+    Flow(label);
+    auto in = label_in_.find(label);
+    // the first pass sees every branch; a label none of them reaches gets every store
+    sync_ = in != label_in_.end() ? in->second : Sync{!first_pass_, {}};
+    // branches from above count at once, so only loops take another pass
+    if (auto out = label_out_.find(label); out != label_out_.end()) Merge(sync_, out->second);
+    reachable_ = true;
+}
+
 std::string CodeGen::R(uint32_t n) {
     used_.gpr.set(n);
     return Fmt("r%u", n);
 }
 std::string CodeGen::Rw(uint32_t n) {
     written_.gpr.set(n);
+    sync_.dirty.gpr.set(n);
     return R(n);
 }
 std::string CodeGen::Ra0(uint32_t n) { return n ? R(n) : "0ull"; }
@@ -55,6 +105,7 @@ std::string CodeGen::F(uint32_t n) {
 }
 std::string CodeGen::Fw(uint32_t n) {
     written_.fpr.set(n);
+    sync_.dirty.fpr.set(n);
     return F(n);
 }
 std::string CodeGen::V(uint32_t n) {
@@ -63,6 +114,7 @@ std::string CodeGen::V(uint32_t n) {
 }
 std::string CodeGen::Vw(uint32_t n) {
     written_.vr.set(n);
+    sync_.dirty.vr.set(n);
     return V(n);
 }
 std::string CodeGen::Cr(uint32_t n) {
@@ -71,6 +123,7 @@ std::string CodeGen::Cr(uint32_t n) {
 }
 std::string CodeGen::Crw(uint32_t n) {
     written_.cr.set(n);
+    sync_.dirty.cr.set(n);
     return Cr(n);
 }
 std::string CodeGen::CrBit(uint32_t bit) { return Cr(bit / 4) + "." + kCrBits[bit % 4]; }
@@ -81,6 +134,7 @@ std::string CodeGen::Ctr() {
 }
 std::string CodeGen::CtrW() {
     written_.ctr = true;
+    sync_.dirty.ctr = true;
     return Ctr();
 }
 std::string CodeGen::Lr() {
@@ -89,6 +143,7 @@ std::string CodeGen::Lr() {
 }
 std::string CodeGen::LrW() {
     written_.lr = true;
+    sync_.dirty.lr = true;
     return Lr();
 }
 std::string CodeGen::Ca() {
@@ -97,6 +152,7 @@ std::string CodeGen::Ca() {
 }
 std::string CodeGen::CaW() {
     written_.ca = true;
+    sync_.dirty.ca = true;
     return Ca();
 }
 std::string CodeGen::So() {
@@ -105,6 +161,7 @@ std::string CodeGen::So() {
 }
 std::string CodeGen::SoW() {
     written_.so = true;
+    sync_.dirty.so = true;
     return So();
 }
 std::string CodeGen::Ov() {
@@ -114,6 +171,7 @@ std::string CodeGen::Ov() {
 // an overflow also sets SO, which keeps it
 std::string CodeGen::OvW() {
     written_.ov = true;
+    sync_.dirty.ov = true;
     SoW();
     return Ov();
 }
@@ -123,9 +181,8 @@ void CodeGen::RecordCr0(const std::string& value) {
     Line(Fmt("\t%s = ppc_cmps(int64_t(int32_t(%s)), 0, %s);", Crw(0).c_str(), value.c_str(), So().c_str()));
 }
 
-// spill stores what the function writes, reload loads all it uses
-std::string CodeGen::RegisterBlock(bool spill) const {
-    const RegSet& set = spill ? written_ : used_;
+// a spill stores set, a reload loads it
+std::string CodeGen::RegisterBlock(const RegSet& set, bool spill) const {
     std::string s;
     auto add = [&](const std::string& local, const std::string& field) {
         s += spill ? Fmt(" %s = %s;", field.c_str(), local.c_str()) : Fmt(" %s = %s;", local.c_str(), field.c_str());
@@ -176,6 +233,7 @@ void CodeGen::Unimpl(const Insn& i) {
 std::string CodeGen::Jump(uint32_t from, uint32_t to) {
     if (body_set_.count(to)) {
         labels_.insert(to);
+        Flow(to);
         if (to <= from) return Fmt("{ PPC_BARRIER(); goto loc_%08X; }", to);
         return Fmt("goto loc_%08X;", to);
     }
@@ -260,7 +318,9 @@ bool CodeGen::EmitBranch(const Insn& i) {
             std::string c = BranchCond(i);
             if (i.Link()) {
                 Line(Fmt("\tif (%s) {", c.c_str()));
+                conditional_ = true;
                 EmitCall(i, i.Target());
+                conditional_ = false;
                 Line("\t}");
             } else {
                 Line(Fmt("\tif (%s) %s", c.c_str(), Jump(i.addr, i.Target()).c_str()));
@@ -308,9 +368,12 @@ void CodeGen::EmitInsn(const Insn& i) {
 void CodeGen::EmitFallthrough(uint32_t next) {
     if (body_set_.count(next)) {
         labels_.insert(next);
+        Flow(next);
         Line(Fmt("\tgoto loc_%08X;", next));
+        reachable_ = false;
     } else if (an_.functions.count(next)) {
         Line("\t" + TailCall(next));
+        reachable_ = false;
     } else {
         Line(Fmt("\tPPC_SPILL; ppc_trap(ctx, 0x%Xu, \"ran off the decoded code\");", next));
     }
@@ -337,7 +400,10 @@ void CodeGen::CollectLabels(const std::vector<uint32_t>& body) {
 void CodeGen::EmitBody(const std::vector<uint32_t>& body) {
     for (size_t k = 0; k < body.size(); k++) {
         uint32_t va = body[k];
-        if (labels_.count(va)) Line(Fmt("loc_%08X:", va));
+        if (labels_.count(va)) {
+            Line(Fmt("loc_%08X:", va));
+            EnterLabel(va);
+        }
         EmitHooks(va, false);
         Insn i = an_.At(va);
         Line(Fmt("\t// %08X ", va) + ppc::Text(i));
@@ -345,24 +411,55 @@ void CodeGen::EmitBody(const std::vector<uint32_t>& body) {
         EmitHooks(va, true);
         bool next_in_order = k + 1 < body.size() && body[k + 1] == va + 4;
         if (!EndsPath(i) && !next_in_order) EmitFallthrough(va + 4);
+        // a trap is left as running on
+        bool trap = i.op == Op::tw || i.op == Op::twi;
+        if (EndsPath(i) && !trap) reachable_ = false;
     }
 }
 
-std::string CodeGen::EmitFunction(uint32_t entry) {
-    entry_ = entry;
+// one emission of the body with the labels' registers as the pass before found them
+void CodeGen::EmitPass(const std::vector<uint32_t>& body, bool entry_first) {
     used_ = {};
     written_ = {};
+    sync_ = {};
+    reachable_ = true;
+    label_out_.clear();
     body_.clear();
+    if (!entry_first) {
+        Flow(entry_);
+        reachable_ = false;
+    }
+    if (body.empty()) Line(Fmt("\tppc_trap(ctx, 0x%Xu, \"function was not decoded\");", entry_));
+    EmitBody(body);
+}
+
+std::string CodeGen::EmitFunction(uint32_t entry) {
+    constexpr int kMaxPasses = 64;
+    entry_ = entry;
     labels_.clear();
     const std::vector<uint32_t>& body = an_.Body(entry);
     body_set_ = std::set<uint32_t>(body.begin(), body.end());
     CollectLabels(body);
     bool entry_first = !body.empty() && body.front() == entry;
     if (!entry_first) labels_.insert(entry);
-    if (body.empty()) Line(Fmt("\tppc_trap(ctx, 0x%Xu, \"function was not decoded\");", entry));
-    EmitBody(body);
-    std::string out = Fmt("#define PPC_SPILL%s\n#define PPC_RELOAD%s\n", RegisterBlock(true).c_str(),
-                          RegisterBlock(false).c_str());
+    // emitted again until the registers at every label stay as the branches there leave them
+    size_t insn_count = insn_count_;
+    std::map<std::string, size_t> unimpl = unimpl_;
+    label_in_.clear();
+    for (int pass = 0;; pass++) {
+        insn_count_ = insn_count;
+        unimpl_ = unimpl;
+        first_pass_ = pass == 0;
+        EmitPass(body, entry_first);
+        if (label_out_ == label_in_) break;
+        label_in_ = std::move(label_out_);
+        if (pass < kMaxPasses) continue;
+        for (auto& [label, sync] : label_in_) sync.all = true;
+        EmitPass(body, entry_first);
+        break;
+    }
+    std::string out = Fmt("#define PPC_SPILL%s\n#define PPC_RELOAD%s\n", RegisterBlock(written_, true).c_str(),
+                          RegisterBlock(used_, false).c_str());
     out += Fmt("PPC_FUNC(__imp__sub_%08X) {\n", entry);
     out += Declarations();
     if (!entry_first) out += Fmt("\tgoto loc_%08X;\n", entry);

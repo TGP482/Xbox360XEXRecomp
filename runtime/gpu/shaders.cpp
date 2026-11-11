@@ -468,8 +468,13 @@ std::string Translator::Source(const Alu& a, int n, bool force_const) {
         if (reg & 128) s = "abs(" + s + ")";
     } else {
         int slot = n == 1 ? 0 : (n == 2 ? !a.IsReg(1) : !(a.IsReg(1) && a.IsReg(2)));
-        if (a.ConstRel(slot)) s = F("c[(%u + %s) & 255]", reg, a.ConstRelToA0() ? "a0" : "aL");
-        else s = F("c[%u]", reg);
+        if (a.ConstRel(slot)) {
+            s = F("c[(%u + %s) & 255]", reg, a.ConstRelToA0() ? "a0" : "aL");
+            info_.constants[0] = info_.constants[1] = ~0ull;
+        } else {
+            s = F("c[%u]", reg);
+            info_.constants[reg / 128] |= 1ull << (reg / 2 % 64);
+        }
         if (a.AbsConstants()) s = "abs(" + s + ")";
     }
     std::string swizzle = ".";

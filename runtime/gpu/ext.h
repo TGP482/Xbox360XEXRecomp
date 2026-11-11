@@ -97,8 +97,8 @@ public:
     // a texture level decoded for upload
     virtual void Decoded(const xenos::TextureFetch&, uint32_t /*face*/, uint32_t /*level*/,
                          const std::vector<uint8_t>& /*px*/, uint32_t /*pitch*/, uint8_t& /*flags*/) {}
-    // a draw's constants: the vertex registers as uploaded (host order), DrawConstants::ext; src_blend 1 without
-    // blending
+    // a draw's constants: the vertex registers as uploaded (host order, current where the draw's shaders read them),
+    // DrawConstants::ext; src_blend 1 without blending
     virtual void Constants(float (*/*vsc*/)[4], float* /*ext*/, const Target* /*rt*/, uint32_t /*src_blend*/) {}
     // a target with range other than 1 is resolved
     virtual void Resolve(Context&, Target&) {}

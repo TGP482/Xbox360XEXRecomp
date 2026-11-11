@@ -39,6 +39,7 @@ struct ShaderInfo {
     bool kills = false;
     bool memexport = false;  // left out
     uint32_t unknown = 0;    // instructions not understood, translated as zero
+    uint64_t constants[2] = {};  // a bit per two float constants read, all when read relative
 };
 
 struct ShaderOptions {

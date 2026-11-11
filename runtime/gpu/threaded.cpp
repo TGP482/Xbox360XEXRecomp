@@ -40,7 +40,10 @@ constexpr uint32_t kBankAt[kBankCount] = {0, kRegBytes, kRegBytes + kConstBytes,
 constexpr uint32_t kBankTotal = kBankAt[kFetch] + kFetchBytes;
 constexpr uint32_t kBlock = 32;
 static_assert(kBankTotal <= UINT16_MAX && kBoolBytes % kBlock == 0 && kRegBytes == 128 * kBlock);
+static_assert(kConstBytes == 256 * kBlock);
 static_assert(std::is_trivially_copyable_v<State> && offsetof(State, regs) == 0);
+
+constexpr uint64_t kNoConstants[4] = {};  // clears and resolves read none
 
 struct Change {
     uint16_t at;  // in the banks
@@ -92,21 +95,20 @@ const uint8_t* Bank(const State& s, uint32_t b) {
 // the banks of a State in one place, as each side of the queue last saw them
 class Banks {
 public:
-    // the title's side: s's blocks that differ from the last recorded, kept as the new last
-    void Record(const State& s, Command& c) {
+    // the title's side: s's blocks that differ from the last recorded, kept as the new last; of the float constants
+    // only the blocks in consts (a bit each, vertex then pixel), as the renderer reads only what the shaders read
+    void Record(const State& s, Command& c, const uint64_t (&consts)[4]) {
         CopyRest(s, c.state);
         c.banks |= 1u << kRegs;
-        const uint8_t* regs = Bank(s, kRegs);
-        for (uint32_t w = 0; w < 2; w++) {
-            for (uint64_t m = s.kept_regs[w]; m; m &= m - 1) {
-                uint32_t at = (w * 64 + uint32_t(std::countr_zero(m))) * kBlock;
-                Take(regs + at, at, c);
-            }
-        }
+        TakeBlocks(Bank(s, kRegs), kBankAt[kRegs], s.kept_regs, c);
         for (uint32_t b = kConsts; b < kBankCount; b++) {
             const uint8_t* from = Bank(s, b);
             if (!from) continue;
             c.banks |= 1u << b;
+            if (b == kConsts) {
+                TakeBlocks(from, kBankAt[b], consts, c);
+                continue;
+            }
             for (uint32_t i = 0; i < kBankBytes[b]; i += kBlock) Take(from + i, kBankAt[b] + i, c);
         }
     }
@@ -123,6 +125,16 @@ public:
     }
 
 private:
+    // the blocks of a bank with their bit set in mask
+    template <size_t N>
+    void TakeBlocks(const uint8_t* from, uint32_t bank_at, const uint64_t (&mask)[N], Command& c) {
+        for (uint32_t w = 0; w < N; w++) {
+            for (uint64_t m = mask[w]; m; m &= m - 1) {
+                uint32_t at = (w * 64 + uint32_t(std::countr_zero(m))) * kBlock;
+                Take(from + at, bank_at + at, c);
+            }
+        }
+    }
     // the block at in the banks, when it differs from the last recorded
     void Take(const uint8_t* from, uint32_t at, Command& c) {
         uint8_t* last = bytes_ + at;
@@ -288,14 +300,20 @@ public:
     void Draw(const State& s, const DrawArgs& a) override {
         if (!s.vs) return;
         std::unique_ptr<Command> c = New(Op::Draw);
-        recorded_banks_.Record(s, *c);
-        CopyDraw(a, inner_->Info(s.vs).fetches.size(), *c);
+        const ShaderInfo& vs = inner_->Info(s.vs);
+        uint64_t consts[4] = {vs.constants[0], vs.constants[1]};
+        if (s.ps) {
+            consts[2] = inner_->Info(s.ps).constants[0];
+            consts[3] = inner_->Info(s.ps).constants[1];
+        }
+        recorded_banks_.Record(s, *c, consts);
+        CopyDraw(a, vs.fetches.size(), *c);
         Push(std::move(c));
     }
     void Clear(const State& s, uint32_t flags, const float color[4], float z, uint32_t stencil,
                const Rect* rect) override {
         std::unique_ptr<Command> c = New(Op::Clear);
-        recorded_banks_.Record(s, *c);
+        recorded_banks_.Record(s, *c, kNoConstants);
         c->flags = flags;
         std::memcpy(c->color, color, sizeof(c->color));
         c->z = z;
@@ -306,7 +324,7 @@ public:
     }
     void Resolve(const State& s, const ResolveArgs& r) override {
         std::unique_ptr<Command> c = New(Op::Resolve);
-        recorded_banks_.Record(s, *c);
+        recorded_banks_.Record(s, *c, kNoConstants);
         c->resolve = r;
         Push(std::move(c));
     }

@@ -2,6 +2,7 @@
 #include "gpu/compiler.h"
 #include "gpu/ext.h"
 #include "gpu/shaders.h"
+#include "gpu/texturedumper.h"
 #include "gpu/xenos_format.h"
 
 #include <dxgi1_6.h>
@@ -206,6 +207,11 @@ struct Texture {
     uint64_t next_hash = 0;
     uint64_t hashed_for = ~0ull;
     std::atomic<uint32_t> next_state = 0;  // HashState of next_hash
+    // the key the texture pack and the dumps know the bytes by, the texturedumper::Generation it was taken at, and
+    // the pack image drawn in place of the guest's
+    uint64_t pack_key = 0;
+    uint32_t pack_gen = 0;
+    Texture* swap = nullptr;
 };
 
 // who hashes a texture ahead: a pool thread or, when it is wanted first, the render thread
@@ -587,6 +593,11 @@ private:
     void HashAhead();
     uint64_t NextHash(Texture& tex);
     void UploadTexture(Texture& tex, const xenos::TextureFetch& t);
+    void UploadRows(ID3D12Resource* res, uint32_t sub, const std::vector<uint8_t>& rows, uint32_t pitch);
+    void LatchPackKey(Texture& tex, const xenos::TextureFetch& t);
+    void LatchPackImage(Texture& tex);
+    void CreatePackTexture(Texture& r, const texturedumper::Image& img);
+    void ReleasePackTextures();
     D3D12_SAMPLER_DESC SamplerDesc(const TextureBinding& b, const uint32_t fetch[6]) const;
     D3D12_GPU_DESCRIPTOR_HANDLE EnsureSamplers(const std::vector<D3D12_SAMPLER_DESC>& descs);
     uint32_t BindTextures(const State& s, const ShaderInfo& info, ShaderStage stage, uint32_t first, uint32_t slots,
@@ -670,6 +681,7 @@ private:
 
     std::unordered_map<uint64_t, Target> targets_;
     std::unordered_map<uint64_t, Texture> textures_;
+    std::unordered_map<uint64_t, Texture> pack_textures_;  // by pack key, shared by the textures drawing them
     std::unordered_map<std::array<uint32_t, 6>, Texture*, FetchHash> frame_textures_;  // by fetch constant, this frame
     std::vector<Texture*> hash_ahead_;
     std::function<void(size_t)> hash_job_ = [this](size_t i) { TakeHash(*hash_ahead_[i]); };
@@ -1461,9 +1473,72 @@ Texture* D3D12Backend::EnsureTexture(const xenos::TextureFetch& t) {
         if (h != tex.hash) {
             tex.hash = h;
             UploadTexture(tex, t);
+            tex.pack_gen = 0;
         }
     }
+    if (tex.pack_gen != texturedumper::Generation()) LatchPackKey(tex, t);
+    if (tex.pack_key) LatchPackImage(tex);
     return &tex;
+}
+
+// after new bytes or a texture setting change: the name the pack and the dumps know the bytes by
+void D3D12Backend::LatchPackKey(Texture& tex, const xenos::TextureFetch& t) {
+    tex.pack_gen = texturedumper::Generation();
+    tex.swap = nullptr;
+    tex.pack_key = 0;
+    if (!texturedumper::Covers(t, tex.format)) return;
+    std::vector<xenos::Level> levels = xenos::Levels(t);
+    texturedumper::Image img{tex.format, t.width, t.height, std::vector<texturedumper::Level>(1)};
+    xenos::LoadLevel(Guest(0), t, levels[0], 0, img.levels[0].px, img.levels[0].pitch);
+    uint64_t key = texturedumper::Key(t, img.levels[0]);
+    if (texturedumper::WantsDump(key)) {
+        img.levels.resize(levels.size());
+        for (size_t l = 1; l < levels.size(); l++) {
+            xenos::LoadLevel(Guest(0), t, levels[l], 0, img.levels[l].px, img.levels[l].pitch);
+        }
+        texturedumper::Dump(key, std::move(img));
+    }
+    // dumping alone keys the bytes too: the pack image is not drawn then
+    if (texturedumper::Replacing()) tex.pack_key = key;
+}
+
+// the pack image for the texture's bytes once it has loaded; textures with the same bytes share its GPU copy
+void D3D12Backend::LatchPackImage(Texture& tex) {
+    auto it = pack_textures_.find(tex.pack_key);
+    if (it == pack_textures_.end()) {
+        texturedumper::Image img;
+        texturedumper::Lookup got = texturedumper::Take(tex.pack_key, img);
+        if (got == texturedumper::Lookup::Loading) return;
+        if (got == texturedumper::Lookup::None) {
+            tex.pack_key = 0;
+            return;
+        }
+        it = pack_textures_.try_emplace(tex.pack_key).first;
+        CreatePackTexture(it->second, img);
+    }
+    if (it->second.res) tex.swap = &it->second;
+    tex.pack_key = 0;
+}
+
+void D3D12Backend::CreatePackTexture(Texture& r, const texturedumper::Image& img) {
+    r.format = img.format;
+    r.levels = uint32_t(img.levels.size());
+    D3D12_RESOURCE_DESC d = TextureDesc(r.format, img.width, img.height, 1, r.levels);
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    r.state = D3D12_RESOURCE_STATE_COPY_DEST;
+    if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, r.state, nullptr, IID_PPV_ARGS(&r.res)))) {
+        LOGE("texture pack: a %ux%u image could not be made", img.width, img.height);
+        return;
+    }
+    for (uint32_t l = 0; l < r.levels; l++) UploadRows(r.res.Get(), l, img.levels[l].px, img.levels[l].pitch);
+}
+
+// the pack's files changed: each image is made again when next drawn; Generation moved on, so every texture lets go
+// of its old copy before it draws
+void D3D12Backend::ReleasePackTextures() {
+    for (auto& [key, pack] : pack_textures_) CurrentFrame().garbage.push_back(pack.res);
+    pack_textures_.clear();
+    texture_views_.clear();
 }
 
 // a texture's hash ahead, unless another thread took it
@@ -1552,6 +1627,24 @@ void D3D12Backend::UploadTexture(Texture& tex, const xenos::TextureFetch& t) {
     }
 }
 
+// one 2D subresource from host rows
+void D3D12Backend::UploadRows(ID3D12Resource* res, uint32_t sub, const std::vector<uint8_t>& rows, uint32_t pitch) {
+    D3D12_RESOURCE_DESC desc = res->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp;
+    UINT row_count;
+    UINT64 row_size;
+    UINT64 total;
+    dev_->GetCopyableFootprints(&desc, sub, 1, 0, &fp, &row_count, &row_size, &total);
+    Alloc a = Upload(total, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+    CopyRows(rows, pitch, fp, row_count, row_size, 0, a.cpu);
+    fp.Offset = a.offset;
+    D3D12_TEXTURE_COPY_LOCATION dst{res, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+    dst.SubresourceIndex = sub;
+    D3D12_TEXTURE_COPY_LOCATION src{a.res, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+    src.PlacedFootprint = fp;
+    cl_->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+}
+
 // the fetch constant's swizzle numbers components as D3D12's component mapping does: 0 to 3, 4 zero, 5 one
 UINT ComponentMapping(const xenos::TextureFetch& t) {
     return D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(t.swizzle[0], t.swizzle[1], t.swizzle[2], t.swizzle[3]);
@@ -1600,6 +1693,7 @@ void D3D12Backend::FillTextureView(const TextureBinding& b, const uint32_t fetch
         return;
     }
     Texture* tex = FrameTexture(fetch, t);
+    if (tex && tex->swap) tex = tex->swap;
     v.Format = tex ? tex->format : DXGI_FORMAT_R8G8B8A8_UNORM;
     switch (b.dimension) {
         case 2:
@@ -2519,6 +2613,7 @@ void D3D12Backend::Present(const uint32_t front[6]) {
     next.alloc->Reset();
     next.garbage.clear();
     next.used = 0;
+    if (texturedumper::Update()) ReleasePackTextures();
     upload_epoch_++;
     next.views = 0;
     cl_->Reset(next.alloc.Get(), nullptr);

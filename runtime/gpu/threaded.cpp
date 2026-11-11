@@ -16,6 +16,8 @@
 #include <utility>
 #include <vector>
 
+#include <immintrin.h>
+
 #include "gpu/backend.h"
 #include "gpu/xenos_format.h"
 
@@ -52,6 +54,8 @@ struct Change {
 
 // draws and clears wake the render thread once this many wait; every other command wakes it at once
 constexpr size_t kWakeBatch = 32;
+constexpr size_t kRunBatch = 32;  // commands the render thread takes per lock
+constexpr uint32_t kSpins = 4096;  // pauses before a fence wait yields, about what a batch takes
 
 enum class Op { Draw, Clear, Resolve, Copy, Present, BeginQuery, EndQuery, Poll, Signal };
 
@@ -391,16 +395,28 @@ public:
     }
     // queued draws copy what they read now, so the title never waits on the render thread behind it
     void PassSignals() override {
-        std::unique_lock lock(queue_lock_);
-        if (!signal_where_) return;
-        for (std::unique_ptr<Command>& c : queue_) {
-            if (c->op == Op::Draw && c->draw.fenced) Detach(*c);
+        uint32_t* where;
+        uint32_t value;
+        uint64_t reading;
+        {
+            std::lock_guard lock(queue_lock_);
+            if (!signal_where_) return;
+            for (std::unique_ptr<Command>& c : queue_) {
+                if (c->op == Op::Draw && c->draw.fenced) Detach(*c);
+            }
+            where = signal_where_;
+            value = signal_value_;
+            reading = reading_;
         }
-        uint64_t reading = reading_;
-        waiters_++;
-        signaled_.wait(lock, [&] { return ran_ >= reading; });
-        waiters_--;
-        PassFence(signal_where_, signal_value_);
+        // the running batch ends sooner than a sleep and its wake would
+        for (uint32_t spins = 0; ran_.load(std::memory_order_acquire) < reading; spins++) {
+            if (spins < kSpins) {
+                _mm_pause();
+            } else {
+                std::this_thread::yield();
+            }
+        }
+        PassFence(where, value);
     }
 
 private:
@@ -467,32 +483,45 @@ private:
         answers_[slot] = samples;
     }
 
-    // one lock per command: the last one finished, the next one taken
+    // one lock per batch: the last one finished, the next one taken
     void Run() {
-        std::unique_ptr<Command> c;
+        std::vector<std::unique_ptr<Command>> batch;
         for (;;) {
             {
                 std::unique_lock lock(queue_lock_);
-                if (c) Retire(std::move(c));
+                Retire(batch);
                 ready_.wait(lock, [&] { return stop_ || !queue_.empty(); });
                 if (queue_.empty()) return;
-                c = std::move(queue_.front());
-                queue_.pop_front();
-                reading_ = c->op == Op::Draw && c->draw.fenced ? c->seq : 0;
+                Take(batch);
             }
-            Execute(*c);
+            for (std::unique_ptr<Command>& c : batch) {
+                Execute(*c);
+                ran_.store(c->seq, std::memory_order_release);
+            }
+        }
+    }
+
+    // under queue_lock_; a present ends the batch, the title waits on it
+    void Take(std::vector<std::unique_ptr<Command>>& batch) {
+        reading_ = 0;
+        while (batch.size() < kRunBatch && !queue_.empty()) {
+            std::unique_ptr<Command>& c = batch.emplace_back(std::move(queue_.front()));
+            queue_.pop_front();
+            if (c->op == Op::Draw && c->draw.fenced) reading_ = c->seq;
+            if (c->op == Op::Present) break;
         }
     }
 
     // under queue_lock_
-    void Retire(std::unique_ptr<Command> c) {
-        ran_ = c->seq;
-        if (c->op == Op::Present) {
-            presents_++;
-            presented_.notify_all();
+    void Retire(std::vector<std::unique_ptr<Command>>& batch) {
+        for (std::unique_ptr<Command>& c : batch) {
+            if (c->op == Op::Present) {
+                presents_++;
+                presented_.notify_all();
+            }
+            free_.push_back(std::move(c));
         }
-        if (waiters_) signaled_.notify_all();
-        free_.push_back(std::move(c));
+        batch.clear();
     }
 
     std::unique_ptr<Backend> inner_;
@@ -503,7 +532,6 @@ private:
     std::mutex queue_lock_;  // the rest below
     std::condition_variable ready_;
     std::condition_variable presented_;
-    std::condition_variable signaled_;
     std::deque<std::unique_ptr<Command>> queue_;
     std::vector<std::unique_ptr<Command>> free_;
     std::vector<std::unique_ptr<Command>> spare_;  // recording's own, outside the lock
@@ -512,13 +540,12 @@ private:
     uint32_t answers_[kQuerySlots] = {};
     uint64_t polled_[kQuerySlots];  // the EndQuery a queued poll asks about
     uint64_t recorded_ = 0;
-    uint64_t ran_ = 0;
+    std::atomic<uint64_t> ran_{0};
     uint64_t queued_presents_ = 0;
     uint64_t presents_ = 0;
     uint32_t* signal_where_ = nullptr;  // the last Signal's
     uint32_t signal_value_ = 0;
-    uint64_t reading_ = 0;  // the running command when it reads the title's buffers
-    uint32_t waiters_ = 0;  // threads in PassSignals
+    uint64_t reading_ = 0;  // the last command of the running batch that reads the title's buffers
     bool stop_ = false;
 };
 

@@ -265,6 +265,33 @@ struct Alloc {
     D3D12_GPU_VIRTUAL_ADDRESS gpu;
 };
 
+// Fenced draws read guest memory the title leaves alone until a fence past them passes, so what a fenced draw
+// uploaded is used again by later ones until a fence passes or the upload ring starts over (an epoch)
+constexpr size_t kKeptUploads = 4096;  // a power of two
+
+struct KeptVertices {
+    const uint8_t* data = nullptr;
+    uint64_t first = 0;
+    uint64_t end = 0;
+    uint64_t epoch = 0;
+    uint64_t offset = 0;  // in the upload ring
+};
+
+struct KeptIndices {
+    const uint8_t* data = nullptr;
+    uint32_t count = 0;
+    uint32_t format = 0;  // index32, then the endian from bit 1
+    uint64_t epoch = 0;
+    D3D12_GPU_VIRTUAL_ADDRESS gpu = 0;
+    uint32_t min = 0;
+    uint32_t max = 0;
+};
+
+size_t KeptSlot(const void* data, uint64_t a, uint64_t b) {
+    uint64_t h = (uint64_t(reinterpret_cast<uintptr_t>(data)) + a * 31 + b) * 0x9E3779B97F4A7C15ull;
+    return size_t(h >> 52) & (kKeptUploads - 1);
+}
+
 struct Query {
     uint64_t fence = 0;  // submission the result is resolved in, 0 while recording
     bool open = false;
@@ -699,6 +726,10 @@ private:
     std::vector<VertexFetchConstant> stream_consts_;
     std::vector<std::pair<std::pair<const uint8_t*, uint32_t>, uint32_t>> stream_copies_;
     std::vector<D3D12_SAMPLER_DESC> sampler_descs_;
+    std::vector<KeptVertices> kept_vertices_ = std::vector<KeptVertices>(kKeptUploads);
+    std::vector<KeptIndices> kept_indices_ = std::vector<KeptIndices>(kKeptUploads);
+    uint64_t upload_epoch_ = 1;
+    uint64_t draw_fences_ = 0;  // DrawArgs::fences of the last draw
 
     ComPtr<ID3D12QueryHeap> query_heap_;
     ComPtr<ID3D12Resource> query_read_;
@@ -963,6 +994,7 @@ void D3D12Backend::Submit(bool wait) {
     f.alloc->Reset();
     f.garbage.clear();
     f.used = 0;
+    upload_epoch_++;
     f.views = 0;
     cl_->Reset(f.alloc.Get(), nullptr);
     Begin();
@@ -1878,6 +1910,16 @@ IndexRange CopyIndices32(const uint8_t* in, uint32_t count, xenos::Endian e, uin
 
 // the title's indices straight into the upload ring, byte order fixed
 bool D3D12Backend::UploadDirectIndices(const DrawArgs& a, uint32_t& min, uint32_t& max) {
+    uint32_t format = uint32_t(a.index32) | a.index_endian << 1;
+    KeptIndices& kept = kept_indices_[KeptSlot(a.indices, a.count, format)];
+    bool same = kept.epoch == upload_epoch_ && kept.data == a.indices && kept.count == a.count && kept.format == format;
+    if (a.fenced && same) {
+        min = kept.min;
+        max = kept.max;
+        D3D12_INDEX_BUFFER_VIEW v{kept.gpu, UINT(a.count) * 4, DXGI_FORMAT_R32_UINT};
+        cl_->IASetIndexBuffer(&v);
+        return true;
+    }
     Alloc ib = Upload(size_t(a.count) * 4, 4);
     auto* out = reinterpret_cast<uint32_t*>(ib.cpu);
     xenos::Endian e = xenos::Endian(a.index_endian);
@@ -1887,6 +1929,7 @@ bool D3D12Backend::UploadDirectIndices(const DrawArgs& a, uint32_t& min, uint32_
     if (r.min > r.max) return false;
     min = r.min;
     max = r.max;
+    if (a.fenced) kept = {a.indices, a.count, format, upload_epoch_, ib.gpu, min, max};
     D3D12_INDEX_BUFFER_VIEW v{ib.gpu, UINT(a.count) * 4, DXGI_FORMAT_R32_UINT};
     cl_->IASetIndexBuffer(&v);
     return true;
@@ -1980,13 +2023,21 @@ D3D12_GPU_VIRTUAL_ADDRESS D3D12Backend::UploadStreams(const DrawArgs& a, const S
             uint64_t first = std::max<uint64_t>(uint64_t(low) * stride, sf.first);
             uint64_t end = std::min<uint64_t>(uint64_t(high) * stride, sf.size);
             uint64_t bytes = end > first ? end - first : 0;
-            Alloc v = Upload(std::max<uint64_t>(bytes, 16), 16);
-            if (v.res != f.upload.Get()) {
-                static bool logged = false;
-                if (!std::exchange(logged, true)) LOGR("D3D12: vertex data past the upload ring reads as zero");
+            KeptVertices& kept = kept_vertices_[KeptSlot(sf.data, first, end)];
+            bool same = kept.epoch == upload_epoch_ && kept.data == sf.data && kept.first == first && kept.end == end;
+            if (!a.fenced || !same) {
+                Alloc v = Upload(std::max<uint64_t>(bytes, 16), 16);
+                if (v.res != f.upload.Get()) {
+                    static bool logged = false;
+                    if (!std::exchange(logged, true)) LOGR("D3D12: vertex data past the upload ring reads as zero");
+                } else if (a.fenced) {
+                    kept = {sf.data, first, end, upload_epoch_, v.offset};
+                }
+                if (bytes) std::memcpy(v.cpu, sf.data + (first - sf.first), size_t(bytes));
+                copied.emplace_back(key, uint32_t(v.offset - first));
+            } else {
+                copied.emplace_back(key, uint32_t(kept.offset - first));
             }
-            if (bytes) std::memcpy(v.cpu, sf.data + (first - sf.first), size_t(bytes));
-            copied.emplace_back(key, uint32_t(v.offset - first));
             it = copied.end() - 1;
         }
         c.address += it->second;
@@ -2148,6 +2199,10 @@ void D3D12Backend::Draw(const State& s, const DrawArgs& a) {
     uint32_t count = 0;
     uint32_t min = 0;
     uint32_t max = 0;
+    if (a.fences != draw_fences_) {
+        draw_fences_ = a.fences;
+        upload_epoch_++;
+    }
     if (!UploadIndices(a, topo, count, min, max)) return;
     k.topology = TopologyType(topo);
     bool strip = topo == D3D_PRIMITIVE_TOPOLOGY_LINESTRIP || topo == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
@@ -2464,6 +2519,7 @@ void D3D12Backend::Present(const uint32_t front[6]) {
     next.alloc->Reset();
     next.garbage.clear();
     next.used = 0;
+    upload_epoch_++;
     next.views = 0;
     cl_->Reset(next.alloc.Get(), nullptr);
     Begin();

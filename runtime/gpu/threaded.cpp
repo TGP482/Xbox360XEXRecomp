@@ -440,6 +440,7 @@ public:
                 std::this_thread::yield();
             }
         }
+        fences_.fetch_add(1, std::memory_order_release);
         PassFence(where, value);
     }
 
@@ -485,7 +486,10 @@ private:
     void Execute(Command& c) {
         if (c.banks) ran_banks_.Apply(c, state_);
         switch (c.op) {
-            case Op::Draw: inner_->Draw(state_, c.draw); break;
+            case Op::Draw:
+                c.draw.fences = fences_.load(std::memory_order_acquire);
+                inner_->Draw(state_, c.draw);
+                break;
             case Op::Clear:
                 inner_->Clear(state_, c.flags, c.color, c.z, c.stencil, c.has_rect ? &c.rect : nullptr);
                 break;
@@ -495,7 +499,10 @@ private:
             case Op::BeginQuery: inner_->BeginQuery(c.query); break;
             case Op::EndQuery: inner_->EndQuery(c.query); break;
             case Op::Poll: Answer(c); break;
-            case Op::Signal: PassFence(c.where, c.value); break;
+            case Op::Signal:
+                fences_.fetch_add(1, std::memory_order_release);
+                PassFence(c.where, c.value);
+                break;
         }
     }
 
@@ -572,6 +579,7 @@ private:
     uint32_t answers_[kQuerySlots] = {};
     uint64_t polled_[kQuerySlots];  // the EndQuery a queued poll asks about
     std::atomic<uint64_t> ran_{0};
+    std::atomic<uint64_t> fences_{0};  // passed, by either thread
     uint64_t queued_presents_ = 0;
     uint64_t presents_ = 0;
     uint32_t* signal_where_ = nullptr;  // the last Signal's

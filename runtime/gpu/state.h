@@ -103,6 +103,7 @@ struct DrawArgs {
     int32_t base_vertex = 0;
     const StreamFetch* streams = nullptr;  // one per entry of the vertex shader's ShaderInfo::fetches
     bool fenced = false;  // buffers kept until a fence past the draw passes, else rewritten at once
+    uint64_t fences = 0;  // fences passed before the draw ran, as Threaded counts them
 };
 
 // D3DDevice_ClearF flags: a bit per colour target, then depth and stencil

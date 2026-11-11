@@ -568,6 +568,7 @@ private:
     D3D12_RECT HostRect(const Rect& r, float scale) const;
     bool UploadIndices(const DrawArgs& a, D3D12_PRIMITIVE_TOPOLOGY& topo, uint32_t& count, uint32_t& min,
                        uint32_t& max);
+    bool UploadDirectIndices(const DrawArgs& a, uint32_t& min, uint32_t& max);
     D3D12_GPU_VIRTUAL_ADDRESS UploadStreams(const DrawArgs& a, const ShaderInfo& vs, uint32_t min, uint32_t max);
     void BindConstants(const State& s, D3D12_GPU_VIRTUAL_ADDRESS fetch, DrawConstants& c, const Target* rt,
                        uint32_t src_blend);
@@ -1735,9 +1736,89 @@ D3D12_RECT D3D12Backend::HostRect(const Rect& r, float scale) const {
     return {LONG(r.x1 * scale), LONG(r.y1 * scale), LONG(r.x2 * scale), LONG(r.y2 * scale)};
 }
 
+// the topology of a primitive type the host draws as the title gives it; false for the ones made lists
+bool DirectTopology(uint32_t prim, D3D12_PRIMITIVE_TOPOLOGY& topo) {
+    switch (prim) {
+        case kPrimPointList: topo = D3D_PRIMITIVE_TOPOLOGY_POINTLIST; return true;
+        case kPrimLineList: topo = D3D_PRIMITIVE_TOPOLOGY_LINELIST; return true;
+        case kPrimLineStrip: topo = D3D_PRIMITIVE_TOPOLOGY_LINESTRIP; return true;
+        case kPrimTriangleList: topo = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST; return true;
+        case kPrimTriangleStrip: topo = D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP; return true;
+        default: return false;
+    }
+}
+
+struct IndexRange {
+    uint32_t min;
+    uint32_t max;
+};
+
+// 16 bit indices widened, a strip cut as the host's 32 bit one; their range without cuts, in one branch free pass
+IndexRange CopyIndices16(const uint8_t* in, uint32_t count, bool swap, uint32_t* out) {
+    uint16_t lo = 0xFFFF;
+    uint16_t hi = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        uint16_t v;
+        std::memcpy(&v, in + i * 2, 2);
+        v = swap ? __builtin_bswap16(v) : v;
+        bool cut = v == 0xFFFF;
+        lo = std::min(lo, v);
+        hi = std::max(hi, uint16_t(cut ? 0 : v));
+        out[i] = cut ? 0xFFFFFFFFu : v;
+    }
+    return {lo, hi};
+}
+
+template <class Swap>
+IndexRange CopyIndices32(const uint8_t* in, uint32_t count, Swap swap, uint32_t* out) {
+    uint32_t lo = UINT32_MAX;
+    uint32_t hi = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t v;
+        std::memcpy(&v, in + i * 4, 4);
+        v = swap(v);
+        bool cut = v == 0xFFFF || v == 0xFFFFFFFF;
+        lo = std::min(lo, cut ? UINT32_MAX : v);
+        hi = std::max(hi, cut ? 0u : v);
+        out[i] = v;
+    }
+    return {lo, hi};
+}
+
+IndexRange CopyIndices32(const uint8_t* in, uint32_t count, xenos::Endian e, uint32_t* out) {
+    auto swap8in16 = [](uint32_t v) { return (v & 0xFF00FF00u) >> 8 | (v & 0x00FF00FFu) << 8; };
+    auto swap8in32 = [](uint32_t v) { return __builtin_bswap32(v); };
+    auto swap16in32 = [](uint32_t v) { return v >> 16 | v << 16; };
+    auto none = [](uint32_t v) { return v; };
+    switch (e) {
+        case xenos::Endian::Swap8In16: return CopyIndices32(in, count, swap8in16, out);
+        case xenos::Endian::Swap8In32: return CopyIndices32(in, count, swap8in32, out);
+        case xenos::Endian::Swap16In32: return CopyIndices32(in, count, swap16in32, out);
+        default: return CopyIndices32(in, count, none, out);
+    }
+}
+
+// the title's indices straight into the upload ring, byte order fixed
+bool D3D12Backend::UploadDirectIndices(const DrawArgs& a, uint32_t& min, uint32_t& max) {
+    Alloc ib = Upload(size_t(a.count) * 4, 4);
+    auto* out = reinterpret_cast<uint32_t*>(ib.cpu);
+    xenos::Endian e = xenos::Endian(a.index_endian);
+    bool swap16 = e == xenos::Endian::Swap8In16;  // of the swaps only 8 in 16 stays within a 16 bit index
+    IndexRange r = a.index32 ? CopyIndices32(a.indices, a.count, e, out)
+                             : CopyIndices16(a.indices, a.count, swap16, out);
+    if (r.min > r.max) return false;
+    min = r.min;
+    max = r.max;
+    D3D12_INDEX_BUFFER_VIEW v{ib.gpu, UINT(a.count) * 4, DXGI_FORMAT_R32_UINT};
+    cl_->IASetIndexBuffer(&v);
+    return true;
+}
+
 // indices into the upload ring as the host draws them: byte order fixed, fans, quads and loops made lists
 bool D3D12Backend::UploadIndices(const DrawArgs& a, D3D12_PRIMITIVE_TOPOLOGY& topo, uint32_t& count, uint32_t& min,
                                  uint32_t& max) {
+    count = a.count;
+    if (a.indices && DirectTopology(a.prim, topo)) return count && UploadDirectIndices(a, min, max);
     std::vector<uint32_t>& src = index_src_;
     src.resize(a.count);
     if (a.indices && a.index32) {

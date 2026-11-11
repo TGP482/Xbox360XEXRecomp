@@ -45,11 +45,13 @@ uint32_t g_hi = 0;
 // the recompiled code's tables, exported by the game code DLL
 const PPCFuncMapping* g_mappings = nullptr;
 const PPCImport* g_import_list = nullptr;
+PPCFunc* const* g_bodies = nullptr;
 uint32_t g_entry = 0;
 #else
 // the headless harness links them in
 const PPCFuncMapping* g_mappings = PPCFuncMappings;
 const PPCImport* g_import_list = PPCImports;
+PPCFunc* const* g_bodies = PPCBodies;
 uint32_t g_entry = PPCEntryPoint;
 #endif
 
@@ -140,7 +142,8 @@ bool Load(const std::filesystem::path& dll) {
     auto* lo = reinterpret_cast<const uint32_t*>(GetProcAddress(m, "PPCCodeBase"));
     auto* hi = reinterpret_cast<const uint32_t*>(GetProcAddress(m, "PPCCodeEnd"));
     auto* entry = reinterpret_cast<const uint32_t*>(GetProcAddress(m, "PPCEntryPoint"));
-    if (!g_mappings || !g_import_list || !lo || !hi || !entry) return false;
+    g_bodies = reinterpret_cast<PPCFunc* const*>(GetProcAddress(m, "PPCBodies"));
+    if (!g_mappings || !g_import_list || !lo || !hi || !entry || !g_bodies) return false;
     g_lo = *lo;
     g_hi = *hi;
     g_entry = *entry;
@@ -165,6 +168,8 @@ void Init() {
     LOGR("dispatch: %zu functions over %08X..%08X", n, g_lo, g_hi);
     BindImports();
 }
+
+PPCFunc* Body(uint32_t index) { return g_bodies[index]; }
 
 PPCFunc* Find(uint32_t guest) {
     if (!InCode(guest) || (guest & 3)) return nullptr;

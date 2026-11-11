@@ -156,7 +156,14 @@ void CodeGen::WriteMapping(const std::vector<uint32_t>& funcs, const std::vector
         const Function& f = an_.functions.at(thunk);
         s += Fmt("\t{\"%s\", %u},\n", f.library.c_str(), f.ordinal);
     }
-    s += "\t{nullptr, 0},\n};\n";
+    s += "\t{nullptr, 0},\n};\n\n";
+    // each recompiled body in funcs then absent order, which the executable's stubs index (host_bodies.cpp)
+    for (const std::vector<uint32_t>* list : {&funcs, &absent})
+        for (uint32_t f : *list) s += Fmt("PPC_EXTERN_FUNC(__imp__sub_%08X);\n", f);
+    s += "\nPPCFunc* const PPCBodies[] = {\n";
+    for (const std::vector<uint32_t>* list : {&funcs, &absent})
+        for (uint32_t f : *list) s += Fmt("\t__imp__sub_%08X,\n", f);
+    s += "};\n";
     for (uint32_t f : absent) {
         s += Fmt("\nPPC_FUNC(__imp__sub_%08X) { ppc_trap(ctx, 0x%Xu, \"not in this image\"); }\n", f, f);
         s += Fmt("PPC_WEAK_FUNC(sub_%08X, __imp__sub_%08X)\n", f, f);
@@ -164,22 +171,30 @@ void CodeGen::WriteMapping(const std::vector<uint32_t>& funcs, const std::vector
     WriteIfChanged(out_ / "ppc_func_mapping.cpp", s);
 }
 
-// The game code DLL exports its tables and each recompiled body; the executable's import library also takes a
-// function's own name, for the calls it makes where it has no override.
-void CodeGen::WriteDefs(const std::vector<uint32_t>& funcs, const std::vector<uint32_t>& absent) const {
+// The game code DLL exports its tables only: a title can have more functions than a DLL may export (65535).
+void CodeGen::WriteDefs() const {
     std::string library = Fmt("LIBRARY %s\nEXPORTS\n", an_.cfg.library.c_str());
     std::string exports;
-    std::string aliases;
     for (const char* table : {"PPCFuncMappings", "PPCImports", "PPCCodeBase", "PPCCodeEnd", "PPCImageBase",
-                              "PPCImageEnd", "PPCEntryPoint"})
+                              "PPCImageEnd", "PPCEntryPoint", "PPCBodies"})
         exports += Fmt("    %s DATA\n", table);
+    WriteIfChanged(out_ / "exports.def", library + exports);
+    WriteIfChanged(out_ / "imports.def", library + exports);
+}
+
+// The executable's way to a recompiled body: __imp__sub_X calls it through PPCBodies, and sub_X is that body
+// wherever the executable has no override.
+void CodeGen::WriteHostBodies(const std::vector<uint32_t>& funcs, const std::vector<uint32_t>& absent) const {
+    std::string s = "#include \"cpu/dispatch.h\"\n\n";
+    uint32_t index = 0;
     for (const std::vector<uint32_t>* list : {&funcs, &absent})
         for (uint32_t f : *list) {
-            exports += Fmt("    __imp__sub_%08X\n", f);
-            aliases += Fmt("    sub_%08X == __imp__sub_%08X\n", f, f);
+            s += Fmt("extern \"C\" void __imp__sub_%08X(PPCContext& __restrict ctx, uint8_t* base) { "
+                     "dispatch::Body(%u)(ctx, base); }\n",
+                     f, index++);
+            s += Fmt("#pragma comment(linker, \"/alternatename:sub_%08X=__imp__sub_%08X\")\n", f, f);
         }
-    WriteIfChanged(out_ / "exports.def", library + exports);
-    WriteIfChanged(out_ / "imports.def", library + exports + aliases);
+    WriteIfChanged(out_ / "host_bodies.cpp", s);
 }
 
 bool CodeGen::Run() {
@@ -196,7 +211,8 @@ bool CodeGen::Run() {
     WriteShared(funcs, absent);
     WritePartitions(funcs);
     WriteMapping(funcs, absent);
-    WriteDefs(funcs, absent);
+    WriteDefs();
+    WriteHostBodies(funcs, absent);
     std::string stats = Fmt("functions %zu\ninstructions %zu\n", funcs.size(), insn_count_);
     for (auto& [k, v] : unimpl_) stats += Fmt("unimplemented %s %zu\n", k.c_str(), v);
     WriteIfChanged(out_ / "ppc_recomp_stats.txt", stats);

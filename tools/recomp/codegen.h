@@ -102,7 +102,8 @@ private:
     void WriteShared(const std::vector<uint32_t>& funcs, const std::vector<uint32_t>& absent) const;
     void WritePartitions(const std::vector<uint32_t>& funcs);
     void WriteMapping(const std::vector<uint32_t>& funcs, const std::vector<uint32_t>& absent) const;
-    void WriteDefs(const std::vector<uint32_t>& funcs, const std::vector<uint32_t>& absent) const;
+    void WriteDefs() const;
+    void WriteHostBodies(const std::vector<uint32_t>& funcs, const std::vector<uint32_t>& absent) const;
 
     // control flow
     void EmitInsn(const ppc::Insn& i);

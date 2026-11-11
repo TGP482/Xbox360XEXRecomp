@@ -116,8 +116,8 @@ function(add_xex_image target xex config partitions game_dir)
     file(GLOB configs CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/config/*.toml ${XEX_SDK_DIR}/xdk/*/*.toml)
     add_custom_command(
         OUTPUT ${GEN}/codegen.stamp
-        BYPRODUCTS ${GEN_SOURCES} ${GEN}/ppc_recomp_shared.h ${GEN}/image_symbols.h ${GEN}/hook_exports.h
-                   ${GEN}/exports.def ${GEN}/imports.def ${GEN}/code.lib
+        BYPRODUCTS ${GEN_SOURCES} ${GEN}/host_bodies.cpp ${GEN}/ppc_recomp_shared.h ${GEN}/image_symbols.h
+                   ${GEN}/hook_exports.h ${GEN}/exports.def ${GEN}/imports.def ${GEN}/code.lib
         COMMAND xex_recomp config/${config} --xdk ${XEX_SDK_DIR}/xdk
         COMMAND ${XEX_LLVM_BIN}/lld-link.exe /lib /machine:x64 /def:${GEN}/imports.def /out:${GEN}/code.lib
         COMMAND ${CMAKE_COMMAND} -E touch ${GEN}/codegen.stamp
@@ -133,8 +133,10 @@ function(add_xex_image target xex config partitions game_dir)
     file(SHA1 ${xex_file} xex_sha1)
     set(XEX_HASH ${CMAKE_CURRENT_BINARY_DIR}/${target}_xex.cpp)
     file(CONFIGURE OUTPUT ${XEX_HASH} CONTENT "extern const char kImageSha1[] = \"${xex_sha1}\";\n")
+    # the recompiled bodies the executable calls, through the DLL's PPCBodies
+    set_source_files_properties(${GEN}/host_bodies.cpp PROPERTIES GENERATED TRUE)
     add_executable(${target} WIN32 ${XEX_RUNTIME_SOURCES} ${XEX_HOST_SOURCES} ${GAME_SOURCES} ${XEX_IMGUI_SOURCES}
-        ${XEX_HASH})
+        ${XEX_HASH} ${GEN}/host_bodies.cpp)
     add_dependencies(${target} recompile_${target} compiler_files)
     # the import library of what the executable exports to its DLL goes to the compiler folder
     set_target_properties(${target} PROPERTIES ENABLE_EXPORTS ON ARCHIVE_OUTPUT_DIRECTORY ${XEX_COMPILER_DIR})

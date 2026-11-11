@@ -89,7 +89,8 @@ XAM_EXPORT(0x1EA, XamAlloc) {
         if (mem::AllocateVirtual(address, region, mem::kMemCommit | mem::kMemReserve, 4)) address = 0;
     }
     W32(a[2], address);
-    return address ? kErrorSuccess : kNoMemory;
+    if (!address) return kNoMemory;
+    return kErrorSuccess;
 }
 
 XAM_EXPORT(0x1EC, XamFree) {

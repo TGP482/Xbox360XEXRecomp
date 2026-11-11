@@ -89,6 +89,13 @@ constexpr uint32_t kHrPending = 1;  // S_FALSE
 std::recursive_mutex g_lock;
 std::unique_ptr<gpu::Backend> g_backend;
 
+// fences pass as the render thread runs past them where the library's waits on one are known
+#ifdef SUB_D3D_WaitForGpu
+constexpr bool kFencesFollowDraws = true;
+#else
+constexpr bool kFencesFollowDraws = false;
+#endif
+
 // Predicated tiling drawn by the host: every tile is one target, a draw predicated to some tiles is scissored to them
 struct Tiling {
     bool on = false;
@@ -413,11 +420,22 @@ void Draw(uint32_t dev, gpu::DrawArgs& a, uint32_t up_data = 0, uint32_t up_byte
     static std::vector<gpu::StreamFetch> streams;  // kept from draw to draw, under g_lock
     Streams(dev, *vs, up_data, up_bytes, up_stride, streams);
     a.streams = streams.data();
+    a.fenced = kFencesFollowDraws && !up_stride;
     backend->Draw(s, a);
 }
 
 // the library writes its own fences once the device is in the mode that does not wait on a GPU
 void UseCpuFences(uint32_t dev) { W8(dev + kDevGpuFlags, R8(dev + kDevGpuFlags) | kGpuFlagCpuFences); }
+
+// the GPU writes a fence once it ran the commands before it; here the render thread does, in their order
+void PassFence(uint32_t writeback, uint32_t fence) {
+    if (!kFencesFollowDraws || !g_backend) {
+        W32(writeback, fence);
+        return;
+    }
+    std::lock_guard lock(g_lock);
+    g_backend->Signal(static_cast<uint32_t*>(HostPtr(writeback)), __builtin_bswap32(fence));
+}
 
 // D3DCLEAR flags on the bound targets, within rect or the scissor; colour is a guest float4, 0 for black
 [[maybe_unused]] void ClearBound(uint32_t dev, uint32_t flags, uint32_t color, float z, uint32_t stencil,
@@ -738,8 +756,8 @@ HLE_FUNC(D3DDevice_Swap) {
     return 0;
 }
 
-// The library asks for room in its command ring. Nothing reads the ring, so it starts over, and every fence written
-// so far has passed.
+// The library asks for room in its command ring. Nothing reads the ring, so it starts over; the fence its kick writes
+// passes once the commands before it ran.
 HLE_FUNC(D3D_MakeSpace) {
     uint32_t dev = a[0];
     UseCpuFences(dev);
@@ -756,9 +774,18 @@ HLE_FUNC(D3D_MakeSpace) {
     // the fence the library's kick would have written
     if constexpr (XDK_Device_KickFences == 1) W32(dev + kDevFence, R32(dev + kDevFence) + 2);
     uint32_t writeback = R32(dev + kDevWriteback);
-    if (writeback) W32(writeback, R32(dev + kDevFence) - 2);
+    if (writeback) PassFence(writeback, R32(dev + kDevFence) - 2);
     return R32(dev + kDevRingWrite);
 }
+
+#ifdef SUB_D3D_WaitForGpu
+// (wait state): a turn of the library's wait on a fence, which gives up once the GPU looks hung; the render thread
+// passes the fence in turn, so the wait goes on
+HLE_FUNC(D3D_WaitForGpu) {
+    if (g_backend) g_backend->WaitSignal();
+    return 1;
+}
+#endif
 
 // Builds whose library reads the GPU's registers itself (2417): the reads go, the rest is the library's
 

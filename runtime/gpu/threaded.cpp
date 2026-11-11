@@ -1,7 +1,9 @@
 // The title's thread records what it draws and a render thread runs it on the renderer, one frame in flight as the
-// console's back buffer allows. A draw's indices and vertices are copied as recorded, since the title may rewrite them
-// at once, and its registers and constants as the blocks that changed; textures are read when drawn.
+// console's back buffer allows. A draw's indices and vertices are read when it runs where fences keep them, else copied
+// as recorded since the title may rewrite them at once; its registers and constants travel as the blocks that changed;
+// textures are read when drawn.
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstring>
@@ -47,7 +49,7 @@ struct Change {
 // draws and clears wake the render thread once this many wait; every other command wakes it at once
 constexpr size_t kWakeBatch = 32;
 
-enum class Op { Draw, Clear, Resolve, Copy, Present, BeginQuery, EndQuery, Poll };
+enum class Op { Draw, Clear, Resolve, Copy, Present, BeginQuery, EndQuery, Poll, Signal };
 
 struct Command {
     Op op = Op::Draw;
@@ -69,6 +71,8 @@ struct Command {
     uint32_t front[6] = {};
     uint32_t query = 0;
     uint64_t ended = 0;  // Poll: the EndQuery it asks about
+    uint32_t* where = nullptr;  // Signal
+    uint32_t value = 0;
 };
 
 // State's fields after regs
@@ -176,6 +180,9 @@ bool VertexRange(const DrawArgs& a, int64_t& low, int64_t& high) {
 void CopyDraw(const DrawArgs& a, size_t stream_count, Command& c) {
     c.draw = a;
     c.streams.assign(a.streams, a.streams + (a.streams ? stream_count : 0));
+    c.draw.streams = c.streams.empty() ? nullptr : c.streams.data();
+    // read as the draw runs, before the render thread signals a fence past it
+    if (a.fenced) return;
     int64_t low = 0;
     int64_t high = 0;
     bool any = VertexRange(a, low, high);
@@ -220,7 +227,6 @@ void CopyDraw(const DrawArgs& a, size_t stream_count, Command& c) {
         sf.first = span.first;
         sf.size = span.end;
     }
-    c.draw.streams = c.streams.empty() ? nullptr : c.streams.data();
 }
 
 class ThreadedBackend final : public Backend {
@@ -323,6 +329,21 @@ public:
         Push(std::move(c));
         return false;
     }
+    void Signal(uint32_t* where, uint32_t value) override {
+        std::unique_ptr<Command> c = New(Op::Signal);
+        c->where = where;
+        c->value = value;
+        Push(std::move(c));
+    }
+    // the render thread runs on without waiting for a batch
+    void WaitSignal() override {
+        std::unique_lock lock(queue_lock_);
+        uint64_t seen = signals_;
+        waiters_++;
+        ready_.notify_one();
+        signaled_.wait(lock, [&] { return signals_ != seen || ran_ == recorded_; });
+        waiters_--;
+    }
 
 private:
     std::unique_ptr<Command> New(Op op) {
@@ -342,10 +363,10 @@ private:
     }
 
     // a wake per draw costs the title a kernel call each time the render thread caught up; whatever the title may
-    // wait on next (present, resolve, copy, query) wakes it at once
+    // wait on next (present, resolve, copy, query) wakes it at once, a signal once the title waits on it
     uint64_t Push(std::unique_ptr<Command> c) {
         uint64_t seq;
-        bool wake = c->op != Op::Draw && c->op != Op::Clear;
+        bool wake = c->op != Op::Draw && c->op != Op::Clear && c->op != Op::Signal;
         {
             std::lock_guard lock(queue_lock_);
             seq = c->seq = ++recorded_;
@@ -369,6 +390,7 @@ private:
             case Op::BeginQuery: inner_->BeginQuery(c.query); break;
             case Op::EndQuery: inner_->EndQuery(c.query); break;
             case Op::Poll: Answer(c); break;
+            case Op::Signal: std::atomic_ref(*c.where).store(c.value, std::memory_order_release); break;
         }
     }
 
@@ -397,13 +419,18 @@ private:
             }
             Execute(*c);
             bool present = c->op == Op::Present;
+            bool signal = c->op == Op::Signal;
+            bool waited_on;
             {
                 std::lock_guard lock(queue_lock_);
                 ran_ = c->seq;
                 if (present) presents_++;
+                if (signal) signals_++;
+                waited_on = waiters_ && (signal || ran_ == recorded_);
                 free_.push_back(std::move(c));
             }
             if (present) presented_.notify_all();
+            if (waited_on) signaled_.notify_all();
         }
     }
 
@@ -415,6 +442,7 @@ private:
     std::mutex queue_lock_;  // the rest below
     std::condition_variable ready_;
     std::condition_variable presented_;
+    std::condition_variable signaled_;
     std::deque<std::unique_ptr<Command>> queue_;
     std::vector<std::unique_ptr<Command>> free_;
     uint64_t ended_[kQuerySlots] = {};  // the command that ends each query
@@ -425,6 +453,8 @@ private:
     uint64_t ran_ = 0;
     uint64_t queued_presents_ = 0;
     uint64_t presents_ = 0;
+    uint64_t signals_ = 0;
+    uint32_t waiters_ = 0;  // threads in WaitSignal
     bool stop_ = false;
 };
 

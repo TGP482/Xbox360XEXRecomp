@@ -101,6 +101,7 @@ struct DrawArgs {
     uint32_t index_endian = 0;  // xenos::Endian
     int32_t base_vertex = 0;
     const StreamFetch* streams = nullptr;  // one per entry of the vertex shader's ShaderInfo::fetches
+    bool fenced = false;  // buffers kept until a fence past the draw passes, else rewritten at once
 };
 
 // D3DDevice_ClearF flags: a bit per colour target, then depth and stencil

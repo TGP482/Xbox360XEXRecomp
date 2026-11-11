@@ -47,6 +47,7 @@ struct Rect {
 
 struct State {
     uint32_t regs[kRegCount] = {};  // host order, from kRegFirst
+    uint64_t kept_regs[2] = {~0ull, ~0ull};  // a bit per 8 regs the title's D3D keeps; the others stay 0
     // guest memory, big endian: float constants (vertex 256 then pixel 256), bools 8 dwords, loops 32 dwords,
     // fetch constants 32 x 6 dwords
     const uint8_t* consts = nullptr;

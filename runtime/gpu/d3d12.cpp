@@ -247,6 +247,12 @@ struct Frame {
     std::vector<ComPtr<ID3D12Resource>> garbage;
 };
 
+// a draw's render targets as OMSetRenderTargets takes them, 0 for none
+struct TargetViews {
+    SIZE_T rtv[4] = {};
+    SIZE_T dsv = 0;
+};
+
 struct Alloc {
     ID3D12Resource* res;
     uint64_t offset;
@@ -648,6 +654,26 @@ private:
     uint8_t const_last_[kRootCount][kConstBytes] = {};
     D3D12_GPU_VIRTUAL_ADDRESS const_gpu_[kRootCount] = {};
 
+    // what the last draw set on the command list, set again only where a draw differs; Unbind forgets it
+    struct Binds {
+        bool valid = false;
+        TargetViews targets;
+        D3D12_VIEWPORT viewport{};
+        D3D12_RECT scissor{};
+        float blend[4] = {};
+        uint32_t stencil_ref = 0;
+        ID3D12PipelineState* pso = nullptr;
+        D3D12_PRIMITIVE_TOPOLOGY topology{};
+        UINT64 roots[kRootCount] = {};  // constant buffers and sampler tables
+    } binds_;
+    // true where now differs from what the last draw set, which keeps it
+    template <class T>
+    bool Latch(T& last, const T& now) {
+        bool same = binds_.valid && std::memcmp(&last, &now, sizeof(T)) == 0;
+        std::memcpy(&last, &now, sizeof(T));
+        return !same;
+    }
+
     // per draw scratch, kept to save allocations
     std::vector<uint32_t> index_src_;
     std::vector<uint32_t> index_out_;
@@ -903,7 +929,7 @@ void D3D12Backend::Begin() {
     ID3D12DescriptorHeap* heaps[] = {view_heap_.Get(), sampler_heap_.Get()};
     cl_->SetDescriptorHeaps(2, heaps);
     cl_->SetGraphicsRootSignature(root_.Get());
-    std::fill(std::begin(const_gpu_), std::end(const_gpu_), 0);
+    Unbind();
 }
 
 void D3D12Backend::Submit(bool wait) {
@@ -1659,7 +1685,10 @@ bool D3D12Backend::BindTargets(const State& s, const ShaderInfo& ps, PipelineKey
     b.ds = ds;
     b.scale = b.rt ? b.rt->scale : ds->scale;
     D3D12_CPU_DESCRIPTOR_HANDLE dsv = ds ? Dsv(ds->view) : D3D12_CPU_DESCRIPTOR_HANDLE{};
-    cl_->OMSetRenderTargets(count, count ? rtv : nullptr, FALSE, ds ? &dsv : nullptr);
+    TargetViews views;
+    for (uint32_t i = 0; i < count; i++) views.rtv[i] = rtv[i].ptr;
+    views.dsv = dsv.ptr;
+    if (Latch(binds_.targets, views)) cl_->OMSetRenderTargets(count, count ? rtv : nullptr, FALSE, ds ? &dsv : nullptr);
     return true;
 }
 
@@ -1930,7 +1959,7 @@ void D3D12Backend::BindConstants(const State& s, D3D12_GPU_VIRTUAL_ADDRESS fetch
             std::memcpy(const_last_[root], be, bytes);
             const_gpu_[root] = a.gpu;
         }
-        cl_->SetGraphicsRootConstantBufferView(root, const_gpu_[root]);
+        if (Latch(binds_.roots[root], const_gpu_[root])) cl_->SetGraphicsRootConstantBufferView(root, const_gpu_[root]);
     };
     if (ext_) {
         float vsc[256][4];
@@ -1970,8 +1999,12 @@ void D3D12Backend::BindViews(const State& s, const ShaderInfo& vs, const ShaderI
     dev_->CopyDescriptorsSimple(1, ViewCpu(vs_views), CopyView(raw), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     cl_->SetGraphicsRootDescriptorTable(kRootVsViews, ViewGuest(vs_views));
     cl_->SetGraphicsRootDescriptorTable(kRootPsViews, ViewGuest(ps_views));
-    cl_->SetGraphicsRootDescriptorTable(kRootVsSamplers, vs_samplers);
-    cl_->SetGraphicsRootDescriptorTable(kRootPsSamplers, ps_samplers);
+    if (Latch(binds_.roots[kRootVsSamplers], vs_samplers.ptr)) {
+        cl_->SetGraphicsRootDescriptorTable(kRootVsSamplers, vs_samplers);
+    }
+    if (Latch(binds_.roots[kRootPsSamplers], ps_samplers.ptr)) {
+        cl_->SetGraphicsRootDescriptorTable(kRootPsSamplers, ps_samplers);
+    }
 }
 
 D3D12_PRIMITIVE_TOPOLOGY_TYPE TopologyType(D3D12_PRIMITIVE_TOPOLOGY topo) {
@@ -2045,15 +2078,17 @@ void D3D12Backend::Draw(const State& s, const DrawArgs& a) {
     BindConstants(s, UploadStreams(a, vs->info, min, max), c, bound.rt, src_blend);
     D3D12_VIEWPORT vp{0, 0, std::ceil(bound.w * bound.scale), std::ceil(bound.h * bound.scale), 0, 1};
     D3D12_RECT sc = HostRect(GuestScissor(s, bound.w, bound.h), bound.scale);
-    cl_->RSSetViewports(1, &vp);
-    cl_->RSSetScissorRects(1, &sc);
+    if (Latch(binds_.viewport, vp)) cl_->RSSetViewports(1, &vp);
+    if (Latch(binds_.scissor, sc)) cl_->RSSetScissorRects(1, &sc);
     float blend[4];
     for (uint32_t i = 0; i < 4; i++) blend[i] = s.RegF(kRbBlendRed + i);
-    cl_->OMSetBlendFactor(blend);
-    cl_->OMSetStencilRef(Bits(s.Reg(kRbStencilRefMask), 0, 8));
-    cl_->SetPipelineState(pso);
-    cl_->IASetPrimitiveTopology(topo);
+    if (Latch(binds_.blend, blend)) cl_->OMSetBlendFactor(blend);
+    uint32_t stencil_ref = Bits(s.Reg(kRbStencilRefMask), 0, 8);
+    if (Latch(binds_.stencil_ref, stencil_ref)) cl_->OMSetStencilRef(stencil_ref);
+    if (Latch(binds_.pso, pso)) cl_->SetPipelineState(pso);
+    if (Latch(binds_.topology, topo)) cl_->IASetPrimitiveTopology(topo);
     cl_->DrawIndexedInstanced(count, 1, 0, a.base_vertex, 0);
+    binds_.valid = true;
     if (cap_) {
         uint32_t rt = bound.rt ? bound.rt->surface.base : 0;
         uint32_t ds = bound.ds ? bound.ds->surface.base : 0;
@@ -2234,7 +2269,7 @@ void D3D12Backend::CopyResolve(Target& src, Resolved& dst, const ResolveArgs& r)
     cl_->SetGraphicsRootDescriptorTable(kRootPsViews, ViewGuest(views));
     cl_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
     cl_->DrawInstanced(4, 1, 0, 0);
-    const_gpu_[kRootVsConsts] = const_gpu_[kRootPsConsts] = 0;
+    Unbind();
 }
 
 // Present
@@ -2364,7 +2399,10 @@ void D3D12Backend::Present(const uint32_t front[6]) {
 // Extension passes
 
 // the draw state set since is set again by the next draw
-void D3D12Backend::Unbind() { std::fill(std::begin(const_gpu_), std::end(const_gpu_), 0); }
+void D3D12Backend::Unbind() {
+    std::fill(std::begin(const_gpu_), std::end(const_gpu_), 0);
+    binds_ = {};
+}
 
 // a copy of the target to read while drawing to it; a multisampled one is resolved into it
 ID3D12Resource* D3D12Backend::Feedback(Target& t) {

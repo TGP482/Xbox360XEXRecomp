@@ -285,10 +285,15 @@ gpu::Rect SelectedTiles() {
 void ReadRegisters(uint32_t dev, gpu::State& s) {
     constexpr uint32_t kBankRegs = 0x80;
     constexpr uint32_t kBanks = std::size(kDevBanks);
+    constexpr uint32_t kBlockRegs = 8;  // a bit of State::kept_regs
+    s.kept_regs[0] = s.kept_regs[1] = 0;
     for (uint32_t b = 0; b < kBanks; b++) {
         uint32_t count = b + 1 < kBanks ? (kDevBanks[b + 1] - kDevBanks[b]) / 4 : kLastBankRegs;
-        for (uint32_t i = 0; i < count && i < kBankRegs; i++) {
-            s.regs[b * kBankRegs + i] = R32(dev + kDevBanks[b] + i * 4);
+        count = std::min(count, kBankRegs);
+        for (uint32_t i = 0; i < count; i++) s.regs[b * kBankRegs + i] = R32(dev + kDevBanks[b] + i * 4);
+        for (uint32_t i = 0; i < count; i += kBlockRegs) {
+            uint32_t block = (b * kBankRegs + i) / kBlockRegs;
+            s.kept_regs[block / 64] |= 1ull << (block % 64);
         }
     }
     if (g_tiling.on) {
@@ -779,10 +784,10 @@ HLE_FUNC(D3D_MakeSpace) {
 }
 
 #ifdef SUB_D3D_WaitForGpu
-// (wait state): a turn of the library's wait on a fence, which gives up once the GPU looks hung; the render thread
-// passes the fence in turn, so the wait goes on
+// (wait state): a turn of the library's wait on a fence, which gives up once the GPU looks hung; the fence passes
+// now, so the wait goes on to see it
 HLE_FUNC(D3D_WaitForGpu) {
-    if (g_backend) g_backend->WaitSignal();
+    if (g_backend) g_backend->PassSignals();
     return 1;
 }
 #endif

@@ -1,9 +1,10 @@
 // The title's thread records what it draws and a render thread runs it on the renderer, one frame in flight as the
-// console's back buffer allows. A draw's indices and vertices are read when it runs where fences keep them, else copied
-// as recorded since the title may rewrite them at once; its registers and constants travel as the blocks that changed;
-// textures are read when drawn.
+// console's back buffer allows. A draw's indices and vertices are read when it runs where fences keep them, copied when
+// the title waits on a fence before then, else copied as recorded since the title may rewrite them at once; its
+// registers and constants travel as the blocks that changed; textures are read when drawn.
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <condition_variable>
 #include <cstddef>
 #include <cstring>
@@ -38,7 +39,7 @@ constexpr uint32_t kBankAt[kBankCount] = {0, kRegBytes, kRegBytes + kConstBytes,
                                           kRegBytes + kConstBytes + kBoolBytes + kLoopBytes};
 constexpr uint32_t kBankTotal = kBankAt[kFetch] + kFetchBytes;
 constexpr uint32_t kBlock = 32;
-static_assert(kBankTotal <= UINT16_MAX && kBoolBytes % kBlock == 0);
+static_assert(kBankTotal <= UINT16_MAX && kBoolBytes % kBlock == 0 && kRegBytes == 128 * kBlock);
 static_assert(std::is_trivially_copyable_v<State> && offsetof(State, regs) == 0);
 
 struct Change {
@@ -94,18 +95,19 @@ public:
     // the title's side: s's blocks that differ from the last recorded, kept as the new last
     void Record(const State& s, Command& c) {
         CopyRest(s, c.state);
-        for (uint32_t b = 0; b < kBankCount; b++) {
+        c.banks |= 1u << kRegs;
+        const uint8_t* regs = Bank(s, kRegs);
+        for (uint32_t w = 0; w < 2; w++) {
+            for (uint64_t m = s.kept_regs[w]; m; m &= m - 1) {
+                uint32_t at = (w * 64 + uint32_t(std::countr_zero(m))) * kBlock;
+                Take(regs + at, at, c);
+            }
+        }
+        for (uint32_t b = kConsts; b < kBankCount; b++) {
             const uint8_t* from = Bank(s, b);
             if (!from) continue;
             c.banks |= 1u << b;
-            for (uint32_t i = 0; i < kBankBytes[b]; i += kBlock) {
-                uint8_t* last = bytes_ + kBankAt[b] + i;
-                if (std::memcmp(from + i, last, kBlock) == 0) continue;
-                std::memcpy(last, from + i, kBlock);
-                Change& ch = c.changes.emplace_back();
-                ch.at = uint16_t(kBankAt[b] + i);
-                std::memcpy(ch.bytes, last, kBlock);
-            }
+            for (uint32_t i = 0; i < kBankBytes[b]; i += kBlock) Take(from + i, kBankAt[b] + i, c);
         }
     }
     // the render thread's side: c's changes applied, its state in s with the banks pointing here
@@ -121,6 +123,16 @@ public:
     }
 
 private:
+    // the block at in the banks, when it differs from the last recorded
+    void Take(const uint8_t* from, uint32_t at, Command& c) {
+        uint8_t* last = bytes_ + at;
+        if (std::memcmp(from, last, kBlock) == 0) return;
+        std::memcpy(last, from, kBlock);
+        Change& ch = c.changes.emplace_back();
+        ch.at = uint16_t(at);
+        std::memcpy(ch.bytes, last, kBlock);
+    }
+
     alignas(64) uint8_t bytes_[kBankTotal] = {};
 };
 
@@ -229,6 +241,25 @@ void CopyDraw(const DrawArgs& a, size_t stream_count, Command& c) {
     }
 }
 
+// a queued draw's buffers copied into it, as for a draw whose buffers the title may rewrite at once
+void Detach(Command& c) {
+    static thread_local std::vector<StreamFetch> streams;
+    streams = c.streams;
+    DrawArgs a = c.draw;
+    a.streams = streams.empty() ? nullptr : streams.data();
+    a.fenced = false;
+    CopyDraw(a, streams.size(), c);
+}
+
+// a big endian fence stored at where, unless a later one is there already
+void PassFence(uint32_t* where, uint32_t value) {
+    std::atomic_ref<uint32_t> at(*where);
+    uint32_t now = at.load(std::memory_order_relaxed);
+    auto later = [&] { return int32_t(__builtin_bswap32(value) - __builtin_bswap32(now)) > 0; };
+    while (later() && !at.compare_exchange_weak(now, value, std::memory_order_release)) {
+    }
+}
+
 class ThreadedBackend final : public Backend {
 public:
     explicit ThreadedBackend(std::unique_ptr<Backend> inner) : inner_(std::move(inner)) {
@@ -333,16 +364,25 @@ public:
         std::unique_ptr<Command> c = New(Op::Signal);
         c->where = where;
         c->value = value;
+        {
+            std::lock_guard lock(queue_lock_);
+            signal_where_ = where;
+            signal_value_ = value;
+        }
         Push(std::move(c));
     }
-    // the render thread runs on without waiting for a batch
-    void WaitSignal() override {
+    // queued draws copy what they read now, so the title never waits on the render thread behind it
+    void PassSignals() override {
         std::unique_lock lock(queue_lock_);
-        uint64_t seen = signals_;
+        if (!signal_where_) return;
+        for (std::unique_ptr<Command>& c : queue_) {
+            if (c->op == Op::Draw && c->draw.fenced) Detach(*c);
+        }
+        uint64_t reading = reading_;
         waiters_++;
-        ready_.notify_one();
-        signaled_.wait(lock, [&] { return signals_ != seen || ran_ == recorded_; });
+        signaled_.wait(lock, [&] { return ran_ >= reading; });
         waiters_--;
+        PassFence(signal_where_, signal_value_);
     }
 
 private:
@@ -363,7 +403,7 @@ private:
     }
 
     // a wake per draw costs the title a kernel call each time the render thread caught up; whatever the title may
-    // wait on next (present, resolve, copy, query) wakes it at once, a signal once the title waits on it
+    // wait on next (present, resolve, copy, query) wakes it at once
     uint64_t Push(std::unique_ptr<Command> c) {
         uint64_t seq;
         bool wake = c->op != Op::Draw && c->op != Op::Clear && c->op != Op::Signal;
@@ -390,7 +430,7 @@ private:
             case Op::BeginQuery: inner_->BeginQuery(c.query); break;
             case Op::EndQuery: inner_->EndQuery(c.query); break;
             case Op::Poll: Answer(c); break;
-            case Op::Signal: std::atomic_ref(*c.where).store(c.value, std::memory_order_release); break;
+            case Op::Signal: PassFence(c.where, c.value); break;
         }
     }
 
@@ -416,17 +456,16 @@ private:
                 if (queue_.empty()) return;
                 c = std::move(queue_.front());
                 queue_.pop_front();
+                reading_ = c->op == Op::Draw && c->draw.fenced ? c->seq : 0;
             }
             Execute(*c);
             bool present = c->op == Op::Present;
-            bool signal = c->op == Op::Signal;
             bool waited_on;
             {
                 std::lock_guard lock(queue_lock_);
                 ran_ = c->seq;
                 if (present) presents_++;
-                if (signal) signals_++;
-                waited_on = waiters_ && (signal || ran_ == recorded_);
+                waited_on = waiters_ != 0;
                 free_.push_back(std::move(c));
             }
             if (present) presented_.notify_all();
@@ -453,8 +492,10 @@ private:
     uint64_t ran_ = 0;
     uint64_t queued_presents_ = 0;
     uint64_t presents_ = 0;
-    uint64_t signals_ = 0;
-    uint32_t waiters_ = 0;  // threads in WaitSignal
+    uint32_t* signal_where_ = nullptr;  // the last Signal's
+    uint32_t signal_value_ = 0;
+    uint64_t reading_ = 0;  // the running command when it reads the title's buffers
+    uint32_t waiters_ = 0;  // threads in PassSignals
     bool stop_ = false;
 };
 

@@ -32,10 +32,10 @@ public:
     virtual void BeginQuery(uint32_t query) = 0;
     virtual void EndQuery(uint32_t query) = 0;
     virtual bool QueryResult(uint32_t query, uint32_t& samples) = 0;
-    // value stored at where once the commands before have run, as the GPU writes a fence
+    // a big endian fence stored at where once the commands before have run, as the GPU writes one; never lowered
     virtual void Signal(uint32_t* where, uint32_t value) { *where = value; }
-    // a wait on a signal: back once one more is stored or nothing is left to run
-    virtual void WaitSignal() {}
+    // the title waits on a fence: every one signalled so far passes now
+    virtual void PassSignals() {}
 };
 
 std::unique_ptr<Backend> CreateBackend();

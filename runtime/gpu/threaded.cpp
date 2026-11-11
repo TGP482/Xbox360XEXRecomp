@@ -1,13 +1,15 @@
 // The title's thread records what it draws and a render thread runs it on the renderer, one frame in flight as the
-// console's back buffer allows. A draw's constants, indices and vertices are copied as recorded, since the title may
-// rewrite them at once; textures are read when drawn.
+// console's back buffer allows. A draw's indices and vertices are copied as recorded, since the title may rewrite them
+// at once, and its registers and constants as the blocks that changed; textures are read when drawn.
 #include <algorithm>
 #include <condition_variable>
+#include <cstddef>
 #include <cstring>
 #include <deque>
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -26,6 +28,22 @@ constexpr size_t kFetchBytes = 32 * 6 * 4;
 
 constexpr uint64_t kNotEnded = UINT64_MAX;
 
+// a State's banks in one place: regs, then the four from guest memory; they travel as the blocks that changed
+enum : uint32_t { kRegs, kConsts, kBools, kLoops, kFetch, kBankCount };
+constexpr uint32_t kRegBytes = sizeof(State::regs);
+constexpr uint32_t kBankBytes[kBankCount] = {kRegBytes, kConstBytes, kBoolBytes, kLoopBytes, kFetchBytes};
+constexpr uint32_t kBankAt[kBankCount] = {0, kRegBytes, kRegBytes + kConstBytes, kRegBytes + kConstBytes + kBoolBytes,
+                                          kRegBytes + kConstBytes + kBoolBytes + kLoopBytes};
+constexpr uint32_t kBankTotal = kBankAt[kFetch] + kFetchBytes;
+constexpr uint32_t kBlock = 32;
+static_assert(kBankTotal <= UINT16_MAX && kBoolBytes % kBlock == 0);
+static_assert(std::is_trivially_copyable_v<State> && offsetof(State, regs) == 0);
+
+struct Change {
+    uint16_t at;  // in the banks
+    uint8_t bytes[kBlock];
+};
+
 // draws and clears wake the render thread once this many wait; every other command wakes it at once
 constexpr size_t kWakeBatch = 32;
 
@@ -34,11 +52,9 @@ enum class Op { Draw, Clear, Resolve, Copy, Present, BeginQuery, EndQuery };
 struct Command {
     Op op = Op::Draw;
     uint64_t seq = 0;
-    State state;
-    uint8_t consts[kConstBytes];
-    uint8_t bools[kBoolBytes];
-    uint8_t loops[kLoopBytes];
-    uint8_t fetch[kFetchBytes];
+    State state;                  // all but regs and the banks
+    uint32_t banks = 0;           // bit per bank the state has
+    std::vector<Change> changes;  // the banks' blocks that differ from the command before
     DrawArgs draw;
     std::vector<StreamFetch> streams;
     std::vector<uint8_t> data;  // indices, then each stream's vertices
@@ -54,19 +70,54 @@ struct Command {
     uint32_t query = 0;
 };
 
-const uint8_t* CopyBank(const uint8_t* from, uint8_t* to, size_t bytes) {
-    if (!from) return nullptr;
-    std::memcpy(to, from, bytes);
-    return to;
+// State's fields after regs
+void CopyRest(const State& from, State& to) {
+    constexpr size_t kAt = sizeof(State::regs);
+    const uint8_t* rest = reinterpret_cast<const uint8_t*>(&from) + kAt;
+    std::memcpy(reinterpret_cast<uint8_t*>(&to) + kAt, rest, sizeof(State) - kAt);
 }
 
-void CopyState(const State& s, Command& c) {
-    c.state = s;
-    c.state.consts = CopyBank(s.consts, c.consts, kConstBytes);
-    c.state.bools = CopyBank(s.bools, c.bools, kBoolBytes);
-    c.state.loops = CopyBank(s.loops, c.loops, kLoopBytes);
-    c.state.fetch = CopyBank(s.fetch, c.fetch, kFetchBytes);
+const uint8_t* Bank(const State& s, uint32_t b) {
+    const uint8_t* regs = reinterpret_cast<const uint8_t*>(s.regs);
+    const uint8_t* from[kBankCount] = {regs, s.consts, s.bools, s.loops, s.fetch};
+    return from[b];
 }
+
+// the banks of a State in one place, as each side of the queue last saw them
+class Banks {
+public:
+    // the title's side: s's blocks that differ from the last recorded, kept as the new last
+    void Record(const State& s, Command& c) {
+        CopyRest(s, c.state);
+        for (uint32_t b = 0; b < kBankCount; b++) {
+            const uint8_t* from = Bank(s, b);
+            if (!from) continue;
+            c.banks |= 1u << b;
+            for (uint32_t i = 0; i < kBankBytes[b]; i += kBlock) {
+                uint8_t* last = bytes_ + kBankAt[b] + i;
+                if (std::memcmp(from + i, last, kBlock) == 0) continue;
+                std::memcpy(last, from + i, kBlock);
+                Change& ch = c.changes.emplace_back();
+                ch.at = uint16_t(kBankAt[b] + i);
+                std::memcpy(ch.bytes, last, kBlock);
+            }
+        }
+    }
+    // the render thread's side: c's changes applied, its state in s with the banks pointing here
+    void Apply(const Command& c, State& s) {
+        for (const Change& ch : c.changes) std::memcpy(bytes_ + ch.at, ch.bytes, kBlock);
+        CopyRest(c.state, s);
+        std::memcpy(s.regs, bytes_, sizeof(s.regs));
+        const uint8_t** to[kBankCount] = {nullptr, &s.consts, &s.bools, &s.loops, &s.fetch};
+        for (uint32_t b = kConsts; b < kBankCount; b++) {
+            bool carried = c.banks >> b & 1;
+            *to[b] = carried ? bytes_ + kBankAt[b] : nullptr;
+        }
+    }
+
+private:
+    alignas(64) uint8_t bytes_[kBankTotal] = {};
+};
 
 // a 32 bit index in host order; the swaps of xenos::SwapEndian, inline
 uint32_t SwapIndex32(uint32_t v, xenos::Endian e) {
@@ -196,14 +247,14 @@ public:
     void Draw(const State& s, const DrawArgs& a) override {
         if (!s.vs) return;
         std::unique_ptr<Command> c = New(Op::Draw);
-        CopyState(s, *c);
+        recorded_banks_.Record(s, *c);
         CopyDraw(a, inner_->Info(s.vs).fetches.size(), *c);
         Push(std::move(c));
     }
     void Clear(const State& s, uint32_t flags, const float color[4], float z, uint32_t stencil,
                const Rect* rect) override {
         std::unique_ptr<Command> c = New(Op::Clear);
-        CopyState(s, *c);
+        recorded_banks_.Record(s, *c);
         c->flags = flags;
         std::memcpy(c->color, color, sizeof(c->color));
         c->z = z;
@@ -214,7 +265,7 @@ public:
     }
     void Resolve(const State& s, const ResolveArgs& r) override {
         std::unique_ptr<Command> c = New(Op::Resolve);
-        CopyState(s, *c);
+        recorded_banks_.Record(s, *c);
         c->resolve = r;
         Push(std::move(c));
     }
@@ -269,6 +320,8 @@ private:
         }
         if (!c) c = std::make_unique<Command>();
         c->op = op;
+        c->banks = 0;
+        c->changes.clear();
         return c;
     }
 
@@ -288,12 +341,13 @@ private:
     }
 
     void Execute(Command& c) {
+        if (c.banks) ran_banks_.Apply(c, state_);
         switch (c.op) {
-            case Op::Draw: inner_->Draw(c.state, c.draw); break;
+            case Op::Draw: inner_->Draw(state_, c.draw); break;
             case Op::Clear:
-                inner_->Clear(c.state, c.flags, c.color, c.z, c.stencil, c.has_rect ? &c.rect : nullptr);
+                inner_->Clear(state_, c.flags, c.color, c.z, c.stencil, c.has_rect ? &c.rect : nullptr);
                 break;
-            case Op::Resolve: inner_->Resolve(c.state, c.resolve); break;
+            case Op::Resolve: inner_->Resolve(state_, c.resolve); break;
             case Op::Copy: inner_->Copy(c.copy); break;
             case Op::Present: inner_->Present(c.front); break;
             case Op::BeginQuery: inner_->BeginQuery(c.query); break;
@@ -327,6 +381,9 @@ private:
     }
 
     std::unique_ptr<Backend> inner_;
+    Banks recorded_banks_;  // as the title last recorded them
+    Banks ran_banks_;       // as the render thread last ran them, for state_
+    State state_;           // the command running
     std::thread thread_;
     std::mutex run_lock_;    // held while a command runs
     std::mutex queue_lock_;  // the rest below

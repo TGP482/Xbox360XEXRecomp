@@ -10,6 +10,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -166,8 +167,17 @@ struct ShaderEntry {
     std::vector<uint32_t> elements;  // vertex: per fetch, address 0 to 11, usage 12 to 15, usage index 16 to 19
     std::vector<uint32_t> outputs;   // vertex exports or pixel inputs, as Semantic and SemanticReg read them
     int8_t vpos = -1;                // pixel: the register given VPOS
+    uint32_t serial = 0;             // tells apart entries made at the same object
+    // vertex: the pixel shader last linked with it, by serial, and the link
+    uint32_t linked_serial = UINT32_MAX;
+    gpu::ShaderOptions link;
+    // vertex: the declaration last matched to its fetches, its count and element bytes, per fetch its element or -1
+    uint32_t decl = 0;
+    std::vector<uint8_t> decl_bytes;
+    std::vector<int32_t> decl_elements;
 };
 std::unordered_map<uint32_t, ShaderEntry> g_shaders;  // by the library's shader object
+uint32_t g_shader_serial = 0;
 
 std::vector<uint32_t> ReadWords(uint32_t at, uint32_t n) {
     std::vector<uint32_t> v(n);
@@ -220,6 +230,7 @@ void CreateShader(uint32_t container, uint32_t object, bool vertex) {
     if (!object) return;
     std::lock_guard lock(g_lock);
     ShaderEntry e;
+    e.serial = ++g_shader_serial;
     if (!ReadContainer(container, vertex, e)) {
         LOGR("d3d: %s shader container %08X not understood", vertex ? "vertex" : "pixel", container);
         return;
@@ -227,7 +238,7 @@ void CreateShader(uint32_t container, uint32_t object, bool vertex) {
     g_shaders[object] = std::move(e);
 }
 
-const ShaderEntry* FindShader(uint32_t object) {
+ShaderEntry* FindShader(uint32_t object) {
     auto it = g_shaders.find(object);
     return it != g_shaders.end() && it->second.shader ? &it->second : nullptr;
 }
@@ -256,6 +267,16 @@ void Link(const ShaderEntry& vs, const ShaderEntry* ps, gpu::ShaderOptions& link
         taken[spare] = true;
     }
     link.vpos_reg = ps->vpos;
+}
+
+// the link is made again only when the vertex shader meets another pixel shader
+void LinkPair(ShaderEntry& vs, const ShaderEntry* ps, gpu::ShaderOptions& link) {
+    uint32_t serial = ps ? ps->serial : 0;
+    if (vs.linked_serial != serial) {
+        Link(vs, ps, vs.link);
+        vs.linked_serial = serial;
+    }
+    link = vs.link;
 }
 
 // Draw state
@@ -313,17 +334,47 @@ struct DeclElement {
     uint32_t type;  // format 0 to 5, x/y z/w swap 6 (7 clear), signed 8, integer 9, component selects from 10
 };
 
-bool FindElement(uint32_t decl, uint32_t usage, uint32_t index, DeclElement& out) {
-    constexpr uint32_t kElementBytes = 12;
-    if (!decl) return false;
-    uint32_t count = std::min<uint32_t>(R32(decl + XDK_VertexDeclaration_Count), 64);
+constexpr uint32_t kElementBytes = 12;
+
+uint32_t ElementCount(uint32_t decl) { return std::min<uint32_t>(R32(decl + XDK_VertexDeclaration_Count), 64); }
+
+DeclElement ReadElement(uint32_t decl, uint32_t i) {
+    uint32_t el = decl + XDK_VertexDeclaration_Elements + i * kElementBytes;
+    return {R16(el), R16(el + 2), R32(el + 4)};
+}
+
+// the element with this usage and usage index, -1 for none
+int32_t FindElement(uint32_t decl, uint32_t usage, uint32_t index) {
+    uint32_t count = ElementCount(decl);
     for (uint32_t i = 0; i < count; i++) {
         uint32_t el = decl + XDK_VertexDeclaration_Elements + i * kElementBytes;
-        if (R8(el + 9) != usage || R8(el + 10) != index) continue;
-        out = {R16(el), R16(el + 2), R32(el + 4)};
-        return true;
+        if (R8(el + 9) == usage && R8(el + 10) == index) return int32_t(i);
     }
-    return false;
+    return -1;
+}
+
+// the declaration's bytes are the ones last matched to the vertex shader
+bool SameDecl(const ShaderEntry& vs, uint32_t decl) {
+    if (vs.decl != decl || vs.decl_bytes.size() < 4) return false;
+    const void* count = HostPtr(decl + XDK_VertexDeclaration_Count);
+    const void* elements = HostPtr(decl + XDK_VertexDeclaration_Elements);
+    return std::memcmp(vs.decl_bytes.data(), count, 4) == 0 &&
+           std::memcmp(vs.decl_bytes.data() + 4, elements, vs.decl_bytes.size() - 4) == 0;
+}
+
+// each fetch of the vertex shader to the declaration's element for its semantic
+void MatchDecl(ShaderEntry& vs, const gpu::ShaderInfo& info, uint32_t decl) {
+    uint32_t count = ElementCount(decl);
+    vs.decl = decl;
+    vs.decl_bytes.resize(4 + count * kElementBytes);
+    std::memcpy(vs.decl_bytes.data(), HostPtr(decl + XDK_VertexDeclaration_Count), 4);
+    std::memcpy(vs.decl_bytes.data() + 4, HostPtr(decl + XDK_VertexDeclaration_Elements), count * kElementBytes);
+    vs.decl_elements.assign(info.fetches.size(), -1);
+    for (size_t k = 0; k < info.fetches.size(); k++) {
+        auto el = std::find_if(vs.elements.begin(), vs.elements.end(),
+                               [&](uint32_t e) { return (e & 0xFFF) == info.fetches[k].address; });
+        if (el != vs.elements.end()) vs.decl_elements[k] = FindElement(decl, *el >> 12 & 0xF, *el >> 16 & 0xF);
+    }
 }
 
 gpu::VertexFetchConstant FetchFromElement(const DeclElement& el, uint32_t stride) {
@@ -372,19 +423,19 @@ bool TableStream(uint32_t dev, uint32_t stream, gpu::StreamFetch& sf) {
 
 // where each fetch of the vertex shader reads: the declaration's element for its semantic, from that element's
 // stream; up_data and up_stride stand in for stream 0 in DrawVerticesUP and DrawIndexedVerticesUP
-void Streams(uint32_t dev, const ShaderEntry& vs, uint32_t up_data, uint32_t up_bytes, uint32_t up_stride,
+void Streams(uint32_t dev, ShaderEntry& vs, uint32_t up_data, uint32_t up_bytes, uint32_t up_stride,
              std::vector<gpu::StreamFetch>& out) {
     auto bytes = [](uint32_t address) { return static_cast<const uint8_t*>(HostPtr(address)); };
     const gpu::ShaderInfo& info = g_backend->Info(vs.shader);
     uint32_t decl = R32(dev + kDevDecl);
+    if (decl && !SameDecl(vs, decl)) MatchDecl(vs, info, decl);
     out.assign(info.fetches.size(), {});
     for (size_t k = 0; k < info.fetches.size(); k++) {
         gpu::StreamFetch& sf = out[k];
         sf.fetch.swizzle = 0x688;  // x y z w: no element reads 0, 0, 0, 1
-        auto el = std::find_if(vs.elements.begin(), vs.elements.end(),
-                               [&](uint32_t e) { return (e & 0xFFF) == info.fetches[k].address; });
-        DeclElement de;
-        if (el == vs.elements.end() || !FindElement(decl, *el >> 12 & 0xF, *el >> 16 & 0xF, de)) continue;
+        int32_t element = decl ? vs.decl_elements[k] : -1;
+        if (element < 0) continue;
+        DeclElement de = ReadElement(decl, uint32_t(element));
         if (up_stride) {
             sf.data = bytes(up_data);
             sf.size = up_bytes;
@@ -399,7 +450,7 @@ void Streams(uint32_t dev, const ShaderEntry& vs, uint32_t up_data, uint32_t up_
 }
 
 // the state of a draw from the device; false when its shaders are not known
-bool ReadState(uint32_t dev, gpu::State& s, const ShaderEntry*& vs) {
+bool ReadState(uint32_t dev, gpu::State& s, ShaderEntry*& vs) {
     vs = FindShader(R32(dev + kDevVertexShader));
     if (!vs) return false;
     const ShaderEntry* ps = FindShader(R32(dev + kDevPixelShader));
@@ -410,7 +461,7 @@ bool ReadState(uint32_t dev, gpu::State& s, const ShaderEntry*& vs) {
     s.fetch = static_cast<const uint8_t*>(HostPtr(dev + kDevFetch));
     s.vs = vs->shader;
     s.ps = ps ? ps->shader : nullptr;
-    Link(*vs, ps, s.link);
+    LinkPair(*vs, ps, s.link);
     return true;
 }
 
@@ -418,7 +469,7 @@ void Draw(uint32_t dev, gpu::DrawArgs& a, uint32_t up_data = 0, uint32_t up_byte
     std::lock_guard lock(g_lock);
     gpu::Backend* backend = Backend();
     static gpu::State s;  // kept from draw to draw, under g_lock: its 4 KB of registers are cleared once
-    const ShaderEntry* vs = nullptr;
+    ShaderEntry* vs = nullptr;
     if (!ReadState(dev, s, vs)) return;
     static std::vector<gpu::StreamFetch> streams;  // kept from draw to draw, under g_lock
     Streams(dev, *vs, up_data, up_bytes, up_stride, streams);

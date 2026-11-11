@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -15,8 +16,10 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -193,7 +196,17 @@ struct Texture {
     uint64_t hash = 0;
     uint64_t checked = ~0ull;  // present it was last hashed in
     uint8_t flags = 0;         // Extension::Decoded's
+    // the guest bytes it covers, hashed ahead for the present in hashed_for
+    xenos::TextureFetch guest;
+    std::vector<xenos::Level> guest_levels;
+    uint64_t next_hash = 0;
+    uint64_t hashed_for = ~0ull;
+    std::atomic<uint32_t> next_state = 0;  // HashState of next_hash
 };
+
+// who hashes a texture ahead: a pool thread or, when it is wanted first, the render thread
+enum HashState : uint32_t { kHashWaiting, kHashTaken, kHashDone };
+void TakeHash(Texture& tex);
 
 // a resolve's copy, read in place of the guest texture at its address
 struct Resolved {
@@ -355,6 +368,80 @@ void WriteBmp(const std::filesystem::path& path, uint32_t w, uint32_t h, const s
     f.write(reinterpret_cast<const char*>(bgra.data()), std::streamsize(bgra.size()));
 }
 
+// runs a job over an index range on the workers, with the caller (Run) or in the background (Start, then Wait)
+class WorkPool {
+public:
+    WorkPool() {
+        uint32_t workers = std::max(1u, std::thread::hardware_concurrency() / 2) - 1;
+        for (uint32_t i = 0; i < workers; i++) threads_.emplace_back([this] { Work(); });
+    }
+    ~WorkPool() {
+        {
+            std::lock_guard lock(lock_);
+            stop_ = true;
+        }
+        wake_.notify_all();
+        for (std::thread& t : threads_) t.join();
+    }
+
+    size_t Workers() const { return threads_.size(); }
+
+    void Run(size_t count, const std::function<void(size_t)>& job) {
+        Start(count, job);
+        Take();
+        Wait();
+    }
+    // job lives until Wait returns
+    void Start(size_t count, const std::function<void(size_t)>& job) {
+        Wait();
+        if (!count) return;
+        {
+            std::lock_guard lock(lock_);
+            job_ = &job;
+            count_ = count;
+            next_ = 0;
+            busy_ = threads_.size();
+            generation_++;
+        }
+        wake_.notify_all();
+    }
+    void Wait() {
+        std::unique_lock lock(lock_);
+        done_.wait(lock, [&] { return busy_ == 0; });
+    }
+
+private:
+    void Take() {
+        for (size_t i = next_++; i < count_; i = next_++) (*job_)(i);
+    }
+
+    void Work() {
+        uint64_t seen = 0;
+        for (;;) {
+            {
+                std::unique_lock lock(lock_);
+                wake_.wait(lock, [&] { return stop_ || generation_ != seen; });
+                if (stop_) return;
+                seen = generation_;
+            }
+            Take();
+            std::lock_guard lock(lock_);
+            if (--busy_ == 0) done_.notify_one();
+        }
+    }
+
+    std::vector<std::thread> threads_;
+    std::mutex lock_;
+    std::condition_variable wake_;
+    std::condition_variable done_;
+    const std::function<void(size_t)>* job_ = nullptr;
+    size_t count_ = 0;
+    std::atomic<size_t> next_ = 0;
+    size_t busy_ = 0;
+    uint64_t generation_ = 0;
+    bool stop_ = false;
+};
+
 // a texture view as the draw needs it; Texture pointers live as long as the backend
 struct ViewKey {
     const Texture* tex = nullptr;
@@ -457,6 +544,8 @@ private:
                          ShaderStage stage, uint32_t slot);
     Texture* EnsureTexture(const xenos::TextureFetch& t);
     Texture* FrameTexture(const uint32_t fetch[6], const xenos::TextureFetch& t);
+    void HashAhead();
+    uint64_t NextHash(Texture& tex);
     void UploadTexture(Texture& tex, const xenos::TextureFetch& t);
     D3D12_SAMPLER_DESC SamplerDesc(const TextureBinding& b, const uint32_t fetch[6]) const;
     D3D12_GPU_DESCRIPTOR_HANDLE EnsureSamplers(const std::vector<D3D12_SAMPLER_DESC>& descs);
@@ -540,6 +629,9 @@ private:
     std::unordered_map<uint64_t, Target> targets_;
     std::unordered_map<uint64_t, Texture> textures_;
     std::unordered_map<std::array<uint32_t, 6>, Texture*, FetchHash> frame_textures_;  // by fetch constant, this frame
+    std::vector<Texture*> hash_ahead_;
+    std::function<void(size_t)> hash_job_ = [this](size_t i) { TakeHash(*hash_ahead_[i]); };
+    WorkPool pool_;  // after what its jobs use, so it stops first
     std::unordered_map<uint64_t, Resolved> resolved_;  // by ResolvedKey
     std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> pass_pipelines_;
     std::vector<std::unique_ptr<Shader>> shaders_;
@@ -1265,16 +1357,47 @@ Texture* D3D12Backend::EnsureTexture(const xenos::TextureFetch& t) {
             return nullptr;
         }
         tex.checked = ~0ull;
+        tex.guest = t;
+        tex.guest_levels = levels;
     }
     if (tex.checked != presents_) {
         tex.checked = presents_;
-        uint64_t h = GuestHash(t, levels);
+        uint64_t h = tex.hashed_for == presents_ ? NextHash(tex) : GuestHash(t, levels);
         if (h != tex.hash) {
             tex.hash = h;
             UploadTexture(tex, t);
         }
     }
     return &tex;
+}
+
+// a texture's hash ahead, unless another thread took it
+void TakeHash(Texture& tex) {
+    uint32_t waiting = kHashWaiting;
+    if (!tex.next_state.compare_exchange_strong(waiting, kHashTaken)) return;
+    tex.next_hash = GuestHash(tex.guest, tex.guest_levels);
+    tex.next_state.store(kHashDone, std::memory_order_release);
+}
+
+// the hash ahead of a texture the render thread wants now: hashed here, or waited for if a pool thread is on it
+uint64_t D3D12Backend::NextHash(Texture& tex) {
+    TakeHash(tex);
+    while (tex.next_state.load(std::memory_order_acquire) != kHashDone) std::this_thread::yield();
+    return tex.next_hash;
+}
+
+// the textures this frame bound are hashed for the next on the pool threads while the render thread goes on, as
+// most are bound again
+void D3D12Backend::HashAhead() {
+    pool_.Wait();
+    hash_ahead_.clear();
+    for (auto& [fetch, tex] : frame_textures_) {
+        if (!tex || tex->hashed_for == presents_) continue;
+        tex->hashed_for = presents_;
+        tex->next_state.store(kHashWaiting, std::memory_order_relaxed);
+        hash_ahead_.push_back(tex);
+    }
+    pool_.Start(hash_ahead_.size(), hash_job_);
 }
 
 // EnsureTexture once per fetch constant and frame
@@ -2129,6 +2252,7 @@ void D3D12Backend::Present(const uint32_t front[6]) {
     g_perf.upload_bytes += CurrentFrame().used;
     presents_++;
     frame_++;
+    HashAhead();
     frame_textures_.clear();
     Frame& next = CurrentFrame();
     WaitFence(next.fence);

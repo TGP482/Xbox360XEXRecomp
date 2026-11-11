@@ -118,9 +118,13 @@ public:
     }
     // the render thread's side: c's changes applied, its state in s with the banks pointing here
     void Apply(const Command& c, State& s) {
-        for (const Change& ch : c.changes) std::memcpy(bytes_ + ch.at, ch.bytes, kBlock);
+        // s is the state the command before left: of its registers only the changed blocks are copied
+        uint8_t* regs = reinterpret_cast<uint8_t*>(s.regs);
+        for (const Change& ch : c.changes) {
+            std::memcpy(bytes_ + ch.at, ch.bytes, kBlock);
+            if (ch.at < sizeof(s.regs)) std::memcpy(regs + ch.at, ch.bytes, kBlock);
+        }
         CopyRest(c.state, s);
-        std::memcpy(s.regs, bytes_, sizeof(s.regs));
         const uint8_t** to[kBankCount] = {nullptr, &s.consts, &s.bools, &s.loops, &s.fetch};
         for (uint32_t b = kConsts; b < kBankCount; b++) {
             bool carried = c.banks >> b & 1;

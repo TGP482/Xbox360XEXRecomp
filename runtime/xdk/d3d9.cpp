@@ -237,7 +237,7 @@ const ShaderEntry* FindShader(uint32_t object) {
 void Link(const ShaderEntry& vs, const ShaderEntry* ps, gpu::ShaderOptions& link) {
     bool taken[16] = {};
     bool linked[16] = {};
-    for (uint32_t i = 0; i < 16; i++) link.export_map[i] = uint8_t(i);
+    link = {};
     if (!ps) return;
     size_t next = 0;
     for (uint32_t in : ps->outputs) {
@@ -296,11 +296,9 @@ void ReadRegisters(uint32_t dev, gpu::State& s) {
             s.kept_regs[block / 64] |= 1ull << (block % 64);
         }
     }
-    if (g_tiling.on) {
-        s.tiled_width = uint32_t(g_tiling.extent.x2);
-        s.tiled_height = uint32_t(g_tiling.extent.y2);
-        s.predicated = SelectedTiles();
-    }
+    s.tiled_width = g_tiling.on ? uint32_t(g_tiling.extent.x2) : 0;
+    s.tiled_height = g_tiling.on ? uint32_t(g_tiling.extent.y2) : 0;
+    s.predicated = g_tiling.on ? SelectedTiles() : gpu::Rect{};
     if constexpr (kDevClipPlanes != xdk::kUnknown) {
         for (uint32_t i = 0; i < 6; i++) {
             for (uint32_t k = 0; k < 4; k++) s.clip_planes[i][k] = GF(dev + kDevClipPlanes + (i * 4 + k) * 4);
@@ -419,7 +417,7 @@ bool ReadState(uint32_t dev, gpu::State& s, const ShaderEntry*& vs) {
 void Draw(uint32_t dev, gpu::DrawArgs& a, uint32_t up_data = 0, uint32_t up_bytes = 0, uint32_t up_stride = 0) {
     std::lock_guard lock(g_lock);
     gpu::Backend* backend = Backend();
-    gpu::State s;
+    static gpu::State s;  // kept from draw to draw, under g_lock: its 4 KB of registers are cleared once
     const ShaderEntry* vs = nullptr;
     if (!ReadState(dev, s, vs)) return;
     static std::vector<gpu::StreamFetch> streams;  // kept from draw to draw, under g_lock

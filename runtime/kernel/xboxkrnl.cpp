@@ -741,4 +741,11 @@ KERNEL_EXPORT(0x194, XexCheckExecutablePrivilege) {
     return 0;
 }
 
+// (config out): the host mixes the console's 5.1 master and folds it to the device, so the output is digital 5.1
+KERNEL_EXPORT(0x1FF, XAudioGetSpeakerConfig) {
+    constexpr uint32_t kDolbyDigital = 0x10000;  // XAUDIOSPEAKERCONFIG_DIGITAL_DOLBYDIGITAL
+    if (a[0]) W32(a[0], kDolbyDigital);
+    return kSuccess;
+}
+
 }  // namespace kernel

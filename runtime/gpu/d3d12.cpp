@@ -14,6 +14,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <map>
 #include <string>
 #include <unordered_map>
@@ -522,6 +523,7 @@ private:
     uint32_t samplers_used_ = 0;
     ComPtr<ID3D12PipelineLibrary> library_;
     bool library_dirty_ = false;
+    std::future<void> saving_;  // the library being written out
 
     // the last constant blocks bound, skipped when unchanged
     uint64_t const_hash_[kRootCount] = {};
@@ -540,6 +542,7 @@ private:
 D3D12Backend::~D3D12Backend() {
     if (!dev_) return;
     Submit(true);
+    if (saving_.valid()) saving_.wait();
     SavePipelineLibrary();
     ImGui_ImplDX12_Shutdown();
     if (event_) CloseHandle(event_);
@@ -729,15 +732,27 @@ void D3D12Backend::LoadPipelineLibrary() {
     }
 }
 
+// written on its own thread, as the pipeline library is thread safe; one save at a time
 void D3D12Backend::SavePipelineLibrary() {
+    using namespace std::chrono_literals;
     if (!library_ || !library_dirty_) return;
-    std::vector<char> blob(library_->GetSerializedSize());
-    if (FAILED(library_->Serialize(blob.data(), blob.size()))) return;
-    std::error_code ec;
-    std::filesystem::create_directories(PipelineLibraryPath().parent_path(), ec);
-    std::ofstream f(PipelineLibraryPath(), std::ios::binary);
-    f.write(blob.data(), std::streamsize(blob.size()));
+    if (saving_.valid() && saving_.wait_for(0s) != std::future_status::ready) return;
     library_dirty_ = false;
+    saving_ = std::async(std::launch::async, [library = library_] {
+        std::vector<char> blob(library->GetSerializedSize());
+        if (FAILED(library->Serialize(blob.data(), blob.size()))) return;
+        std::filesystem::path path = PipelineLibraryPath();
+        std::filesystem::path part = path;
+        part += ".part";
+        std::error_code ec;
+        std::filesystem::create_directories(path.parent_path(), ec);
+        {
+            std::ofstream f(part, std::ios::binary);
+            if (!f.write(blob.data(), std::streamsize(blob.size()))) return;
+        }
+        // an exit mid save keeps the last whole file
+        std::filesystem::rename(part, path, ec);
+    });
 }
 
 void D3D12Backend::Begin() {

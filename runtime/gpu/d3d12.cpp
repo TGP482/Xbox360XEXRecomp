@@ -583,7 +583,7 @@ private:
     void FillPipelineDesc(const PipelineKey& k, D3D12_GRAPHICS_PIPELINE_STATE_DESC& d) const;
     ID3D12PipelineState* EnsureResolvePipeline(DXGI_FORMAT rtv, bool ms);
     uint32_t Samples(uint32_t want);
-    uint32_t HostSamples(uint32_t title) const { return title > 1 && msaa_ ? msaa_ : title; }
+    uint32_t HostSamples(uint32_t title) const { return title > 1 ? msaa_ : title; }
 
     // textures
     Resolved* FindResolved(const xenos::TextureFetch& t, const TextureBinding& b, ShaderStage stage, uint32_t slot);
@@ -679,7 +679,7 @@ private:
     uint32_t swap_w_ = 0, swap_h_ = 0;
     uint32_t guest_w_ = 0, guest_h_ = 0;
     float scale_ = 1;
-    uint32_t msaa_ = 0;      // host samples of the title's multisampled targets, 0 the title's
+    uint32_t msaa_ = 1;      // host samples of the title's multisampled targets
     uint32_t msaa_set_ = 0;  // app::Settings::msaa they came from
     Extension* ext_ = nullptr;
 
@@ -1182,14 +1182,13 @@ Target* D3D12Backend::EnsureTarget(const Surface& sf, bool depth, uint32_t width
     return &t;
 }
 
-// want samples, fewer until the GPU has them for every target format; 0 stays 0, the title's
+// want samples, fewer until the GPU has them for every target format; 0 is 1
 uint32_t D3D12Backend::Samples(uint32_t want) {
     static constexpr DXGI_FORMAT kFormats[] = {
         DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R10G10B10A2_UNORM,
         DXGI_FORMAT_R16G16_FLOAT,   DXGI_FORMAT_R16G16B16A16_FLOAT,  DXGI_FORMAT_R32_FLOAT,
         DXGI_FORMAT_R32G32_FLOAT,   DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
     };
-    if (!want) return 0;
     uint32_t n = std::clamp(want, 1u, 8u);
     auto has = [&](DXGI_FORMAT f) {
         D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS q{f, n};
@@ -1758,7 +1757,8 @@ D3D12_SAMPLER_DESC D3D12Backend::SamplerDesc(const TextureBinding& b, const uint
     uint32_t min = b.min != kFilterFromFetch ? b.min : t.min_filter;
     uint32_t mip = b.mip != kFilterFromFetch ? b.mip : t.mip_filter;
     uint32_t aniso = b.aniso != kAnisoFromFetch ? b.aniso : t.aniso;
-    if (app::Get().aniso) aniso = std::min<uint32_t>(std::bit_width(app::Get().aniso), 5);
+    // the setting replaces the title's: 0 off, else 2 to 16 as a level of 2 to 5
+    aniso = std::min<uint32_t>(std::bit_width(std::max(app::Get().aniso, 1u)), 5);
     D3D12_SAMPLER_DESC d{};
     if (aniso > 1) {
         d.Filter = D3D12_FILTER_ANISOTROPIC;
@@ -2357,6 +2357,15 @@ void D3D12Backend::Draw(const State& s, const DrawArgs& a) {
         std::fprintf(cap_, "%04u draw prim %u count %u into %ux%u rt %u ds %u vs %016llx ps %016llx\n", cap_i_++,
                      a.prim, count, bound.w, bound.h, rt, ds, static_cast<unsigned long long>(k.vs),
                      static_cast<unsigned long long>(k.ps));
+        // what each pixel shader fetch reads: a resolve, or guest memory
+        for (uint32_t i = 0; i < ps_info.textures.size(); i++) {
+            uint32_t fetch[6];
+            ReadFetch(s, ps_info.textures[i].fetch, fetch);
+            xenos::TextureFetch t = xenos::DecodeTextureFetch(fetch);
+            bool resolve = FindResolved(t, ps_info.textures[i], ShaderStage::Pixel, i) != nullptr;
+            std::fprintf(cap_, "     tex %u at %08X format %u %ux%u%s\n", i, t.base, uint32_t(t.format), t.width,
+                         t.height, resolve ? " resolve" : "");
+        }
     }
 }
 

@@ -22,8 +22,8 @@ struct Settings {
     uint32_t render_percent = 100;   // of the output height
     uint32_t fps_cap = 60;           // 0 unlimited, kFpsCapRefresh the monitor's refresh rate
     bool vsync = true;
-    uint32_t aniso = 0;              // 0 as the game asks
-    uint32_t msaa = 0;               // samples of the title's multisampled targets, 0 as the game asks
+    uint32_t aniso = 0;              // forced on every texture in place of the game's, 0 off
+    uint32_t msaa = 0;               // samples of the title's multisampled targets, 0 off
     bool custom_textures = true;     // images in textures\replacement\ beside the exe replace the game's
     bool dump_textures = false;      // each texture once into textures\dumps\ beside the exe
     uint32_t texture_dump_format = 0;  // 0 PNG, 1 DDS

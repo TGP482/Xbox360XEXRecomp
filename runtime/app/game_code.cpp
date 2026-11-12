@@ -93,9 +93,15 @@ HWND g_window = nullptr;
 bool g_start = false;  // the player picked Start once the game was ready
 bool g_delete_compiler = false;  // ticked on the ready page
 Palette g_colours;
-POINT g_mouse{-1, -1};  // in the client area, -1 once it left
-float g_hover_start = 0;  // 0 to 1, fading towards whether the pointer is over the button
-float g_hover_exit = 0;
+// how lit each ready page control is, 0 to 1, fading with the cursor over it
+struct Glow {
+    float start = 0;
+    float exit = 0;
+    float toggle = 0;
+};
+Glow g_glow;
+bool g_pad = false;  // a controller is connected, so the labels name its buttons
+constexpr float kFadeMs = 120.0f;
 uint64_t g_compiler_bytes = 0;
 constexpr UINT kBuildDone = WM_APP + 1;
 
@@ -524,28 +530,28 @@ Layout Arrange(const RECT& client, int unit) {
     return l;
 }
 
-// a button's text, with the controller button that presses it while a controller is plugged in
-std::wstring Label(const wchar_t* text, const wchar_t* button) {
-    return input::AnyConnected() ? std::wstring(text) + L" (" + button + L")" : std::wstring(text);
+// the controller button that presses a control, shown only with a controller connected
+std::wstring Label(const std::wstring& text, const wchar_t* button) {
+    return g_pad ? text + L" (" + button + L")" : text;
 }
 
-// the ready page's buttons, lighter while the pointer is over them
+void PaintButton(HDC dc, const RECT& box, const std::wstring& text, float glow) {
+    FillBox(dc, box, Blend(g_colours.bar_empty, g_colours.bar_full, glow));
+    DrawLine(dc, box, text, Blend(g_colours.text, g_colours.background, glow), DT_CENTER);
+}
+
 void PaintChoices(HDC dc, const Layout& l, int unit) {
-    constexpr float kHoverLight = 0.3f;
-    FillBox(dc, l.start, Blend(g_colours.bar_full, g_colours.text, g_hover_start * kHoverLight));
-    DrawLine(dc, l.start, Label(L"Start", L"A"), g_colours.background, DT_CENTER);
-    FillBox(dc, l.exit, Blend(g_colours.bar_empty, g_colours.bar_full, g_hover_exit * kHoverLight));
-    DrawLine(dc, l.exit, Label(L"Exit", L"B"), g_colours.text, DT_CENTER);
+    PaintButton(dc, l.start, Label(L"Start", L"A"), g_glow.start);
+    PaintButton(dc, l.exit, Label(L"Exit", L"B"), g_glow.exit);
     int middle = (l.delete_toggle.top + l.delete_toggle.bottom) / 2;
     RECT box{l.delete_toggle.left, middle - unit / 2, l.delete_toggle.left + unit, middle + unit / 2};
-    FillBox(dc, box, g_colours.bar_empty);
-    if (g_delete_compiler) InflateRect(&box, -unit / 4, -unit / 4);
-    if (g_delete_compiler) FillBox(dc, box, g_colours.bar_full);
+    FillBox(dc, box, Blend(g_colours.bar_empty, g_colours.bar_full, g_glow.toggle));
+    InflateRect(&box, -unit / 4, -unit / 4);
+    if (g_delete_compiler) FillBox(dc, box, Blend(g_colours.bar_full, g_colours.background, g_glow.toggle));
     RECT label = l.delete_toggle;
     label.left += unit * 3 / 2;
     std::wstring megabytes = std::to_wstring(g_compiler_bytes >> 20);
-    DrawLine(dc, label, Label((L"Delete the compiler files, " + megabytes + L" MB").c_str(), L"X"), g_colours.text,
-             DT_LEFT);
+    DrawLine(dc, label, Label(L"Delete the compiler files, " + megabytes + L" MB", L"X"), g_colours.text, DT_LEFT);
 }
 
 void Paint(HDC dc, const RECT& client, int unit) {
@@ -625,19 +631,27 @@ void OnClick(HWND hwnd, LPARAM lp) {
     else if (PtInRect(&l.delete_toggle, at)) g_delete_compiler = !g_delete_compiler;
 }
 
-// each timer tick moves a button's highlight a step towards whether the pointer is over it
-void FadeHover(HWND hwnd) {
-    constexpr float kStep = 0.25f;
+float Approach(float glow, bool lit, float step) {
+    return lit ? std::min(glow + step, 1.0f) : std::max(glow - step, 0.0f);
+}
+
+// read with each repaint: the cursor, so leaving the window or another window over it unlights too, and controllers
+void UpdateReadyPage(HWND hwnd) {
+    static int64_t last = NowMs();
+    int64_t now = NowMs();
+    float step = float(now - last) / kFadeMs;
+    last = now;
+    g_pad = input::AnyConnected();
+    POINT at;
+    GetCursorPos(&at);
+    bool over = WindowFromPoint(at) == hwnd;
+    ScreenToClient(hwnd, &at);
     RECT client;
     GetClientRect(hwnd, &client);
     Layout l = Arrange(client, Unit(hwnd));
-    bool ready = g_progress.stage == Stage::Ready;
-    auto fade = [&](float& v, const RECT& r) {
-        float target = ready && PtInRect(&r, g_mouse) ? 1.0f : 0.0f;
-        v = target > v ? std::min(v + kStep, target) : std::max(v - kStep, target);
-    };
-    fade(g_hover_start, l.start);
-    fade(g_hover_exit, l.exit);
+    g_glow.start = Approach(g_glow.start, over && PtInRect(&l.start, at), step);
+    g_glow.exit = Approach(g_glow.exit, over && PtInRect(&l.exit, at), step);
+    g_glow.toggle = Approach(g_glow.toggle, over && PtInRect(&l.delete_toggle, at), step);
 }
 
 // a controller's A starts, B leaves and X ticks the delete box, once ready; on the press, not the hold
@@ -661,18 +675,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_ERASEBKGND:
             return 1;
         case WM_TIMER:
-            FadeHover(hwnd);
+            if (ready) UpdateReadyPage(hwnd);
             InvalidateRect(hwnd, nullptr, FALSE);
             PollController(hwnd);
-            return 0;
-        case WM_MOUSEMOVE: {
-            TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, hwnd, 0};
-            TrackMouseEvent(&track);
-            g_mouse = {short(LOWORD(lp)), short(HIWORD(lp))};
-            return 0;
-        }
-        case WM_MOUSELEAVE:
-            g_mouse = {-1, -1};
             return 0;
         case WM_LBUTTONUP:
             OnClick(hwnd, lp);
@@ -727,7 +732,7 @@ HWND OpenWindow() {
     NONCLIENTMETRICSW metrics{sizeof(metrics)};
     SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0, dpi);
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, LONG_PTR(CreateFontIndirectW(&metrics.lfMessageFont)));
-    SetTimer(hwnd, 1, 50, nullptr);  // the controller is read with each repaint
+    SetTimer(hwnd, 1, 16, nullptr);  // the controller and cursor are read with each repaint
     ShowWindow(hwnd, SW_SHOW);
     return hwnd;
 }

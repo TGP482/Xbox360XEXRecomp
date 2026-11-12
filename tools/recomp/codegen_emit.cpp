@@ -1,5 +1,6 @@
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 
 #include "codegen.h"
 
@@ -33,8 +34,12 @@ std::string Fmt(const char* f, ...) {
     va_start(ap, f);
     va_list again;
     va_copy(again, ap);
-    std::string s(size_t(std::vsnprintf(nullptr, 0, f, ap)), '\0');
-    std::vsnprintf(s.data(), s.size() + 1, f, again);
+    // most text fits, so it formats once
+    char buf[256];
+    size_t n = size_t(std::vsnprintf(buf, sizeof(buf), f, ap));
+    std::string s(n, '\0');
+    if (n < sizeof(buf)) std::memcpy(s.data(), buf, n);
+    else std::vsnprintf(s.data(), n + 1, f, again);
     va_end(again);
     va_end(ap);
     return s;
@@ -59,7 +64,7 @@ void CodeGen::Line(std::string s) {
     bool always = s.rfind("\t" + kSpill, 0) == 0 || s.rfind("\tif (true) {", 0) == 0;
     bool call = always && s.find("PPC_RELOAD;") != std::string::npos;
     bool every = sync_.all || !reachable_;
-    if (!every) {
+    if (!every && s.find(kSpill) != std::string::npos) {
         std::string stores = RegisterBlock(sync_.dirty, true);
         if (!stores.empty()) stores.erase(0, 1);
         for (size_t at = s.find(kSpill); at != std::string::npos; at = s.find(kSpill, at + stores.size())) {

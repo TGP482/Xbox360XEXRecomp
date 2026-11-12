@@ -226,6 +226,7 @@ struct Resolved {
     uint32_t width = 0;  // title texels
     uint32_t height = 0;
     uint32_t view = 0;  // RTV slot
+    float scale = 1;    // host texels per title texel
     int32_t copied = -1;  // the guest format a D3DX copy wrote, which block compressed fetches may read
 };
 
@@ -1205,6 +1206,7 @@ void D3D12Backend::DropTargets() {
     for (auto& [key, t] : targets_) (t.depth ? free_dsv_ : free_rtv_).push_back(t.view);
     targets_.clear();
     cap_rt_ = nullptr;
+    Unbind();
 }
 
 // RB_SURFACE_INFO: pitch in pixels, samples 1, 2 or 4
@@ -2426,7 +2428,7 @@ void D3D12Backend::Resolve(const State& s, const ResolveArgs& r) {
 // the host texture read in place of guest memory, made again when the format or size changes
 Resolved& D3D12Backend::EnsureResolved(uint64_t key, DXGI_FORMAT format, uint32_t w, uint32_t h) {
     Resolved& dst = resolved_[key];
-    if (dst.res && dst.format == format && dst.width == w && dst.height == h) return dst;
+    if (dst.res && dst.format == format && dst.width == w && dst.height == h && dst.scale == scale_) return dst;
     if (dst.res) {
         Release(dst.res);
     } else if (!free_rtv_.empty()) {
@@ -2436,6 +2438,7 @@ Resolved& D3D12Backend::EnsureResolved(uint64_t key, DXGI_FORMAT format, uint32_
     dst.format = format;
     dst.width = w;
     dst.height = h;
+    dst.scale = scale_;
     uint32_t hw = uint32_t(std::ceil(w * scale_));
     uint32_t hh = uint32_t(std::ceil(h * scale_));
     D3D12_RESOURCE_DESC d = TextureDesc(format, hw, hh);
@@ -2626,8 +2629,8 @@ void D3D12Backend::Present(const uint32_t front[6]) {
     auto resolved = resolved_.find(ResolvedKey(t.base, 0));
     if (resolved != resolved_.end()) {
         Resolved& r = resolved->second;
-        BlitToSwap(r.res.Get(), r.state, r.format, ComponentMapping(t), uint32_t(std::ceil(r.width * scale_)),
-                   uint32_t(std::ceil(r.height * scale_)));
+        BlitToSwap(r.res.Get(), r.state, r.format, ComponentMapping(t), uint32_t(std::ceil(r.width * r.scale)),
+                   uint32_t(std::ceil(r.height * r.scale)));
     } else if (Texture* tex = EnsureTexture(t)) {
         BlitToSwap(tex->res.Get(), tex->state, tex->format, ComponentMapping(t), t.width, t.height);
     }
@@ -2664,6 +2667,13 @@ void D3D12Backend::Present(const uint32_t front[6]) {
         fps_start_ = now;
     }
     if (diag::Perf()) LogPerf();
+    if (float scale = app::RenderScale(guest_h_); scale != scale_) {
+        Submit(true);
+        DropTargets();
+        scale_ = scale;
+        if (ext_) ext_->Reset(*this);
+        LOGR("D3D12: render scale %.3f", scale_);
+    }
     if (app::Get().msaa != msaa_set_) {
         Submit(true);
         DropTargets();
@@ -2828,8 +2838,8 @@ void D3D12Backend::FinishCapture(const xenos::TextureFetch& front) {
     auto resolved = resolved_.find(ResolvedKey(front.base, 0));
     if (resolved != resolved_.end()) {
         Resolved& r = resolved->second;
-        uint32_t w = uint32_t(std::ceil(r.width * scale_));
-        uint32_t h = uint32_t(std::ceil(r.height * scale_));
+        uint32_t w = uint32_t(std::ceil(r.width * r.scale));
+        uint32_t h = uint32_t(std::ceil(r.height * r.scale));
         CapSave(r.res.Get(), r.state, r.format, 1, false, w, h, 1, "present");
     }
     std::fclose(cap_);

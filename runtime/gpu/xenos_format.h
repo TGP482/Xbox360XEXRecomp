@@ -149,6 +149,8 @@ struct Level {
     uint32_t rows_blocks;   // rows in memory
     uint32_t address;
     uint32_t face_stride;  // bytes from one cube face or slice to the next
+    uint32_t x = 0;  // blocks in from the address, for a level 0 stored in the packed mip tail
+    uint32_t y = 0;
 };
 
 // level 0 and the mips before the packed tail; the tail is left to the levels above it (MaxLOD stops there)

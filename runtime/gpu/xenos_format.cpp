@@ -235,7 +235,15 @@ std::vector<Level> Levels(const TextureFetch& t) {
     const FormatInfo& fi = Info(t.format);
     std::vector<Level> levels;
     uint32_t pitch = t.pitch ? t.pitch : t.width;
-    levels.push_back(MakeLevel(t, fi, t.width, t.height, pitch, t.height, t.base));
+    Level base = MakeLevel(t, fi, t.width, t.height, pitch, t.height, t.base);
+    // a level 0 this small sits in the packed tail, 16 texels down when wider than tall, else across
+    if (t.packed_mips && std::min(NextPow2(t.width), NextPow2(t.height)) <= kPackedTexels) {
+        uint32_t offset = kPackedTexels / fi.block;
+        if (NextPow2(t.width) > NextPow2(t.height)) base.y = offset;
+        else base.x = offset;
+        if (!t.tiled) base.rows_blocks += base.y;
+    }
+    levels.push_back(base);
     if (!t.mip_base || !t.mip_max) return levels;
     uint32_t faces = t.dimension == Dimension::Cube ? t.depth : 1;
     uint32_t w2 = NextPow2(t.width);
@@ -342,6 +350,8 @@ void ExpandDxt3a(const uint8_t* in, uint8_t* out, uint32_t row_pitch) {
 
 const uint8_t* BlockAt(const uint8_t* src, const Level& l, const FormatInfo& fi, bool tiled, uint32_t bx,
                        uint32_t by) {
+    bx += l.x;
+    by += l.y;
     uint32_t index = by * l.pitch_blocks + bx;
     if (tiled) index = TiledOffset2D(bx, by, l.pitch_blocks, Log2(fi.bytes));
     return src + size_t(index) * fi.bytes;

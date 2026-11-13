@@ -18,9 +18,11 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -39,6 +41,7 @@ struct Variant {
     ShaderInfo info;
     std::vector<uint8_t> dxil;
     uint64_t key = 0;  // of the DXIL, so a cached pipeline of other DXIL never matches
+    std::atomic<bool> building{false};  // compiling on a build thread; dxil and key are read once it is done
 };
 
 struct Shader {
@@ -265,6 +268,16 @@ struct CachedPipeline {
     D3D12_SHADER_BYTECODE ps{};
     D3D12_CACHED_PIPELINE_STATE blob{};
 };
+
+// a pipeline for a build thread to make, handed back with what it made
+struct BuiltPipeline {
+    PipelineKey key;
+    D3D12_SHADER_BYTECODE vs{};
+    D3D12_SHADER_BYTECODE ps{};
+    ComPtr<ID3D12PipelineState> pso;
+};
+
+constexpr auto kHoldMax = std::chrono::milliseconds(50);  // longest a frame missing draws keeps the last one up
 
 struct Frame {
     ComPtr<ID3D12CommandAllocator> alloc;
@@ -604,6 +617,9 @@ private:
     Variant* FindVariant(Shader* s, const ShaderOptions& opt);
     ID3D12PipelineState* EnsurePipeline(const PipelineKey& k, const Variant& vs, const Variant* ps);
     ID3D12PipelineState* FindPipeline(const PipelineKey& k, const Variant& vs, const Variant* ps);
+    ComPtr<ID3D12PipelineState> MakePipeline(const BuiltPipeline& b) const;
+    void TakeBuilt();
+    bool Async() const { return app::Get().async_shaders && !cap_; }
     void FillPipelineDesc(const PipelineKey& k, D3D12_GRAPHICS_PIPELINE_STATE_DESC& d) const;
     ID3D12PipelineState* EnsureResolvePipeline(DXGI_FORMAT rtv, bool ms, bool filter = false);
     uint32_t Samples(uint32_t want);
@@ -658,6 +674,7 @@ private:
     void BlitToSwap(ID3D12Resource* src, D3D12_RESOURCE_STATES& state, DXGI_FORMAT fmt, UINT mapping, uint32_t w,
                     uint32_t h);
     void RenderUi();
+    void ShowFrame(const xenos::TextureFetch& t);
     void CopyResolve(Target& src, Resolved& dst, const ResolveArgs& r);
     Resolved& EnsureResolved(uint64_t key, DXGI_FORMAT format, uint32_t w, uint32_t h);
     void DropResolved(uint32_t base);
@@ -725,6 +742,13 @@ private:
     std::unordered_map<uint64_t, uint32_t> sampler_sets_;
     uint32_t samplers_used_ = 0;
     std::ofstream pipeline_cache_;  // each pipeline appended as it is made
+    // async shaders: pipelines on the build threads and those they made; a frame missing draws is held back
+    std::unordered_set<uint64_t> building_;
+    std::vector<BuiltPipeline> built_;
+    std::mutex built_lock_;
+    std::atomic<bool> built_ready_{false};
+    bool skipped_frame_ = false;
+    std::chrono::steady_clock::time_point shown_;
 
     // the last constant blocks bound, skipped when unchanged; no address means upload again
     uint8_t const_last_[kRootCount][kConstBytes] = {};
@@ -1354,7 +1378,18 @@ Variant* D3D12Backend::EnsureVariant(Shader* s, const ShaderOptions& opt) {
         s->last = FindVariant(s, opt);
         s->last_opt = opt;
     }
+    if (s->last->building.load(std::memory_order_acquire)) {
+        skipped_frame_ = true;
+        return nullptr;
+    }
     return s->last->dxil.empty() ? nullptr : s->last;
+}
+
+// on a build thread when async
+void BuildVariant(Variant& v, const std::string& hlsl, const wchar_t* profile) {
+    if (!CompileHlsl(hlsl, profile, v.dxil)) v.dxil.clear();
+    v.key = Hash64(v.dxil.data(), v.dxil.size());
+    v.building.store(false, std::memory_order_release);
 }
 
 Variant* D3D12Backend::FindVariant(Shader* s, const ShaderOptions& opt) {
@@ -1365,8 +1400,14 @@ Variant* D3D12Backend::FindVariant(Shader* s, const ShaderOptions& opt) {
     std::string hlsl = TranslateShader(s->stage, s->code.data(), s->code.size(), opt, v->info);
     const wchar_t* profile = s->stage == ShaderStage::Vertex ? L"vs_6_0" : L"ps_6_0";
     g_perf.shaders++;
-    if (!CompileHlsl(hlsl, profile, v->dxil)) v->dxil.clear();
-    v->key = Hash64(v->dxil.data(), v->dxil.size());
+    if (FindHlsl(hlsl, profile, v->dxil)) {
+        v->key = Hash64(v->dxil.data(), v->dxil.size());
+    } else if (Async()) {
+        v->building = true;
+        Post([variant = v.get(), hlsl = std::move(hlsl), profile] { BuildVariant(*variant, hlsl, profile); });
+    } else {
+        BuildVariant(*v, hlsl, profile);
+    }
     return v.get();
 }
 
@@ -1449,22 +1490,55 @@ ID3D12PipelineState* D3D12Backend::EnsurePipeline(const PipelineKey& k, const Va
 }
 
 ID3D12PipelineState* D3D12Backend::FindPipeline(const PipelineKey& k, const Variant& vs, const Variant* ps) {
+    if (built_ready_.load(std::memory_order_acquire)) TakeBuilt();
     uint64_t key = Hash64(&k, sizeof(k));
     auto it = pipelines_.find(key);
     if (it != pipelines_.end()) return it->second.Get();
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC d{};
-    FillPipelineDesc(k, d);
-    d.VS = {vs.dxil.data(), vs.dxil.size()};
-    if (ps) d.PS = {ps->dxil.data(), ps->dxil.size()};
-    ComPtr<ID3D12PipelineState> pso;
-    g_perf.pipelines++;
-    if (FAILED(dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso)))) {
-        LOGE("D3D12: pipeline %016llx failed", static_cast<unsigned long long>(key));
-    } else {
-        StorePipeline(k, d.VS, d.PS, pso.Get());
+    BuiltPipeline b{k, {vs.dxil.data(), vs.dxil.size()}};
+    if (ps) b.ps = {ps->dxil.data(), ps->dxil.size()};
+    if (Async()) {
+        skipped_frame_ = true;
+        if (!building_.insert(key).second) return nullptr;
+        g_perf.pipelines++;
+        Post([this, b]() mutable {
+            b.pso = MakePipeline(b);
+            std::lock_guard lock(built_lock_);
+            built_.push_back(std::move(b));
+            built_ready_.store(true, std::memory_order_release);
+        });
+        return nullptr;
     }
-    pipelines_[key] = pso;
-    return pso.Get();
+    g_perf.pipelines++;
+    b.pso = MakePipeline(b);
+    if (b.pso) StorePipeline(b.key, b.vs, b.ps, b.pso.Get());
+    pipelines_[key] = b.pso;
+    return b.pso.Get();
+}
+
+// any thread
+ComPtr<ID3D12PipelineState> D3D12Backend::MakePipeline(const BuiltPipeline& b) const {
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC d{};
+    FillPipelineDesc(b.key, d);
+    d.VS = b.vs;
+    d.PS = b.ps;
+    ComPtr<ID3D12PipelineState> pso;
+    if (FAILED(dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso)))) {
+        LOGE("D3D12: pipeline %016llx failed", static_cast<unsigned long long>(Hash64(&b.key, sizeof(b.key))));
+    }
+    return pso;
+}
+
+// what the build threads made, kept and written to the cache on the render thread
+void D3D12Backend::TakeBuilt() {
+    std::lock_guard lock(built_lock_);
+    built_ready_ = false;
+    for (BuiltPipeline& b : built_) {
+        uint64_t key = Hash64(&b.key, sizeof(b.key));
+        building_.erase(key);
+        if (b.pso) StorePipeline(b.key, b.vs, b.ps, b.pso.Get());
+        pipelines_[key] = std::move(b.pso);
+    }
+    built_.clear();
 }
 
 ID3D12PipelineState* D3D12Backend::EnsureResolvePipeline(DXGI_FORMAT rtv, bool ms, bool filter) {
@@ -2680,14 +2754,8 @@ void D3D12Backend::RenderUi() {
     ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), cl_.Get());
 }
 
-void D3D12Backend::Present(const uint32_t front[6]) {
-    xenos::TextureFetch t = xenos::DecodeTextureFetch(front);
-    if (cap_) {
-        FinishCapture(t);
-    } else if (g_capture.exchange(false)) {
-        StartCapture();
-    }
-    ResizeSwap();
+// the frame and the UI into the back buffer, then shown
+void D3D12Backend::ShowFrame(const xenos::TextureFetch& t) {
     uint32_t bi = swap_->GetCurrentBackBufferIndex();
     D3D12_RESOURCE_STATES bs = D3D12_RESOURCE_STATE_PRESENT;
     Transition(bb_[bi].Get(), bs, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -2709,6 +2777,25 @@ void D3D12Backend::Present(const uint32_t front[6]) {
     Submit(false);
     bool vsync = app::Get().vsync;
     swap_->Present(vsync ? 1 : 0, !vsync && tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
+}
+
+void D3D12Backend::Present(const uint32_t front[6]) {
+    xenos::TextureFetch t = xenos::DecodeTextureFetch(front);
+    if (cap_) {
+        FinishCapture(t);
+    } else if (g_capture.exchange(false)) {
+        StartCapture();
+    }
+    ResizeSwap();
+    // a frame missing draws still being built is not shown, the last whole one stays up: otherwise a new effect's
+    // passes flash on screen
+    auto when = std::chrono::steady_clock::now();
+    if (std::exchange(skipped_frame_, false) && when - shown_ < kHoldMax) {
+        Submit(false);
+    } else {
+        ShowFrame(t);
+        shown_ = when;
+    }
 
     g_perf.upload_bytes += CurrentFrame().used;
     presents_++;

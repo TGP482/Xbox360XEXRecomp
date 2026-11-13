@@ -24,6 +24,7 @@ struct Settings {
     bool vsync = true;
     uint32_t aniso = 0;              // forced on every texture in place of the game's, 0 off
     uint32_t msaa = 0;               // samples of the title's multisampled targets, 0 off
+    bool async_shaders = true;       // a draw whose shaders are still being built is skipped; settings file only
     bool custom_textures = true;     // images in textures\replacement\ beside the exe replace the game's
     bool dump_textures = false;      // each texture once into textures\dumps\ beside the exe
     uint32_t texture_dump_format = 0;  // 0 PNG, 1 DDS

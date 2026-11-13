@@ -52,6 +52,7 @@ void Load() {
     s.vsync = t["vsync"].value_or(s.vsync);
     s.aniso = t["anisotropic_filtering"].value_or(s.aniso);
     s.msaa = t["msaa"].value_or(s.msaa);
+    s.async_shaders = t["async_shaders"].value_or(s.async_shaders);
     s.custom_textures = t["custom_textures"].value_or(s.custom_textures);
     s.dump_textures = t["dump_textures"].value_or(s.dump_textures);
     s.texture_dump_format = std::min(t["texture_dump_format"].value_or(s.texture_dump_format), 1u);
@@ -77,6 +78,7 @@ toml::table Table() {
                   {"vsync", s.vsync},
                   {"anisotropic_filtering", int64_t(s.aniso)},
                   {"msaa", int64_t(s.msaa)},
+                  {"async_shaders", s.async_shaders},
                   {"custom_textures", s.custom_textures},
                   {"dump_textures", s.dump_textures},
                   {"texture_dump_format", int64_t(s.texture_dump_format)},

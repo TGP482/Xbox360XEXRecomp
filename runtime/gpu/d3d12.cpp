@@ -18,7 +18,6 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
-#include <future>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -39,7 +38,7 @@ namespace gpu {
 struct Variant {
     ShaderInfo info;
     std::vector<uint8_t> dxil;
-    uint64_t key = 0;  // the microcode and options, the same every run
+    uint64_t key = 0;  // of the DXIL, so a cached pipeline of other DXIL never matches
 };
 
 struct Shader {
@@ -247,6 +246,24 @@ struct PipelineKey {
     uint32_t topology = 0;
     uint32_t strip_cut = 0;
     uint32_t unused = 0;  // no padding: the key is hashed and compared as bytes
+};
+
+// cache/pipelines.bin: the header, then per pipeline its record, the shaders' DXIL and the driver's blob
+constexpr uint32_t kPipelineCacheMagic = 0x31505358;
+struct PipelineRecord {
+    PipelineKey key;
+    uint32_t vs_size = 0;
+    uint32_t ps_size = 0;
+    uint32_t blob_size = 0;
+    uint32_t unused = 0;  // no padding: written as bytes
+};
+
+// a pipeline read from the cache, pointing into the file's bytes
+struct CachedPipeline {
+    PipelineKey key;
+    D3D12_SHADER_BYTECODE vs{};
+    D3D12_SHADER_BYTECODE ps{};
+    D3D12_CACHED_PIPELINE_STATE blob{};
 };
 
 struct Frame {
@@ -553,8 +570,9 @@ private:
     void CreateHeaps();
     bool CreateRootSignature();
     void CreateFrames();
-    void LoadPipelineLibrary();
-    void SavePipelineLibrary();
+    void LoadPipelineCache();
+    void StorePipeline(const PipelineKey& k, D3D12_SHADER_BYTECODE vs, D3D12_SHADER_BYTECODE ps,
+                       ID3D12PipelineState* pso);
 
     Frame& CurrentFrame() { return frames_[frame_ % kFrames]; }
     void Begin();
@@ -706,9 +724,7 @@ private:
     std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> resolve_pipelines_;
     std::unordered_map<uint64_t, uint32_t> sampler_sets_;
     uint32_t samplers_used_ = 0;
-    ComPtr<ID3D12PipelineLibrary> library_;
-    bool library_dirty_ = false;
-    std::future<void> saving_;  // the library being written out
+    std::ofstream pipeline_cache_;  // each pipeline appended as it is made
 
     // the last constant blocks bound, skipped when unchanged; no address means upload again
     uint8_t const_last_[kRootCount][kConstBytes] = {};
@@ -767,8 +783,6 @@ private:
 D3D12Backend::~D3D12Backend() {
     if (!dev_) return;
     Submit(true);
-    if (saving_.valid()) saving_.wait();
-    SavePipelineLibrary();
     ImGui_ImplDX12_Shutdown();
     if (event_) CloseHandle(event_);
 }
@@ -780,7 +794,7 @@ bool D3D12Backend::Init(uint32_t width, uint32_t height) {
     CreateHeaps();
     if (!CreateRootSignature()) return false;
     CreateFrames();
-    LoadPipelineLibrary();
+    LoadPipelineCache();
     ImGui_ImplDX12_Init(dev_.Get(), kFrames, kSwapFormat, ui_heap_.Get(),
                         ui_heap_->GetCPUDescriptorHandleForHeapStart(), ui_heap_->GetGPUDescriptorHandleForHeapStart());
     scale_ = app::RenderScale(guest_h_);
@@ -962,42 +976,92 @@ void D3D12Backend::CreateFrames() {
                                   IID_PPV_ARGS(&query_read_));
 }
 
-std::filesystem::path PipelineLibraryPath() { return app::ExeDir() / "cache" / "pipelines.bin"; }
+std::filesystem::path PipelineCachePath() { return app::ExeDir() / "cache" / "pipelines.bin"; }
 
-// the driver's compiled pipelines from earlier runs; a driver change makes it start empty
-void D3D12Backend::LoadPipelineLibrary() {
-    ComPtr<ID3D12Device1> dev1;
-    if (FAILED(dev_.As(&dev1))) return;
-    static std::vector<char> blob;  // the library reads it for as long as it lives
-    std::ifstream f(PipelineLibraryPath(), std::ios::binary);
-    if (f) blob.assign(std::istreambuf_iterator<char>(f), {});
-    if (blob.empty() || FAILED(dev1->CreatePipelineLibrary(blob.data(), blob.size(), IID_PPV_ARGS(&library_)))) {
-        blob.clear();
-        dev1->CreatePipelineLibrary(nullptr, 0, IID_PPV_ARGS(&library_));
-    }
+std::vector<char> ReadWhole(const std::filesystem::path& path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) return {};
+    std::vector<char> bytes(size_t(f.tellg()));
+    f.seekg(0);
+    f.read(bytes.data(), std::streamsize(bytes.size()));
+    return bytes;
 }
 
-// written on its own thread, as the pipeline library is thread safe; one save at a time
-void D3D12Backend::SavePipelineLibrary() {
-    using namespace std::chrono_literals;
-    if (!library_ || !library_dirty_) return;
-    if (saving_.valid() && saving_.wait_for(0s) != std::future_status::ready) return;
-    library_dirty_ = false;
-    saving_ = std::async(std::launch::async, [library = library_] {
-        std::vector<char> blob(library->GetSerializedSize());
-        if (FAILED(library->Serialize(blob.data(), blob.size()))) return;
-        std::filesystem::path path = PipelineLibraryPath();
-        std::filesystem::path part = path;
-        part += ".part";
-        std::error_code ec;
-        std::filesystem::create_directories(path.parent_path(), ec);
-        {
-            std::ofstream f(part, std::ios::binary);
-            if (!f.write(blob.data(), std::streamsize(blob.size()))) return;
-        }
-        // an exit mid save keeps the last whole file
-        std::filesystem::rename(part, path, ec);
-    });
+// the whole records; at is left past the last
+std::vector<CachedPipeline> ParsePipelines(const std::vector<char>& file, size_t& at) {
+    std::vector<CachedPipeline> cached;
+    while (file.size() - at >= sizeof(PipelineRecord)) {
+        PipelineRecord r;
+        std::memcpy(&r, &file[at], sizeof(r));
+        size_t size = sizeof(r) + size_t(r.vs_size) + r.ps_size + r.blob_size;
+        if (file.size() - at < size) break;
+        const char* p = &file[at + sizeof(r)];
+        CachedPipeline c{r.key};
+        c.vs = {p, r.vs_size};
+        if (r.ps_size) c.ps = {p + r.vs_size, r.ps_size};
+        c.blob = {p + r.vs_size + r.ps_size, r.blob_size};
+        cached.push_back(c);
+        at += size;
+    }
+    return cached;
+}
+
+// every pipeline earlier runs made is made again before the first frame, so none is made mid game; a driver change
+// makes them from the DXIL and writes the file again
+void D3D12Backend::LoadPipelineCache() {
+    auto start = std::chrono::steady_clock::now();
+    std::filesystem::path path = PipelineCachePath();
+    std::vector<char> file = ReadWhole(path);
+    const uint32_t header[2] = {kPipelineCacheMagic, sizeof(PipelineRecord)};
+    size_t at = sizeof(header);
+    bool known = file.size() >= at && std::memcmp(file.data(), header, at) == 0;
+    std::vector<CachedPipeline> cached;
+    if (known) cached = ParsePipelines(file, at);
+
+    std::vector<ComPtr<ID3D12PipelineState>> made(cached.size());
+    std::atomic<bool> stale = false;
+    std::function<void(size_t)> make = [&](size_t i) {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC d{};
+        FillPipelineDesc(cached[i].key, d);
+        d.VS = cached[i].vs;
+        d.PS = cached[i].ps;
+        d.CachedPSO = cached[i].blob;
+        if (SUCCEEDED(dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&made[i])))) return;
+        stale = true;
+        d.CachedPSO = {};
+        dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&made[i]));
+    };
+    pool_.Run(cached.size(), make);
+
+    // a cut off record or a stale blob: written again from what was made
+    bool rewrite = !known || at != file.size() || stale;
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    pipeline_cache_.open(path, std::ios::binary | (rewrite ? std::ios::trunc : std::ios::app));
+    if (rewrite) pipeline_cache_.write(reinterpret_cast<const char*>(header), sizeof(header));
+    size_t count = 0;
+    for (size_t i = 0; i < cached.size(); i++) {
+        if (!made[i]) continue;
+        pipelines_[Hash64(&cached[i].key, sizeof(PipelineKey))] = made[i];
+        if (rewrite) StorePipeline(cached[i].key, cached[i].vs, cached[i].ps, made[i].Get());
+        count++;
+    }
+    auto took = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
+    LOGR("D3D12: %zu pipelines made from the cache in %lld ms%s", count, static_cast<long long>(took.count()),
+         stale ? ", driver changed" : "");
+}
+
+// flushed per pipeline, so an exit or a crash keeps every one before it
+void D3D12Backend::StorePipeline(const PipelineKey& k, D3D12_SHADER_BYTECODE vs, D3D12_SHADER_BYTECODE ps,
+                                 ID3D12PipelineState* pso) {
+    ComPtr<ID3DBlob> blob;
+    if (!pipeline_cache_.is_open() || FAILED(pso->GetCachedBlob(&blob))) return;
+    PipelineRecord r{k, uint32_t(vs.BytecodeLength), uint32_t(ps.BytecodeLength), uint32_t(blob->GetBufferSize())};
+    pipeline_cache_.write(reinterpret_cast<const char*>(&r), sizeof(r));
+    pipeline_cache_.write(static_cast<const char*>(vs.pShaderBytecode), std::streamsize(vs.BytecodeLength));
+    pipeline_cache_.write(static_cast<const char*>(ps.pShaderBytecode), std::streamsize(ps.BytecodeLength));
+    pipeline_cache_.write(static_cast<const char*>(blob->GetBufferPointer()), std::streamsize(blob->GetBufferSize()));
+    pipeline_cache_.flush();
 }
 
 void D3D12Backend::Begin() {
@@ -1298,11 +1362,11 @@ Variant* D3D12Backend::FindVariant(Shader* s, const ShaderOptions& opt) {
     auto& v = s->variants[key];
     if (v) return v.get();
     v = std::make_unique<Variant>();
-    v->key = key;
     std::string hlsl = TranslateShader(s->stage, s->code.data(), s->code.size(), opt, v->info);
     const wchar_t* profile = s->stage == ShaderStage::Vertex ? L"vs_6_0" : L"ps_6_0";
     g_perf.shaders++;
     if (!CompileHlsl(hlsl, profile, v->dxil)) v->dxil.clear();
+    v->key = Hash64(v->dxil.data(), v->dxil.size());
     return v.get();
 }
 
@@ -1392,16 +1456,12 @@ ID3D12PipelineState* D3D12Backend::FindPipeline(const PipelineKey& k, const Vari
     FillPipelineDesc(k, d);
     d.VS = {vs.dxil.data(), vs.dxil.size()};
     if (ps) d.PS = {ps->dxil.data(), ps->dxil.size()};
-    wchar_t name[24];
-    swprintf(name, 24, L"%016llx", static_cast<unsigned long long>(key));
     ComPtr<ID3D12PipelineState> pso;
     g_perf.pipelines++;
-    if (!library_ || FAILED(library_->LoadGraphicsPipeline(name, &d, IID_PPV_ARGS(&pso)))) {
-        if (FAILED(dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso)))) {
-            LOGE("D3D12: pipeline %016llx failed", static_cast<unsigned long long>(key));
-        } else if (library_ && SUCCEEDED(library_->StorePipeline(name, pso.Get()))) {
-            library_dirty_ = true;
-        }
+    if (FAILED(dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso)))) {
+        LOGE("D3D12: pipeline %016llx failed", static_cast<unsigned long long>(key));
+    } else {
+        StorePipeline(k, d.VS, d.PS, pso.Get());
     }
     pipelines_[key] = pso;
     return pso.Get();
@@ -2665,7 +2725,6 @@ void D3D12Backend::Present(const uint32_t front[6]) {
     next.views = 0;
     cl_->Reset(next.alloc.Get(), nullptr);
     Begin();
-    if (presents_ % 600 == 0) SavePipelineLibrary();
 
     fps_frames_++;
     auto now = std::chrono::steady_clock::now();

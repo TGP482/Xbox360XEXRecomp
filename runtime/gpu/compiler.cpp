@@ -201,6 +201,8 @@ void Add(uint64_t key, uint64_t check, const std::vector<uint8_t>& dxil) {
 
 void Run() {
     SetThreadDescription(GetCurrentThread(), L"shader build");
+    // the game's threads come first: builds only take what they leave
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     Pool& p = P();
     for (;;) {
         std::function<void()> job;

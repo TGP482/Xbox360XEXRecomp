@@ -277,7 +277,6 @@ struct BuiltPipeline {
     ComPtr<ID3D12PipelineState> pso;
 };
 
-constexpr auto kHoldMax = std::chrono::milliseconds(50);  // longest a frame missing draws keeps the last one up
 
 struct Frame {
     ComPtr<ID3D12CommandAllocator> alloc;
@@ -742,13 +741,15 @@ private:
     std::unordered_map<uint64_t, uint32_t> sampler_sets_;
     uint32_t samplers_used_ = 0;
     std::ofstream pipeline_cache_;  // each pipeline appended as it is made
-    // async shaders: pipelines on the build threads and those they made; a frame missing draws is held back
+    // async shaders: pipelines on the build threads and those they made
     std::unordered_set<uint64_t> building_;
     std::vector<BuiltPipeline> built_;
     std::mutex built_lock_;
     std::atomic<bool> built_ready_{false};
-    bool skipped_frame_ = false;
-    std::chrono::steady_clock::time_point shown_;
+    // since the last log line
+    uint32_t posted_shaders_ = 0;
+    uint32_t posted_pipelines_ = 0;
+    uint32_t skipped_draws_ = 0;
 
     // the last constant blocks bound, skipped when unchanged; no address means upload again
     uint8_t const_last_[kRootCount][kConstBytes] = {};
@@ -1379,7 +1380,7 @@ Variant* D3D12Backend::EnsureVariant(Shader* s, const ShaderOptions& opt) {
         s->last_opt = opt;
     }
     if (s->last->building.load(std::memory_order_acquire)) {
-        skipped_frame_ = true;
+        skipped_draws_++;
         return nullptr;
     }
     return s->last->dxil.empty() ? nullptr : s->last;
@@ -1404,6 +1405,7 @@ Variant* D3D12Backend::FindVariant(Shader* s, const ShaderOptions& opt) {
         v->key = Hash64(v->dxil.data(), v->dxil.size());
     } else if (Async()) {
         v->building = true;
+        posted_shaders_++;
         Post([variant = v.get(), hlsl = std::move(hlsl), profile] { BuildVariant(*variant, hlsl, profile); });
     } else {
         BuildVariant(*v, hlsl, profile);
@@ -1497,9 +1499,10 @@ ID3D12PipelineState* D3D12Backend::FindPipeline(const PipelineKey& k, const Vari
     BuiltPipeline b{k, {vs.dxil.data(), vs.dxil.size()}};
     if (ps) b.ps = {ps->dxil.data(), ps->dxil.size()};
     if (Async()) {
-        skipped_frame_ = true;
+        skipped_draws_++;
         if (!building_.insert(key).second) return nullptr;
         g_perf.pipelines++;
+        posted_pipelines_++;
         Post([this, b]() mutable {
             b.pso = MakePipeline(b);
             std::lock_guard lock(built_lock_);
@@ -2787,15 +2790,7 @@ void D3D12Backend::Present(const uint32_t front[6]) {
         StartCapture();
     }
     ResizeSwap();
-    // a frame missing draws still being built is not shown, the last whole one stays up: otherwise a new effect's
-    // passes flash on screen
-    auto when = std::chrono::steady_clock::now();
-    if (std::exchange(skipped_frame_, false) && when - shown_ < kHoldMax) {
-        Submit(false);
-    } else {
-        ShowFrame(t);
-        shown_ = when;
-    }
+    ShowFrame(t);
 
     g_perf.upload_bytes += CurrentFrame().used;
     presents_++;
@@ -2820,6 +2815,13 @@ void D3D12Backend::Present(const uint32_t front[6]) {
         fps_ = fps_frames_ / secs;
         fps_frames_ = 0;
         fps_start_ = now;
+        if (posted_shaders_ || posted_pipelines_ || skipped_draws_) {
+            LOGR("async shaders: %u shaders and %u pipelines started, %u draws waited", posted_shaders_,
+                 posted_pipelines_, skipped_draws_);
+            posted_shaders_ = 0;
+            posted_pipelines_ = 0;
+            skipped_draws_ = 0;
+        }
     }
     if (diag::Perf()) LogPerf();
     if (float scale = app::RenderScale(guest_h_); scale != scale_) {

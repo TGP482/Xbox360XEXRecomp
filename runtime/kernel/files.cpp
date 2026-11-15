@@ -249,6 +249,19 @@ bool CreateSymbolicLink(const std::string& link, const std::string& target) {
     return true;
 }
 
+// a host folder the guest sees as drive: (name:), for a title's own files beside the disc and the hard disk
+void MountHostFolder(const std::string& drive, const std::string& host) {
+    std::string name = Upper(drive.substr(0, drive.find(':')));
+    std::string device = "\\DEVICE\\HOST" + name;
+    std::error_code ec;
+    fs::create_directories(host, ec);
+    {
+        std::lock_guard<std::mutex> lock(g_links_lock);
+        g_devices[device] = host;
+    }
+    CreateSymbolicLink("\\??\\" + name + ":", device);
+}
+
 bool DeleteSymbolicLink(const std::string& link) {
     std::lock_guard<std::mutex> lock(g_links_lock);
     return g_links.erase(Upper(Normalize(link))) != 0;

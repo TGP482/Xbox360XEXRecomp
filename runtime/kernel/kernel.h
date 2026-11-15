@@ -226,6 +226,7 @@ std::vector<ThreadRef> Threads();
 // files: console paths to host folders or the mounted disc image
 void MountDefaults(const std::string& game_dir, const std::string& data_dir);
 bool CreateSymbolicLink(const std::string& link, const std::string& target);
+void MountHostFolder(const std::string& drive, const std::string& host);  // "name:" to a host folder
 bool DeleteSymbolicLink(const std::string& link);
 std::string QuerySymbolicLink(const std::string& link);
 std::string ResolvePath(const std::string& console_path, uint32_t root_handle);  // host path or empty

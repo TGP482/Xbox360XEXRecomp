@@ -57,6 +57,7 @@ struct Palette {
     COLORREF dim;
     COLORREF bar_empty;
     COLORREF bar_full;
+    COLORREF lit_text;
 };
 
 COLORREF Pick(uint32_t argb, COLORREF fallback) {
@@ -65,8 +66,9 @@ COLORREF Pick(uint32_t argb, COLORREF fallback) {
 
 Palette GamePalette() {
     const WindowColours& c = kGame.compiler_colours;
-    return {Pick(c.background, RGB(10, 11, 10)), Pick(c.text, RGB(227, 232, 219)), Pick(c.dim, RGB(145, 153, 138)),
-            Pick(c.bar_empty, RGB(28, 33, 26)), Pick(c.bar_full, RGB(145, 158, 130))};
+    COLORREF background = Pick(c.background, RGB(10, 11, 10));
+    return {background, Pick(c.text, RGB(227, 232, 219)), Pick(c.dim, RGB(145, 153, 138)),
+            Pick(c.bar_empty, RGB(28, 33, 26)), Pick(c.bar_full, RGB(145, 158, 130)), Pick(c.lit_text, background)};
 }
 
 COLORREF Blend(COLORREF a, COLORREF b, float t) {
@@ -545,7 +547,7 @@ std::wstring Label(const std::wstring& text, const wchar_t* button) {
 
 void PaintButton(HDC dc, const RECT& box, const std::wstring& text, float glow) {
     FillBox(dc, box, Blend(g_colours.bar_empty, g_colours.bar_full, glow));
-    DrawLine(dc, box, text, Blend(g_colours.text, g_colours.background, glow), DT_CENTER);
+    DrawLine(dc, box, text, Blend(g_colours.text, g_colours.lit_text, glow), DT_CENTER);
 }
 
 void PaintChoices(HDC dc, const Layout& l, int unit) {

@@ -87,6 +87,7 @@ struct WindowColours {
     uint32_t dim = 0;
     uint32_t bar_empty = 0;
     uint32_t bar_full = 0;
+    uint32_t lit_text = 0;  // a lit button's label; 0 is the background colour
 };
 struct Option {  // a setting in the settings file, flag or value
     const char* key;

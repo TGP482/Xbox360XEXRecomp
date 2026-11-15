@@ -1,7 +1,8 @@
 // The recompiled game code is built on the player's PC, so a release carries none of it: xex_recomp translates each
 // xex of GameInfo::images to C++, clang compiles that and lld links it into <exe>.dll beside the executables, all from
 // the compiler folder. The first start does this behind a progress window. Finished objects are kept, so a closed
-// window or a crash loses only the files in progress and the next start carries on.
+// window or a crash loses only the files in progress and the next start carries on. Choose asks a launch question in
+// the same window's look.
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -583,8 +584,10 @@ void Paint(HDC dc, const RECT& client, int unit) {
 
 int Unit(HWND hwnd) { return MulDiv(10, GetDpiForWindow(hwnd), 96); }
 
+using PaintFn = void (*)(HDC dc, const RECT& client, int unit);
+
 // painted off screen, then copied, so the bar does not flicker
-void PaintWindow(HWND hwnd) {
+void PaintWindow(HWND hwnd, PaintFn paint) {
     PAINTSTRUCT ps;
     HDC dc = BeginPaint(hwnd, &ps);
     RECT client;
@@ -593,7 +596,7 @@ void PaintWindow(HWND hwnd) {
     HBITMAP bitmap = CreateCompatibleBitmap(dc, client.right, client.bottom);
     HGDIOBJ old_bitmap = SelectObject(memory, bitmap);
     HGDIOBJ old_font = SelectObject(memory, reinterpret_cast<HFONT>(GetWindowLongPtrW(hwnd, GWLP_USERDATA)));
-    Paint(memory, client, Unit(hwnd));
+    paint(memory, client, Unit(hwnd));
     BitBlt(dc, 0, 0, client.right, client.bottom, memory, 0, 0, SRCCOPY);
     SelectObject(memory, old_font);
     SelectObject(memory, old_bitmap);
@@ -619,11 +622,15 @@ void DeleteCompiler() {
     else LOGR("Game code: compiler folder deleted");
 }
 
+void DestroyWithFont(HWND hwnd) {
+    DeleteObject(reinterpret_cast<HFONT>(GetWindowLongPtrW(hwnd, GWLP_USERDATA)));
+    DestroyWindow(hwnd);
+}
+
 void CloseWindowWith(HWND hwnd, bool start) {
     g_start = start;
     if (g_progress.stage == Stage::Ready && g_delete_compiler) DeleteCompiler();
-    DeleteObject(reinterpret_cast<HFONT>(GetWindowLongPtrW(hwnd, GWLP_USERDATA)));
-    DestroyWindow(hwnd);
+    DestroyWithFont(hwnd);
 }
 
 // once ready: Start or Enter starts the game, Exit, Escape or the close button leaves, Space ticks the delete box
@@ -677,7 +684,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     bool ready = g_progress.stage == Stage::Ready;
     switch (msg) {
         case WM_PAINT:
-            PaintWindow(hwnd);
+            PaintWindow(hwnd, Paint);
             return 0;
         case WM_ERASEBKGND:
             return 1;
@@ -715,21 +722,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-// centred on the primary monitor, sized for its DPI, in the message font
-HWND OpenWindow() {
+// centred on the primary monitor, sized for its DPI, in the message font; a class per window procedure
+HWND OpenWindow(WNDPROC proc, const wchar_t* class_suffix, int height) {
     g_colours = GamePalette();
     HINSTANCE inst = GetModuleHandleW(nullptr);
     WNDCLASSEXW wc{sizeof(wc)};
-    wc.lpfnWndProc = WndProc;
+    wc.lpfnWndProc = proc;
     wc.hInstance = inst;
     wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));
     wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));  // IDC_ARROW
-    std::wstring class_name = std::wstring(kGame.name) + L"GameCode";
+    std::wstring class_name = std::wstring(kGame.name) + class_suffix;
     wc.lpszClassName = class_name.c_str();
     RegisterClassExW(&wc);
     UINT dpi = GetDpiForSystem();
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-    RECT r{0, 0, MulDiv(520, dpi, 96), MulDiv(130, dpi, 96)};
+    RECT r{0, 0, MulDiv(520, dpi, 96), MulDiv(height, dpi, 96)};
     AdjustWindowRectExForDpi(&r, style, FALSE, 0, dpi);
     int w = r.right - r.left;
     int h = r.bottom - r.top;
@@ -776,7 +783,7 @@ bool BuildWithWindow(std::vector<Target>& targets) {
     }
     SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);  // no sleep while it works
     input::Init();
-    g_window = OpenWindow();
+    g_window = OpenWindow(WndProc, L"GameCode", 130);
     bool ok = false;
     std::thread worker([&] {
         ok = Build(targets);
@@ -794,7 +801,122 @@ bool BuildWithWindow(std::vector<Target>& targets) {
     return ok && g_start;
 }
 
+// the launch question: its heading over a button per choice, a controller's A, X and Y on the first three
+struct ChoicePage {
+    const wchar_t* heading = nullptr;
+    std::vector<std::wstring> labels;
+    std::vector<float> glow;
+    int picked = -1;
+};
+ChoicePage g_page;
+constexpr uint16_t kChoiceButtons[] = {input::kA, input::kX, input::kY};
+constexpr const wchar_t* kChoiceButtonNames[] = {L"A", L"X", L"Y"};
+constexpr int kChoiceHeight = 80;
+
+// in a row under the heading, a unit apart
+RECT ChoiceBox(const RECT& client, int unit, int i) {
+    int n = int(g_page.labels.size());
+    int width = (client.right - client.left - unit * (n + 1)) / n;
+    int left = client.left + unit + i * (width + unit);
+    return {left, client.top + unit * 4, left + width, client.top + unit * 7};
+}
+
+void PaintChoicePage(HDC dc, const RECT& client, int unit) {
+    FillBox(dc, client, g_colours.background);
+    SetBkMode(dc, TRANSPARENT);
+    RECT heading{client.left + unit, client.top + unit, client.right - unit, client.top + unit * 3};
+    DrawLine(dc, heading, g_page.heading, g_colours.text, DT_LEFT);
+    for (int i = 0; i < int(g_page.labels.size()); i++) {
+        std::wstring label = i < int(std::size(kChoiceButtons)) ? Label(g_page.labels[i], kChoiceButtonNames[i])
+                                                                 : g_page.labels[i];
+        PaintButton(dc, ChoiceBox(client, unit, i), label, g_page.glow[i]);
+    }
+}
+
+void Pick(HWND hwnd, int choice) {
+    g_page.picked = choice;
+    DestroyWithFont(hwnd);
+}
+
+// the box under the cursor, -1 when none
+int ChoiceAt(HWND hwnd, POINT at) {
+    RECT client;
+    GetClientRect(hwnd, &client);
+    for (int i = 0; i < int(g_page.labels.size()); i++) {
+        RECT box = ChoiceBox(client, Unit(hwnd), i);
+        if (PtInRect(&box, at)) return i;
+    }
+    return -1;
+}
+
+void UpdateChoices(HWND hwnd) {
+    static int64_t last = NowMs();
+    int64_t now = NowMs();
+    float step = float(now - last) / kFadeMs;
+    last = now;
+    g_pad = input::AnyConnected();
+    POINT at;
+    GetCursorPos(&at);
+    bool over = WindowFromPoint(at) == hwnd;
+    ScreenToClient(hwnd, &at);
+    int lit = over ? ChoiceAt(hwnd, at) : -1;
+    for (int i = 0; i < int(g_page.glow.size()); i++) g_page.glow[i] = Approach(g_page.glow[i], i == lit, step);
+}
+
+// on the press, not the hold: A, X or Y picks, B leaves
+void PollChoiceController(HWND hwnd) {
+    static uint16_t held = 0;
+    uint16_t now = input::HeldOnAnyController();
+    uint16_t pressed = now & ~held;
+    held = now;
+    if (pressed & input::kB) return Pick(hwnd, -1);
+    for (int i = 0; i < int(std::min(g_page.labels.size(), std::size(kChoiceButtons))); i++) {
+        if (pressed & kChoiceButtons[i]) return Pick(hwnd, i);
+    }
+}
+
+// a click or the number keys pick, Escape or the close button leaves
+LRESULT CALLBACK ChoiceProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_PAINT:
+            PaintWindow(hwnd, PaintChoicePage);
+            return 0;
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_TIMER:
+            UpdateChoices(hwnd);
+            InvalidateRect(hwnd, nullptr, FALSE);
+            PollChoiceController(hwnd);
+            return 0;
+        case WM_LBUTTONUP:
+            if (int i = ChoiceAt(hwnd, {short(LOWORD(lp)), short(HIWORD(lp))}); i >= 0) Pick(hwnd, i);
+            return 0;
+        case WM_KEYDOWN:
+            if (wp == VK_ESCAPE) Pick(hwnd, -1);
+            else if (wp >= '1' && wp < WPARAM('1' + g_page.labels.size())) Pick(hwnd, int(wp - '1'));
+            return 0;
+        case WM_CLOSE:
+            Pick(hwnd, -1);
+            return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
 }  // namespace
+
+int Choose(const wchar_t* heading, const std::vector<std::wstring>& choices) {
+    if (choices.empty()) return -1;
+    g_page = {heading, choices, std::vector<float>(choices.size(), 0.0f), -1};
+    input::Init();
+    HWND hwnd = OpenWindow(ChoiceProc, L"Choice", kChoiceHeight);
+    MSG msg;
+    while (IsWindow(hwnd) && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    LOGR("Launch choice: %d", g_page.picked);
+    return g_page.picked;
+}
 
 bool PrepareGameCode(const GameFiles& game) {
     // one build at a time: a second copy of the game started meanwhile waits for it, then finds the DLL current

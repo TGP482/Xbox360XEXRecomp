@@ -51,6 +51,7 @@ A new XDK build needs `xdk/<build>/layout.toml` and signatures made from titles 
 - **XEX Loading** - Reads retail XEX2 files, decrypted and decompressed by the tool's own code, with imports by ordinal and TLS.
 - **Kernel and XAM** - Implements threads, waits, objects, files, memory, crypto, content and the signed in profile, with game files read from host folders or a disc image.
 - **Image Switching** - Starts the matching executable when the game launches another XEX, handing over the last frame so the picture stays on screen.
+- **Launch Choice** - Asks the player a question at launch, such as which mode to start, with `app::Choose` from `GameInfo::init`.
 
 ### Graphics
 - **Direct3D 9** - Implements the XDK's Direct3D draws, clears, resolves, swaps and queries at the API level, found in each game by signatures.

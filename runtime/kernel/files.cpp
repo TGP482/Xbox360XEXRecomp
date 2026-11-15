@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <optional>
 
 #include "kernel/disc.h"
 #include "kernel/kernel.h"
@@ -22,6 +23,12 @@ std::mutex g_links_lock;
 std::map<std::string, std::string> g_links;  // upper case "\??\GAME:" -> "\Device\Cdrom0"
 std::map<std::string, fs::path> g_devices;   // upper case device -> host directory
 constexpr char kCdRom[] = "\\DEVICE\\CDROM0";
+// host folders over disc folders, the folder's parts upper case
+struct Overlay {
+    std::vector<std::string> folder;
+    fs::path host;
+};
+std::vector<Overlay> g_overlays;
 
 // CreateDisposition, and the IO_STATUS_BLOCK Information an open reports
 enum : uint32_t { kSupersede = 0, kOpen = 1, kCreate = 2, kOpenIf = 3, kOverwrite = 4, kOverwriteIf = 5 };
@@ -62,6 +69,19 @@ std::string Normalize(std::string p) {
     }
     while (out.size() > 1 && out.back() == '\\') out.pop_back();
     return out;
+}
+
+// a console path's folders and file, its separators dropped
+std::vector<std::string> Parts(const std::string& path) {
+    std::vector<std::string> parts;
+    size_t s = 0;
+    while (s < path.size()) {
+        size_t e = path.find('\\', s);
+        if (e == std::string::npos) e = path.size();
+        if (e > s) parts.push_back(path.substr(s, e - s));
+        s = e + 1;
+    }
+    return parts;
 }
 
 // host lookup that ignores case on file systems that do not
@@ -249,17 +269,13 @@ bool CreateSymbolicLink(const std::string& link, const std::string& target) {
     return true;
 }
 
-// a host folder the guest sees as drive: (name:), for a title's own files beside the disc and the hard disk
-void MountHostFolder(const std::string& drive, const std::string& host) {
-    std::string name = Upper(drive.substr(0, drive.find(':')));
-    std::string device = "\\DEVICE\\HOST" + name;
+// a host folder laid over a folder of the disc: its files add to and replace the disc's there, and new files land in it
+void MountDiscOverlay(const std::string& folder, const std::string& host) {
     std::error_code ec;
     fs::create_directories(host, ec);
-    {
-        std::lock_guard<std::mutex> lock(g_links_lock);
-        g_devices[device] = host;
-    }
-    CreateSymbolicLink("\\??\\" + name + ":", device);
+    std::lock_guard<std::mutex> lock(g_links_lock);
+    g_overlays.push_back({Parts(Upper(Normalize(folder))), host});
+    LOGR("files: game:\\%s is laid over by %s", folder.c_str(), host.c_str());
 }
 
 bool DeleteSymbolicLink(const std::string& link) {
@@ -280,6 +296,23 @@ struct Target {
     bool disc = false;                   // on the mounted disc image
     const Disc::Entry* entry = nullptr;  // there: the file or folder, null when missing
 };
+
+// a disc path under an overlay's folder: the overlay's file when it has one, or when the game has nothing there
+std::optional<fs::path> OverlayPath(const std::vector<std::string>& parts, const fs::path& game_dir) {
+    for (const Overlay& o : g_overlays) {
+        if (parts.size() <= o.folder.size()) continue;
+        auto same = [](const std::string& folder, const std::string& part) { return folder == Upper(part); };
+        if (!std::equal(o.folder.begin(), o.folder.end(), parts.begin(), same)) continue;
+        std::vector<std::string> rest(parts.begin() + std::ptrdiff_t(o.folder.size()), parts.end());
+        fs::path host = MatchCase(o.host, rest);
+        std::error_code ec;
+        if (fs::exists(host, ec)) return host;
+        const Disc* disc = MountedDisc();
+        bool in_game = disc ? disc->Find(parts) != nullptr : fs::exists(MatchCase(game_dir, parts), ec);
+        if (!in_game) return host;
+    }
+    return std::nullopt;
+}
 
 Target Resolve(const std::string& xbox_path, uint32_t root_handle) {
     std::string p = Normalize(xbox_path);
@@ -308,20 +341,14 @@ Target Resolve(const std::string& xbox_path, uint32_t root_handle) {
         if (up.compare(0, e.first.size(), e.first) == 0 && (up.size() == e.first.size() || up[e.first.size()] == '\\'))
             if (!best || e.first.size() > best->first.size()) best = &e;
     if (!best) return {};
-    std::vector<std::string> parts;
-    std::string rest = p.substr(best->first.size());
-    size_t s = 0;
-    while (s < rest.size()) {
-        size_t e = rest.find('\\', s);
-        if (e == std::string::npos) e = rest.size();
-        if (e > s) parts.push_back(rest.substr(s, e - s));
-        s = e + 1;
-    }
+    std::vector<std::string> parts = Parts(p.substr(best->first.size()));
     // no console name holds ':', and fs::path would take "D:" as a host drive
     for (auto& part : parts)
         if (part.find(':') != std::string::npos) return {};
-    if (best->first == kCdRom)
+    if (best->first == kCdRom) {
+        if (std::optional<fs::path> host = OverlayPath(parts, best->second)) return {host->string()};
         if (const Disc* disc = MountedDisc()) return {{}, true, disc->Find(parts)};
+    }
     return {MatchCase(best->second, parts).string()};
 }
 

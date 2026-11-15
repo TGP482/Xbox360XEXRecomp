@@ -112,13 +112,14 @@ int64_t NowMs() {
 
 fs::path CompilerDir() { return ExeDir() / "compiler"; }
 
-// the config in compiler\config whose [xex] path is this xex; an included one has no path
-fs::path ConfigFor(const std::string& xex) {
+// the config in compiler\config whose [xex] library is this executable's DLL; an included one has none, so one xex
+// can back several executables
+fs::path ConfigFor(const std::wstring& exe) {
     std::error_code ec;
     for (auto& e : fs::directory_iterator(CompilerDir() / "config", ec)) {
         try {
             toml::table t = toml::parse_file(e.path().string());
-            if (fs::path(t["xex"]["path"].value_or(std::string())).filename() == xex) return e.path();
+            if (fs::path(t["xex"]["library"].value_or(std::string())) == exe + L".dll") return e.path();
         } catch (const toml::parse_error&) {
         }
     }
@@ -129,7 +130,8 @@ std::vector<Image> Images() {
     std::vector<Image> images;
     for (auto& [xex, exe] : kGame.images) {
         std::string name = exe;
-        images.push_back({std::wstring(name.begin(), name.end()), xex, ConfigFor(xex)});
+        std::wstring wide(name.begin(), name.end());
+        images.push_back({wide, xex, ConfigFor(wide)});
     }
     return images;
 }
@@ -137,6 +139,11 @@ std::vector<Image> Images() {
 fs::path WorkDir(const Image& image) { return CompilerDir() / "work" / image.exe; }
 fs::path CodeDll(const Image& image) { return ExeDir() / (image.exe + L".dll"); }
 fs::path StampFile(const Image& image) { return WorkDir(image) / "built.txt"; }
+bool IsThisExe(const Image& image) {
+    wchar_t self[MAX_PATH];
+    GetModuleFileNameW(nullptr, self, MAX_PATH);
+    return _wcsicmp(fs::path(self).stem().c_str(), image.exe.c_str()) == 0;
+}
 std::wstring Quote(const fs::path& path) { return L"\"" + path.wstring() + L"\""; }
 fs::path CompileLog() { return ExeDir() / "logs" / "compile.log"; }
 
@@ -802,7 +809,7 @@ bool PrepareGameCode(const GameFiles& game) {
     CloseHandle(lock);
     if (!built) return false;
     for (const Image& image : images)
-        if (image.xex == IMAGE_XEX && dispatch::Load(CodeDll(image))) return true;
+        if (IsThisExe(image) && dispatch::Load(CodeDll(image))) return true;
     MessageBoxW(nullptr, L"The game's code could not be loaded, see the log in the logs folder.", kGame.title,
                 MB_ICONERROR);
     return false;

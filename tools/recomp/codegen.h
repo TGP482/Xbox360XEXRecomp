@@ -56,6 +56,7 @@ private:
     std::map<uint32_t, Sync> label_in_;   // at each label, over every way there, as the pass before found
     std::map<uint32_t, Sync> label_out_;  // the same, gathered in this pass
     std::string body_;
+    std::set<uint32_t> jumps_;  // calls to the CRT's setjmp, each with a host buffer
     int ret_hook_ = 0;
     size_t insn_count_ = 0;
     std::map<std::string, size_t> unimpl_;

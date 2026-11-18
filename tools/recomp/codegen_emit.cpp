@@ -226,6 +226,7 @@ std::string CodeGen::Declarations() const {
     if (used_.ca) add("uint8_t", "xer_ca", "ctx.xer_ca");
     if (used_.ov) add("uint8_t", "xer_ov", "ctx.xer_ov");
     if (used_.so) add("uint8_t", "xer_so", "ctx.xer_so");
+    for (uint32_t at : jumps_) s += Fmt("\tvoid* jump_%08X[5];\n", at);
     return s;
 }
 
@@ -274,7 +275,14 @@ void CodeGen::EmitCall(const Insn& i, uint32_t target) {
         return;
     }
     Line(Fmt("\t%s = 0x%Xull;", LrW().c_str(), i.addr + 4));
-    if (f == an_.functions.end())
+    auto jmp = an_.cfg.symbols.find("Crt_SetJmp");
+    if (jmp != an_.cfg.symbols.end() && jmp->second == target) {
+        // the guest longjmp restores the context from its buffer, then lands here through the host's
+        jumps_.insert(i.addr);
+        Line(Fmt("\tPPC_SPILL; ppc_jump_mark(uint32_t(ctx.r[3]), jump_%08X); sub_%08X(ctx, base); "
+                 "__builtin_setjmp(jump_%08X); PPC_RELOAD;",
+                 i.addr, target, i.addr));
+    } else if (f == an_.functions.end())
         Line(Fmt("\tPPC_SPILL; ppc_icall(ctx, base, 0x%Xu); PPC_RELOAD;", target));
     else if (f->second.kind == Kind::Import)
         Line(Fmt("\tPPC_SPILL; ppc_import(ctx, base, %u); PPC_RELOAD;", import_slots_.at(target)));
@@ -430,6 +438,7 @@ void CodeGen::EmitPass(const std::vector<uint32_t>& body, bool entry_first) {
     reachable_ = true;
     label_out_.clear();
     body_.clear();
+    jumps_.clear();
     if (!entry_first) {
         Flow(entry_);
         reachable_ = false;

@@ -297,8 +297,11 @@ struct Target {
     const Disc::Entry* entry = nullptr;  // there: the file or folder, null when missing
 };
 
-// a disc path under an overlay's folder: the overlay's file when it has one, or when the game has nothing there
+// a disc path under an overlay's folder: the file of any overlay that has it, else the first overlay's when the game
+// has nothing there
 std::optional<fs::path> OverlayPath(const std::vector<std::string>& parts, const fs::path& game_dir) {
+    std::optional<fs::path> fallback;
+    bool checked = false;
     for (const Overlay& o : g_overlays) {
         if (parts.size() <= o.folder.size()) continue;
         auto same = [](const std::string& folder, const std::string& part) { return folder == Upper(part); };
@@ -307,11 +310,13 @@ std::optional<fs::path> OverlayPath(const std::vector<std::string>& parts, const
         fs::path host = MatchCase(o.host, rest);
         std::error_code ec;
         if (fs::exists(host, ec)) return host;
+        if (checked) continue;
+        checked = true;
         const Disc* disc = MountedDisc();
         bool in_game = disc ? disc->Find(parts) != nullptr : fs::exists(MatchCase(game_dir, parts), ec);
-        if (!in_game) return host;
+        if (!in_game) fallback = host;
     }
-    return std::nullopt;
+    return fallback;
 }
 
 Target Resolve(const std::string& xbox_path, uint32_t root_handle) {

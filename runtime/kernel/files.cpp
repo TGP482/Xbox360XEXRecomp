@@ -184,6 +184,11 @@ bool WildMatch(const std::string& pat, const std::string& s) {
         }
     }
     while (p < pat.size() && pat[p] == '*') p++;
+    // a trailing dot matches a name without one, as the console finds "0*.*" folders
+    if (p < pat.size() && pat[p] == '.') {
+        p++;
+        while (p < pat.size() && pat[p] == '*') p++;
+    }
     return p == pat.size();
 }
 

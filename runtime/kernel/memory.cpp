@@ -1,6 +1,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -115,12 +116,19 @@ static uint8_t* Reserve() {
 }
 #endif
 
+#ifdef _WIN32
+static LONG CALLBACK OnWatchedWrite(EXCEPTION_POINTERS* e);
+#endif
+
 bool Init() {
     g_base = Reserve();
     if (!g_base) {
         LOGE("memory: could not reserve the 4 GB guest space");
         return false;
     }
+#ifdef _WIN32
+    AddVectoredExceptionHandler(1, OnWatchedWrite);
+#endif
     LOGR("memory: guest space at %p", static_cast<void*>(g_base));
     return true;
 }
@@ -443,6 +451,8 @@ uint32_t AllocPhysical(uint32_t size, uint32_t protect, uint32_t lowest, uint32_
     uint32_t hi = std::min(highest, kPhysicalSize - 1);
     // highest fit first: low memory stays free for requests limited to it
     uint32_t pa = g_physical.Alloc(size, align, lowest, hi, true);
+    // committing again would reset a watched page's protection behind the watch
+    if (pa) Unwatch(VirtualFromPhysical(pa), size);
     if (!pa || !CommitPhysical(pa, size)) {
         LOGE("memory: physical allocation of %X bytes failed (%X..%X align %X), %llu KB in use", size, lowest,
              highest, align, (unsigned long long)(g_physical.Used() >> 10));
@@ -513,6 +523,101 @@ uint32_t PhysicalFromVirtual(uint32_t va) {
 }
 
 uint32_t VirtualFromPhysical(uint32_t pa) { return kPhysical64k | (pa & (kPhysicalSize - 1)); }
+
+// Write tracking
+
+static std::mutex g_watch_lock;
+static std::vector<uint8_t> g_watched(kPhysicalSize / kPage, 0);
+static std::vector<std::atomic<uint32_t>> g_page_writes(kPhysicalSize / kPage);
+static std::atomic<uint64_t> g_writes{0};
+
+uint64_t Writes() { return g_writes.load(std::memory_order_acquire); }
+
+uint64_t WriteSum(uint32_t pa, uint32_t size) {
+    uint64_t sum = 0;
+    uint64_t end = std::min<uint64_t>(uint64_t(pa) + size, kPhysicalSize);
+    for (uint64_t p = pa / kPage; p < (end + kPage - 1) / kPage; p++) sum += g_page_writes[p].load();
+    return sum;
+}
+
+#ifdef _WIN32
+// a run of physical pages in all three windows; the 4 KB window shows page 0 at its end
+static void ProtectPages(uint32_t page, uint32_t count, DWORD protect) {
+    DWORD old;
+    uint32_t pa = page * kPage;
+    size_t bytes = size_t(count) * kPage;
+    VirtualProtect(g_base + kPhysical64k + pa, bytes, protect, &old);
+    VirtualProtect(g_base + kPhysical16m + pa, bytes, protect, &old);
+    if (page) {
+        VirtualProtect(g_base + kPhysical4k + pa - kPage, bytes, protect, &old);
+        return;
+    }
+    VirtualProtect(g_base + kPhysical4k + kPhysicalSize - kPage, kPage, protect, &old);
+    if (count > 1) VirtualProtect(g_base + kPhysical4k, bytes - kPage, protect, &old);
+}
+
+// under g_watch_lock
+static void Open(uint32_t page) {
+    ProtectPages(page, 1, PAGE_READWRITE);
+    g_watched[page] = 0;
+    g_page_writes[page].fetch_add(1);
+    g_writes.fetch_add(1, std::memory_order_release);
+}
+
+static LONG CALLBACK OnWatchedWrite(EXCEPTION_POINTERS* e) {
+    const EXCEPTION_RECORD& r = *e->ExceptionRecord;
+    constexpr ULONG_PTR kWrite = 1;
+    if (r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION || r.ExceptionInformation[0] != kWrite) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    uintptr_t at = r.ExceptionInformation[1];
+    uintptr_t base = reinterpret_cast<uintptr_t>(g_base);
+    if (at < base + kPhysical64k || at >= base + kSpace) return EXCEPTION_CONTINUE_SEARCH;
+    uint32_t page = PhysicalFromVirtual(uint32_t(at - base)) / kPage;
+    std::lock_guard<std::mutex> lock(g_watch_lock);
+    if (g_watched[page]) {
+        Open(page);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    // another thread opened it between the fault and the lock
+    MEMORY_BASIC_INFORMATION mi;
+    bool open = VirtualQuery(reinterpret_cast<void*>(at), &mi, sizeof(mi)) && mi.Protect == PAGE_READWRITE;
+    return open ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+}
+
+bool Watch(uint32_t pa, uint32_t size) {
+    uint64_t end = uint64_t(pa) + size;
+    if (!size || end > kPhysicalSize) return false;
+    uint32_t first = pa / kPage;
+    uint32_t last = uint32_t((end + kPage - 1) / kPage);
+    for (uint32_t p = first; p < last; p++)
+        if (!g_physical_committed[p]) return false;
+    std::lock_guard<std::mutex> lock(g_watch_lock);
+    for (uint32_t p = first; p < last;) {
+        if (g_watched[p]) {
+            p++;
+            continue;
+        }
+        uint32_t start = p;
+        while (p < last && !g_watched[p]) g_watched[p++] = 1;
+        ProtectPages(start, p - start, PAGE_READONLY);
+    }
+    return true;
+}
+
+void Unwatch(uint32_t va, uint32_t size) {
+    if (!size || !InPhysical(va)) return;
+    uint64_t end = std::min<uint64_t>(uint64_t(va) + size, kSpace);
+    std::lock_guard<std::mutex> lock(g_watch_lock);
+    for (uint64_t at = va & ~(kPage - 1); at < end; at += kPage) {
+        uint32_t page = PhysicalFromVirtual(uint32_t(at)) / kPage;
+        if (g_watched[page]) Open(page);
+    }
+}
+#else
+bool Watch(uint32_t, uint32_t) { return false; }
+void Unwatch(uint32_t, uint32_t) {}
+#endif
 
 Stats Query() {
     std::lock_guard<std::recursive_mutex> lock(g_lock);

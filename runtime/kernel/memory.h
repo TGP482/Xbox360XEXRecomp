@@ -68,6 +68,12 @@ void FreeSystem(uint32_t va);
 uint32_t AllocStack(uint32_t size);  // returns the top, guard below the bottom
 void FreeStack(uint32_t top);
 
+// write tracking for host caches: a watched physical page faults on its first write, which counts it and opens it
+bool Watch(uint32_t pa, uint32_t size);
+void Unwatch(uint32_t va, uint32_t size);  // before a host OS call writes guest memory, which cannot fault
+uint64_t Writes();                         // first writes to watched pages so far
+uint64_t WriteSum(uint32_t pa, uint32_t size);
+
 uint32_t PhysicalFromVirtual(uint32_t va);
 uint32_t VirtualFromPhysical(uint32_t pa);  // in the 64 KB window, which shows physical memory at its own address
 

@@ -567,6 +567,7 @@ constexpr uint32_t kSegment = 0x1000;
 constexpr uint32_t kSegmentElement = 8;
 
 size_t Move(File& f, bool write, uint64_t pos, uint32_t at, uint32_t chunk) {
+    if (!write) mem::Unwatch(at, chunk);
     if (f.entry) return MountedDisc()->Read(*f.entry, pos, HostPtr(at), chunk);
     if (write) return std::fwrite(HostPtr(at), 1, chunk, f.fp);
     return std::fread(HostPtr(at), 1, chunk, f.fp);

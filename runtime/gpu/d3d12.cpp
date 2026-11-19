@@ -209,6 +209,11 @@ struct Texture {
     uint64_t next_hash = 0;
     uint64_t hashed_for = ~0ull;
     std::atomic<uint32_t> next_state = 0;  // HashState of next_hash
+    // checks the bytes held; once watched, the write counts of its pages then and the write count it last saw
+    uint32_t stable = 0;
+    bool watched = false;
+    uint64_t write_sum = 0;
+    uint64_t writes_seen = 0;
     // the key the texture pack and the dumps know the bytes by, the texturedumper::Generation it was taken at, and
     // the pack image drawn in place of the guest's
     uint64_t pack_key = 0;
@@ -633,6 +638,7 @@ private:
     Texture* FrameTexture(const uint32_t fetch[6], const xenos::TextureFetch& t);
     void HashAhead();
     uint64_t NextHash(Texture& tex);
+    void CheckBytes(Texture& tex, const xenos::TextureFetch& t, const std::vector<xenos::Level>& levels);
     void UploadTexture(Texture& tex, const xenos::TextureFetch& t);
     void UploadRows(ID3D12Resource* res, uint32_t sub, const std::vector<uint8_t>& rows, uint32_t pitch);
     void LatchPackKey(Texture& tex, const xenos::TextureFetch& t);
@@ -1590,16 +1596,60 @@ uint64_t SpanHash(const void* data, size_t n, uint64_t seed) {
     return Hash64(h, sizeof(h), Hash64(p + i, n - i, n));
 }
 
-// the guest bytes a texture covers, levels and faces included
-uint64_t GuestHash(const xenos::TextureFetch& t, const std::vector<xenos::Level>& levels) {
+// the guest bytes a texture covers, levels and faces included, as address and size
+template <class F>
+void EachSpan(const xenos::TextureFetch& t, const std::vector<xenos::Level>& levels, F f) {
     const xenos::FormatInfo& fi = xenos::Info(t.format);
-    uint64_t h = 0;
     for (const xenos::Level& l : levels) {
         uint64_t bytes = uint64_t(l.pitch_blocks) * l.rows_blocks * fi.bytes;
         uint64_t total = l.face_stride ? uint64_t(l.face_stride) * (t.depth - 1) + bytes : bytes;
-        h = SpanHash(Guest(l.address), size_t(std::min<uint64_t>(total, UINT32_MAX - l.address)), h);
+        f(l.address, uint32_t(std::min<uint64_t>(total, UINT32_MAX - l.address)));
     }
+}
+
+uint64_t GuestHash(const xenos::TextureFetch& t, const std::vector<xenos::Level>& levels) {
+    uint64_t h = 0;
+    EachSpan(t, levels, [&](uint32_t address, uint32_t size) { h = SpanHash(Guest(address), size, h); });
     return h;
+}
+
+// checks a texture's bytes hold before its pages are watched for writes: well past a 15 fps video even at 2000 fps
+constexpr uint32_t kWatchAfter = 240;
+
+uint32_t PhysicalOf(uint32_t address) { return address & (mem::kPhysicalSize - 1); }
+
+uint64_t PageWrites(const Texture& tex) {
+    uint64_t sum = 0;
+    EachSpan(tex.guest, tex.guest_levels, [&](uint32_t address, uint32_t size) {
+        sum += mem::WriteSum(PhysicalOf(address), size);
+    });
+    return sum;
+}
+
+// nothing wrote a watched texture's pages since it was watched; a write ends the watch
+bool Unwritten(Texture& tex) {
+    if (!tex.watched) return false;
+    uint64_t writes = mem::Writes();
+    if (writes == tex.writes_seen) return true;
+    if (PageWrites(tex) != tex.write_sum) {
+        tex.watched = false;
+        tex.stable = 0;
+        return false;
+    }
+    tex.writes_seen = writes;
+    return true;
+}
+
+// counts before protection: a write that lands after the hash that follows still moves them
+bool WatchPages(Texture& tex) {
+    tex.writes_seen = mem::Writes();
+    tex.write_sum = PageWrites(tex);
+    bool ok = true;
+    EachSpan(tex.guest, tex.guest_levels, [&](uint32_t address, uint32_t size) {
+        ok = ok && mem::Watch(PhysicalOf(address), size);
+    });
+    tex.watched = ok;
+    return ok;
 }
 
 DXGI_FORMAT HostTextureFormat(const xenos::TextureFetch& t) {
@@ -1640,12 +1690,7 @@ Texture* D3D12Backend::EnsureTexture(const xenos::TextureFetch& t) {
     }
     if (tex.checked != presents_) {
         tex.checked = presents_;
-        uint64_t h = tex.hashed_for == presents_ ? NextHash(tex) : GuestHash(t, levels);
-        if (h != tex.hash) {
-            tex.hash = h;
-            UploadTexture(tex, t);
-            tex.pack_gen = 0;
-        }
+        if (!Unwritten(tex)) CheckBytes(tex, t, levels);
     }
     if (tex.pack_gen != texturedumper::Generation()) LatchPackKey(tex, t);
     if (tex.pack_key) LatchPackImage(tex);
@@ -1712,6 +1757,25 @@ void D3D12Backend::ReleasePackTextures() {
     texture_views_.clear();
 }
 
+// the bytes hashed again and uploaded when they changed; bytes that held long enough get their pages watched first, so
+// the hash after it sees every write before it
+void D3D12Backend::CheckBytes(Texture& tex, const xenos::TextureFetch& t, const std::vector<xenos::Level>& levels) {
+    bool watching = false;
+    if (tex.stable >= kWatchAfter) {
+        watching = WatchPages(tex);
+        if (!watching) tex.stable = 0;
+    }
+    uint64_t h = !watching && tex.hashed_for == presents_ ? NextHash(tex) : GuestHash(t, levels);
+    if (h == tex.hash) {
+        tex.stable++;
+        return;
+    }
+    tex.hash = h;
+    tex.stable = 0;
+    UploadTexture(tex, t);
+    tex.pack_gen = 0;
+}
+
 // a texture's hash ahead, unless another thread took it
 void TakeHash(Texture& tex) {
     uint32_t waiting = kHashWaiting;
@@ -1733,7 +1797,7 @@ void D3D12Backend::HashAhead() {
     pool_.Wait();
     hash_ahead_.clear();
     for (auto& [fetch, tex] : frame_textures_) {
-        if (!tex || tex->hashed_for == presents_) continue;
+        if (!tex || tex->hashed_for == presents_ || Unwritten(*tex)) continue;
         tex->hashed_for = presents_;
         tex->next_state.store(kHashWaiting, std::memory_order_relaxed);
         hash_ahead_.push_back(tex);

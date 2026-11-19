@@ -661,6 +661,7 @@ XAM_EXPORT(0x12, NetDll_recv) {
     for (;;) {
         Socket k = Find(a[1]);
         if (k.s == INVALID_SOCKET) return Fail(WSAENOTSOCK);
+        mem::Unwatch(a[2], a[3]);
         int n = ::recv(k.s, static_cast<char*>(HostPtr(a[2])), int(a[3]), int(a[4]));
         if (n >= 0) return uint32_t(n);
         int e = WSAGetLastError();

@@ -1,6 +1,7 @@
 #include "gpu/xenos_format.h"
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
 
 namespace xenos {
@@ -160,18 +161,27 @@ void SwapEndian(uint8_t* p, size_t n, Endian e) {
         case Endian::None:
             return;
         case Endian::Swap8In16:
-            for (size_t i = 0; i + 2 <= n; i += 2) std::swap(p[i], p[i + 1]);
+            for (size_t i = 0; i + 2 <= n; i += 2) {
+                uint16_t v;
+                std::memcpy(&v, p + i, 2);
+                v = __builtin_bswap16(v);
+                std::memcpy(p + i, &v, 2);
+            }
             return;
         case Endian::Swap8In32:
             for (size_t i = 0; i + 4 <= n; i += 4) {
-                std::swap(p[i], p[i + 3]);
-                std::swap(p[i + 1], p[i + 2]);
+                uint32_t v;
+                std::memcpy(&v, p + i, 4);
+                v = __builtin_bswap32(v);
+                std::memcpy(p + i, &v, 4);
             }
             return;
         case Endian::Swap16In32:
             for (size_t i = 0; i + 4 <= n; i += 4) {
-                std::swap(p[i], p[i + 2]);
-                std::swap(p[i + 1], p[i + 3]);
+                uint32_t v;
+                std::memcpy(&v, p + i, 4);
+                v = v >> 16 | v << 16;
+                std::memcpy(p + i, &v, 4);
             }
             return;
     }
@@ -205,11 +215,7 @@ uint32_t NextPow2(uint32_t v) {
     return p;
 }
 
-uint32_t Log2(uint32_t v) {
-    uint32_t n = 0;
-    while ((1u << (n + 1)) <= v) n++;
-    return n;
-}
+uint32_t Log2(uint32_t v) { return v ? uint32_t(std::bit_width(v)) - 1 : 0; }
 
 Level MakeLevel(const TextureFetch& t, const FormatInfo& fi, uint32_t w, uint32_t h, uint32_t store_w,
                 uint32_t store_h, uint32_t address) {
@@ -362,15 +368,19 @@ void CopyLevel(const uint8_t* src, const TextureFetch& t, const Level& l, const 
                uint32_t bh, uint8_t* out, uint32_t row_pitch) {
     uint32_t run = bw;
     if (t.tiled) run = l.x % 8 ? 1 : std::min(8u, 16u >> Log2(fi.bytes));
+    // texels holding whole swap units swap a row at once
+    uint32_t unit = t.endian == Endian::Swap8In16 ? 2 : 4;
+    bool span = t.endian == Endian::None || fi.bytes % unit == 0;
     for (uint32_t by = 0; by < bh; by++) {
         uint8_t* row = out + size_t(by) * row_pitch;
         for (uint32_t bx = 0; bx < bw; bx += run) {
             uint32_t n = std::min(run, bw - bx);
             uint8_t* o = row + size_t(bx) * fi.bytes;
             std::memcpy(o, BlockAt(src, l, fi, t.tiled, bx, by), size_t(n) * fi.bytes);
-            if (t.endian == Endian::None) continue;
+            if (span) continue;
             for (uint32_t k = 0; k < n; k++) SwapEndian(o + size_t(k) * fi.bytes, fi.bytes, t.endian);
         }
+        if (span) SwapEndian(row, size_t(bw) * fi.bytes, t.endian);
     }
 }
 

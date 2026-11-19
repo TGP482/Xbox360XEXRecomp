@@ -58,3 +58,4 @@ extern "C" const uint32_t PPCImageBase;
 extern "C" const uint32_t PPCImageEnd;
 extern "C" const uint32_t PPCEntryPoint;
 extern "C" PPCFunc* const PPCBodies[];  // each recompiled body, in the order the executable's stubs index
+extern "C" const uint8_t PPCExactCallees[];  // per mapping: calls rely on the body, so it must not be overridden

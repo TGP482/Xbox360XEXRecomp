@@ -36,6 +36,7 @@ struct Config {
     std::map<uint32_t, std::string> functions;  // extra entry points
     // names the host binds to: functions it replaces and data it reads; 0 = not in this image
     std::map<std::string, uint32_t> symbols;
+    std::set<uint32_t> overridden;  // functions the host may replace: named symbols and PPC_FUNC(sub_X) in src
     std::map<std::string, uint32_t> data;
     std::map<std::string, uint32_t> layout;  // XDK data layout, emitted as XDK_<name>
     std::vector<std::pair<uint32_t, uint32_t>> data_ranges;  // data inside code sections, end exclusive

@@ -69,6 +69,7 @@ void CodeGen::EmitHooks(uint32_t va, bool after) {
     for (auto [it, e] = an_.cfg.hooks.equal_range(va); it != e; ++it) {
         const Hook& h = it->second;
         if (h.after != after) continue;
+        unknown_calls_ = true;
         auto leave = [&](const Hook::Exit& x) { return x.ret ? std::string("PPC_SPILL; return;") : Jump(va, x.to); };
         if (!h.Returns()) {
             Line(Fmt("\tPPC_SPILL; %s(ctx, base); PPC_RELOAD;", h.call.c_str()));
@@ -163,7 +164,14 @@ void CodeGen::WriteMapping(const std::vector<uint32_t>& funcs, const std::vector
     s += "\nPPCFunc* const PPCBodies[] = {\n";
     for (const std::vector<uint32_t>* list : {&funcs, &absent})
         for (uint32_t f : *list) s += Fmt("\t__imp__sub_%08X,\n", f);
-    s += "};\n";
+    s += "};\n\n";
+    // 1 where calls rely on what the body reads and writes, in funcs order: such a function must not be overridden
+    s += "const uint8_t PPCExactCallees[] = {";
+    for (size_t k = 0; k < funcs.size(); k++) {
+        const char* row = k % 64 ? "" : "\n\t";
+        s += Fmt("%s%d,", row, int(exact_called_.count(funcs[k])));
+    }
+    s += "\n};\n";
     for (uint32_t f : absent) {
         s += Fmt("\nPPC_FUNC(__imp__sub_%08X) { ppc_trap(ctx, 0x%Xu, \"not in this image\"); }\n", f, f);
         s += Fmt("PPC_WEAK_FUNC(sub_%08X, __imp__sub_%08X)\n", f, f);
@@ -176,7 +184,7 @@ void CodeGen::WriteDefs() const {
     std::string library = Fmt("LIBRARY %s\nEXPORTS\n", an_.cfg.library.c_str());
     std::string exports;
     for (const char* table : {"PPCFuncMappings", "PPCImports", "PPCCodeBase", "PPCCodeEnd", "PPCImageBase",
-                              "PPCImageEnd", "PPCEntryPoint", "PPCBodies"})
+                              "PPCImageEnd", "PPCEntryPoint", "PPCBodies", "PPCExactCallees"})
         exports += Fmt("    %s DATA\n", table);
     WriteIfChanged(out_ / "exports.def", library + exports);
     WriteIfChanged(out_ / "imports.def", library + exports);
@@ -209,11 +217,14 @@ bool CodeGen::Run() {
     std::vector<uint32_t> absent;
     WriteSymbols(absent);
     WriteShared(funcs, absent);
+    Summarize(funcs);
     WritePartitions(funcs);
     WriteMapping(funcs, absent);
     WriteDefs();
     WriteHostBodies(funcs, absent);
-    std::string stats = Fmt("functions %zu\ninstructions %zu\n", funcs.size(), insn_count_);
+    size_t exact = 0;
+    for (uint32_t f : funcs) exact += Exact(f) != nullptr;
+    std::string stats = Fmt("functions %zu\ninstructions %zu\nexact summaries %zu\n", funcs.size(), insn_count_, exact);
     for (auto& [k, v] : unimpl_) stats += Fmt("unimplemented %s %zu\n", k.c_str(), v);
     WriteIfChanged(out_ / "ppc_recomp_stats.txt", stats);
     std::fprintf(stderr, "%s", stats.c_str());

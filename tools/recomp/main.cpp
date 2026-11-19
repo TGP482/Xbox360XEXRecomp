@@ -174,6 +174,22 @@ static bool CheckOverrides(const Analysis& an) {
     return ok;
 }
 
+// the game's host overrides by address, PPC_FUNC(sub_X) anywhere in its sources
+static void FindOverrides(const fs::path& src, Config& cfg) {
+    static const std::string kOverride = "PPC_FUNC(sub_";
+    if (!fs::is_directory(src)) return;
+    for (auto& e : fs::recursive_directory_iterator(src)) {
+        if (!e.is_regular_file()) continue;
+        std::ifstream f(e.path(), std::ios::binary);
+        std::string text((std::istreambuf_iterator<char>(f)), {});
+        for (size_t at = text.find(kOverride); at != std::string::npos; at = text.find(kOverride, at + 1)) {
+            std::string hex = text.substr(at + kOverride.size(), 8);
+            if (hex.size() == 8 && hex.find_first_not_of("0123456789abcdefABCDEF") == std::string::npos)
+                cfg.overridden.insert(uint32_t(std::stoul(hex, nullptr, 16)));
+        }
+    }
+}
+
 static bool ReadImage(const fs::path& path, xex::Image& img) {
     std::ifstream f(path, std::ios::binary);
     if (!f) {
@@ -221,6 +237,9 @@ int main(int argc, char** argv) {
                      args[0].c_str(), cfg.title, cfg.entry);
         return 1;
     }
+    for (auto& [name, va] : cfg.symbols)
+        if (va) cfg.overridden.insert(va);
+    FindOverrides(root / "src", cfg);
     fs::path out_dir = args.size() > 2 ? fs::path(args[2]) : root / cfg.out_dir;
     Analysis an(img, cfg);
     an.Run();

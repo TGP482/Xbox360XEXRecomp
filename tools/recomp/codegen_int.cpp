@@ -505,6 +505,7 @@ bool CodeGen::EmitSystem(const Insn& i) {
                      (i.word >> 21) & 1 ? 128 : 32));
             return true;
         case Op::sc:
+            unknown_calls_ = true;
             Line("\tPPC_SPILL; ppc_syscall(ctx, base); PPC_RELOAD;");
             return true;
         default:

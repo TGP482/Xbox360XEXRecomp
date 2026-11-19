@@ -4,6 +4,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "analysis.h"
@@ -11,6 +12,7 @@
 // Every guest register a function touches is a C++ local: loaded from the context at entry and after each call,
 // stored back before each call and return. Inside a function the host compiler keeps them in host registers.
 // A store covers the registers some path wrote since the last call on it; the context still holds the others.
+// A direct call to a function without unknown calls below it stores and reloads only the registers it touches.
 struct RegSet {
     std::bitset<32> gpr;
     std::bitset<32> fpr;
@@ -31,6 +33,14 @@ struct Sync {
     bool operator==(const Sync&) const = default;
 };
 
+// What a call to a function can read or change in the context, its callees' included
+struct Summary {
+    bool all = false;  // anything: indirect calls, imports, hooks, host overrides
+    RegSet touched;
+    RegSet written;
+    std::vector<uint32_t> callees;
+};
+
 class CodeGen {
 public:
     CodeGen(const Analysis& an, std::filesystem::path out) : an_(an), out_(std::move(out)) {}
@@ -42,6 +52,8 @@ private:
     std::map<uint32_t, uint32_t> import_slots_;  // import thunk to its index in PPCImports
     uint32_t code_base_ = 0;
     uint32_t code_words_ = 0;
+    std::unordered_map<uint32_t, Summary> summaries_;
+    bool summarizing_ = false;  // no summary is complete yet
 
     // the function being emitted
     uint32_t entry_ = 0;
@@ -58,6 +70,11 @@ private:
     std::string body_;
     std::set<uint32_t> jumps_;  // calls to the CRT's setjmp, each with a host buffer
     int ret_hook_ = 0;
+    bool unknown_calls_ = false;
+    std::vector<uint32_t> callees_;
+    uint32_t callee_ = 0;         // the direct call on the line being emitted, stored and reloaded by its summary
+    std::set<uint32_t> reloads_;  // callees with a reload of their own in this function
+    std::set<uint32_t> exact_called_;  // callees whose body the calls rely on, checked against overrides at start
     size_t insn_count_ = 0;
     std::map<std::string, size_t> unimpl_;
 
@@ -89,6 +106,9 @@ private:
     std::string OvW();
 
     // functions and their files
+    void Summarize(const std::vector<uint32_t>& funcs);
+    const Summary* Exact(uint32_t target) const;
+    bool BeginFunction(uint32_t entry);
     std::string EmitFunction(uint32_t entry);
     std::string EmitImport(uint32_t entry, uint32_t slot);
     std::string RegisterBlock(const RegSet& set, bool spill) const;

@@ -45,17 +45,49 @@ std::string Fmt(const char* f, ...) {
     return s;
 }
 
+RegSet Both(const RegSet& a, const RegSet& b) {
+    RegSet s;
+    s.gpr = a.gpr & b.gpr;
+    s.fpr = a.fpr & b.fpr;
+    s.vr = a.vr & b.vr;
+    s.cr = a.cr & b.cr;
+    s.ctr = a.ctr && b.ctr;
+    s.lr = a.lr && b.lr;
+    s.ca = a.ca && b.ca;
+    s.ov = a.ov && b.ov;
+    s.so = a.so && b.so;
+    return s;
+}
+
+RegSet Without(const RegSet& a, const RegSet& b) {
+    RegSet s;
+    s.gpr = a.gpr & ~b.gpr;
+    s.fpr = a.fpr & ~b.fpr;
+    s.vr = a.vr & ~b.vr;
+    s.cr = a.cr & ~b.cr;
+    s.ctr = a.ctr && !b.ctr;
+    s.lr = a.lr && !b.lr;
+    s.ca = a.ca && !b.ca;
+    s.ov = a.ov && !b.ov;
+    s.so = a.so && !b.so;
+    return s;
+}
+
+void Add(RegSet& into, const RegSet& from) {
+    into.gpr |= from.gpr;
+    into.fpr |= from.fpr;
+    into.vr |= from.vr;
+    into.cr |= from.cr;
+    into.ctr = into.ctr || from.ctr;
+    into.lr = into.lr || from.lr;
+    into.ca = into.ca || from.ca;
+    into.ov = into.ov || from.ov;
+    into.so = into.so || from.so;
+}
+
 void Merge(Sync& into, const Sync& from) {
     into.all = into.all || from.all;
-    into.dirty.gpr |= from.dirty.gpr;
-    into.dirty.fpr |= from.dirty.fpr;
-    into.dirty.vr |= from.dirty.vr;
-    into.dirty.cr |= from.dirty.cr;
-    into.dirty.ctr = into.dirty.ctr || from.dirty.ctr;
-    into.dirty.lr = into.dirty.lr || from.dirty.lr;
-    into.dirty.ca = into.dirty.ca || from.dirty.ca;
-    into.dirty.ov = into.dirty.ov || from.dirty.ov;
-    into.dirty.so = into.dirty.so || from.dirty.so;
+    Add(into.dirty, from.dirty);
 }
 
 // PPC_SPILL in a line becomes the stores of the registers that can differ from the context there
@@ -64,8 +96,9 @@ void CodeGen::Line(std::string s) {
     bool always = s.rfind("\t" + kSpill, 0) == 0 || s.rfind("\tif (true) {", 0) == 0;
     bool call = always && s.find("PPC_RELOAD;") != std::string::npos;
     bool every = sync_.all || !reachable_;
+    const RegSet* touched = callee_ ? &summaries_.at(callee_).touched : nullptr;
     if (!every && s.find(kSpill) != std::string::npos) {
-        std::string stores = RegisterBlock(sync_.dirty, true);
+        std::string stores = RegisterBlock(touched ? Both(sync_.dirty, *touched) : sync_.dirty, true);
         if (!stores.empty()) stores.erase(0, 1);
         for (size_t at = s.find(kSpill); at != std::string::npos; at = s.find(kSpill, at + stores.size())) {
             // without stores the space after the macro goes too
@@ -75,6 +108,8 @@ void CodeGen::Line(std::string s) {
     }
     // past a call that always runs every local is the context's
     if (call && !conditional_) sync_ = {};
+    // past a direct call the callee's registers are the context's, the others keep what they had
+    if (touched && !conditional_) sync_.dirty = Without(sync_.dirty, *touched);
     body_ += s;
     body_ += '\n';
 }
@@ -248,6 +283,8 @@ std::string CodeGen::Jump(uint32_t from, uint32_t to) {
 
 std::string CodeGen::TailCall(uint32_t to) {
     auto f = an_.functions.find(to);
+    if (f == an_.functions.end() || f->second.kind == Kind::Import) unknown_calls_ = true;
+    else callees_.push_back(to);
     if (f == an_.functions.end())
         return Fmt("{ PPC_SPILL; ppc_icall(ctx, base, 0x%Xu); return; }", to);
     if (f->second.kind == Kind::Import)
@@ -279,15 +316,28 @@ void CodeGen::EmitCall(const Insn& i, uint32_t target) {
     if (jmp != an_.cfg.symbols.end() && jmp->second == target) {
         // the guest longjmp restores the context from its buffer, then lands here through the host's
         jumps_.insert(i.addr);
+        callees_.push_back(target);
         Line(Fmt("\tPPC_SPILL; ppc_jump_mark(uint32_t(ctx.r[3]), jump_%08X); sub_%08X(ctx, base); "
                  "__builtin_setjmp(jump_%08X); PPC_RELOAD;",
                  i.addr, target, i.addr));
-    } else if (f == an_.functions.end())
+    } else if (f == an_.functions.end()) {
+        unknown_calls_ = true;
         Line(Fmt("\tPPC_SPILL; ppc_icall(ctx, base, 0x%Xu); PPC_RELOAD;", target));
-    else if (f->second.kind == Kind::Import)
+    } else if (f->second.kind == Kind::Import) {
+        unknown_calls_ = true;
         Line(Fmt("\tPPC_SPILL; ppc_import(ctx, base, %u); PPC_RELOAD;", import_slots_.at(target)));
-    else
-        Line(Fmt("\tPPC_SPILL; sub_%08X(ctx, base); PPC_RELOAD;", target));
+    } else {
+        callees_.push_back(target);
+        if (!Exact(target) || sync_.all || !reachable_) {
+            Line(Fmt("\tPPC_SPILL; sub_%08X(ctx, base); PPC_RELOAD;", target));
+            return;
+        }
+        reloads_.insert(target);
+        exact_called_.insert(target);
+        callee_ = target;
+        Line(Fmt("\tPPC_SPILL; sub_%08X(ctx, base); PPC_RELOAD_%08X;", target, target));
+        callee_ = 0;
+    }
 }
 
 // Save and restore helpers run inline: they are called from nearly every prologue and epilogue, and a call would
@@ -305,6 +355,7 @@ void CodeGen::EmitHelper(uint32_t entry, bool tail) {
 // bcctr through a jump table becomes a switch on ctr, any other a jump through the function table
 void CodeGen::EmitIndirect(const Insn& i) {
     auto jt = an_.jump_tables.find(i.addr);
+    unknown_calls_ = true;
     if (jt == an_.jump_tables.end()) {
         Line(Fmt("\tPPC_SPILL; [[clang::musttail]] return ppc_jump_ctr(ctx, base);"));
         return;
@@ -343,6 +394,7 @@ bool CodeGen::EmitBranch(const Insn& i) {
         case Op::bclr: {
             std::string c = BranchCond(i);
             if (i.Link()) {
+                unknown_calls_ = true;
                 Line(Fmt("\tif (%s) { uint32_t t = uint32_t(%s); %s = 0x%Xull; PPC_SPILL; "
                          "ppc_call(ctx, base, t, 0x%Xu, %u); PPC_RELOAD; }",
                          c.c_str(), Lr().c_str(), LrW().c_str(), i.addr + 4, code_base_, code_words_));
@@ -353,6 +405,7 @@ bool CodeGen::EmitBranch(const Insn& i) {
         }
         case Op::bcctr: {
             std::string c = BranchCond(i);
+            if (!Always(i.Bo()) || i.Link()) unknown_calls_ = true;
             if (i.Link()) {
                 Line(Fmt("\tif (%s) { %s = 0x%Xull; PPC_SPILL; ppc_call(ctx, base, uint32_t(%s), 0x%Xu, %u); "
                          "PPC_RELOAD; }",
@@ -439,6 +492,9 @@ void CodeGen::EmitPass(const std::vector<uint32_t>& body, bool entry_first) {
     label_out_.clear();
     body_.clear();
     jumps_.clear();
+    unknown_calls_ = false;
+    callees_.clear();
+    reloads_.clear();
     if (!entry_first) {
         Flow(entry_);
         reachable_ = false;
@@ -447,19 +503,72 @@ void CodeGen::EmitPass(const std::vector<uint32_t>& body, bool entry_first) {
     EmitBody(body);
 }
 
-std::string CodeGen::EmitFunction(uint32_t entry) {
-    constexpr int kMaxPasses = 64;
+// the function's labels; true when its body starts at its entry
+bool CodeGen::BeginFunction(uint32_t entry) {
     entry_ = entry;
     labels_.clear();
+    label_in_.clear();
     const std::vector<uint32_t>& body = an_.Body(entry);
     body_set_ = std::set<uint32_t>(body.begin(), body.end());
     CollectLabels(body);
     bool entry_first = !body.empty() && body.front() == entry;
     if (!entry_first) labels_.insert(entry);
+    return entry_first;
+}
+
+// a callee whose summary is complete and holds no unknown calls
+const Summary* CodeGen::Exact(uint32_t target) const {
+    if (summarizing_) return nullptr;
+    auto s = summaries_.find(target);
+    return s != summaries_.end() && !s->second.all ? &s->second : nullptr;
+}
+
+// What every function reads and writes, its callees' included, so a direct call stores and reloads only those.
+// The registers a function touches come from one emission, which they do not depend on.
+void CodeGen::Summarize(const std::vector<uint32_t>& funcs) {
+    size_t insn_count = insn_count_;
+    std::map<std::string, size_t> unimpl = unimpl_;
+    summarizing_ = true;
+    for (uint32_t f : funcs) summaries_[f].all = true;
+    for (uint32_t f : funcs) {
+        bool host = an_.cfg.trace.count(f) || an_.cfg.overridden.count(f);
+        if (an_.functions.at(f).kind == Kind::Import || host) continue;
+        first_pass_ = true;
+        EmitPass(an_.Body(f), BeginFunction(f));
+        summaries_[f] = {unknown_calls_, used_, written_, callees_};
+    }
+    summarizing_ = false;
+    insn_count_ = insn_count;
+    unimpl_ = unimpl;
+    // callees' registers spread to their callers until nothing changes; any unknown callee makes the caller unknown
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (uint32_t f : funcs) {
+            Summary& s = summaries_.at(f);
+            if (s.all) continue;
+            for (uint32_t c : s.callees) {
+                const Summary* callee = Exact(c);
+                if (!callee) {
+                    s.all = changed = true;
+                    break;
+                }
+                RegSet touched = s.touched;
+                RegSet written = s.written;
+                Add(s.touched, callee->touched);
+                Add(s.written, callee->written);
+                changed = changed || !(touched == s.touched) || !(written == s.written);
+            }
+        }
+    }
+}
+
+std::string CodeGen::EmitFunction(uint32_t entry) {
+    constexpr int kMaxPasses = 64;
+    const std::vector<uint32_t>& body = an_.Body(entry);
+    bool entry_first = BeginFunction(entry);
     // emitted again until the registers at every label stay as the branches there leave them
     size_t insn_count = insn_count_;
     std::map<std::string, size_t> unimpl = unimpl_;
-    label_in_.clear();
     for (int pass = 0;; pass++) {
         insn_count_ = insn_count;
         unimpl_ = unimpl;
@@ -474,11 +583,17 @@ std::string CodeGen::EmitFunction(uint32_t entry) {
     }
     std::string out = Fmt("#define PPC_SPILL%s\n#define PPC_RELOAD%s\n", RegisterBlock(written_, true).c_str(),
                           RegisterBlock(used_, false).c_str());
+    // after a direct call: what the callee can write, of what this function keeps in locals
+    for (uint32_t c : reloads_) {
+        std::string loads = RegisterBlock(Both(summaries_.at(c).written, used_), false);
+        out += Fmt("#define PPC_RELOAD_%08X%s\n", c, loads.c_str());
+    }
     out += Fmt("PPC_FUNC(__imp__sub_%08X) {\n", entry);
     out += Declarations();
     if (!entry_first) out += Fmt("\tgoto loc_%08X;\n", entry);
     out += body_;
     out += "}\n#undef PPC_SPILL\n#undef PPC_RELOAD\n";
+    for (uint32_t c : reloads_) out += Fmt("#undef PPC_RELOAD_%08X\n", c);
     if (an_.cfg.trace.count(entry))
         out += Fmt("PPC_TRACED_FUNC(sub_%08X, __imp__sub_%08X, 0x%Xu)\n\n", entry, entry, entry);
     else

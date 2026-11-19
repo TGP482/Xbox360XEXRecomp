@@ -357,6 +357,23 @@ const uint8_t* BlockAt(const uint8_t* src, const Level& l, const FormatInfo& fi,
     return src + size_t(index) * fi.bytes;
 }
 
+// the tiling keeps 16 bytes of a row together, up to 8 blocks, so blocks kept as they are copy a run at a time
+void CopyLevel(const uint8_t* src, const TextureFetch& t, const Level& l, const FormatInfo& fi, uint32_t bw,
+               uint32_t bh, uint8_t* out, uint32_t row_pitch) {
+    uint32_t run = bw;
+    if (t.tiled) run = l.x % 8 ? 1 : std::min(8u, 16u >> Log2(fi.bytes));
+    for (uint32_t by = 0; by < bh; by++) {
+        uint8_t* row = out + size_t(by) * row_pitch;
+        for (uint32_t bx = 0; bx < bw; bx += run) {
+            uint32_t n = std::min(run, bw - bx);
+            uint8_t* o = row + size_t(bx) * fi.bytes;
+            std::memcpy(o, BlockAt(src, l, fi, t.tiled, bx, by), size_t(n) * fi.bytes);
+            if (t.endian == Endian::None) continue;
+            for (uint32_t k = 0; k < n; k++) SwapEndian(o + size_t(k) * fi.bytes, fi.bytes, t.endian);
+        }
+    }
+}
+
 }  // namespace
 
 void LoadLevel(const uint8_t* guest, const TextureFetch& t, const Level& l, uint32_t slice, std::vector<uint8_t>& out,
@@ -368,6 +385,10 @@ void LoadLevel(const uint8_t* guest, const TextureFetch& t, const Level& l, uint
     row_pitch = bw * expand * fi.host_bytes;
     out.assign(size_t(row_pitch) * bh * expand, 0);
     const uint8_t* src = guest + l.address + size_t(slice) * l.face_stride;
+    if (fi.convert == Convert::None && expand == 1 && fi.host_bytes == fi.bytes) {
+        CopyLevel(src, t, l, fi, bw, bh, out.data(), row_pitch);
+        return;
+    }
     uint8_t block[16];
     for (uint32_t by = 0; by < bh; by++) {
         for (uint32_t bx = 0; bx < bw; bx++) {

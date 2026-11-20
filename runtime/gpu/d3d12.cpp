@@ -370,6 +370,7 @@ float4 ps(O i) : SV_Target {
     // depth is held reversed
     c = opts.y != 0 ? 1 - c.xxxx : c;
     c.rgb *= opts.z != 0 ? opts.z : 1;
+    c *= opts.w != 0 ? opts.w : 1;
     return c;
 }
 )";
@@ -2745,8 +2746,9 @@ void D3D12Backend::CopyResolve(Target& src, Resolved& dst, const ResolveArgs& r)
     Transition(dst.res.Get(), dst.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
     // source in its own host pixels, destination at the render scale
     float ss = src.scale;
+    float bias = src.depth ? 1.0f : std::exp2(float(r.exp_bias));
     float cb[8] = {r.rect.x1 * ss, r.rect.y1 * ss, (r.rect.x2 - r.rect.x1) * ss, (r.rect.y2 - r.rect.y1) * ss,
-                   float(src.samples), src.depth ? 1.0f : 0.0f, 0, 0};
+                   float(src.samples), src.depth ? 1.0f : 0.0f, 0, bias};
     D3D12_GPU_VIRTUAL_ADDRESS addr = UploadConstants(cb, sizeof(cb));
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = Rtv(dst.view);
     cl_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);

@@ -121,6 +121,7 @@ struct ResolveArgs {
     int32_t dst_x = 0;
     int32_t dst_y = 0;
     bool swap = false;   // red and blue exchanged on the way
+    int32_t exp_bias = 0;  // colour scaled by 2 to this power on the way
     uint32_t clear = 0;  // kClear* after the copy
     float clear_color[4] = {};
     float clear_z = 1;

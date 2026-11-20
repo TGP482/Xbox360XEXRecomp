@@ -551,6 +551,8 @@ void ResolveTo(uint32_t dev, const ResolveCall& c) {
     r.dst_format = d1 & 0x3F;
     // the library sets RB_COPY_DEST_INFO's swap when the destination reads red from z
     r.swap = (R32(f + 12) >> 1 & 7) != 0;
+    // the library moves flags bits 26 to 31 into RB_COPY_DEST_INFO's signed exponent bias
+    r.exp_bias = int32_t(c.flags) >> 26;
     uint32_t width = (d2 & 0x1FFF) + 1;
     r.dst_height = (d2 >> 13 & 0x1FFF) + 1;
     uint32_t pitch = (d0 >> 22 & 0x1FF) * 32;

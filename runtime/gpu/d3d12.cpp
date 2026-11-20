@@ -58,7 +58,7 @@ namespace {
 
 using Microsoft::WRL::ComPtr;
 
-constexpr int kFrames = 2;
+constexpr int kFrames = 3;  // frames in flight, one more queued than the GPU runs
 constexpr uint64_t kUploadSize = 96ull << 20;  // per frame
 constexpr uint32_t kViewsPerFrame = 1u << 18;
 constexpr uint32_t kSamplerCount = 2048;

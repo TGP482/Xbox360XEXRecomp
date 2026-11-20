@@ -74,9 +74,10 @@ constexpr uint32_t kSourceEffects = 0x44;
 constexpr uint32_t kTypePcm = 1;
 constexpr uint32_t kTypePcm8 = XDK_XAudio_SourcePcm8;
 constexpr uint32_t kTypeXma = XDK_XAudio_SourceXma;
-// submix voice init
+// submix voice init: its input format {u8 type, u8 channels, u32 rate}, then the channels its effects put out
+constexpr uint32_t kSubmixChannels = 0x01;
 constexpr uint32_t kSubmixRate = 0x04;
-constexpr uint32_t kSubmixChannels = 0x09;
+constexpr uint32_t kSubmixEffectChannels = 0x09;  // 6 when zero
 constexpr uint32_t kSubmixEffects = 0x0C;
 constexpr uint32_t kSubmixOutput = 0x10;
 // packet: buffer, bytes, loop count, loop start and length in bytes (0 to the end)
@@ -142,6 +143,7 @@ struct Voice {
     float pitch = 0;  // octaves
     std::vector<Output> outputs;
     std::vector<float> mix;  // a submix's input this frame
+    uint32_t effect_channels = kMasterChannels;
     std::unique_ptr<Reverb> reverb;
     std::shared_ptr<GuestEffect> effect;  // sources only
     // source
@@ -215,9 +217,9 @@ std::vector<Output> DefaultOutputs(uint32_t channels) {
     return {o};
 }
 
-std::unique_ptr<Reverb> MakeReverb(uint32_t channels) {
+std::unique_ptr<Reverb> MakeReverb(uint32_t in, uint32_t out) {
     auto r = std::make_unique<Reverb>();
-    r->host = audio::MakeReverb(channels, kFrame);
+    r->host = audio::MakeReverb(in, out, kFrame);
     if (!r->host) return nullptr;
     r->in.resize(size_t(kFrame) * r->host->InChannels());
     r->out.resize(size_t(kFrame) * r->host->OutChannels());
@@ -292,7 +294,7 @@ void ReadEffects(PPCContext& ctx, Voice& v, uint32_t chain) {
         uint8_t id = R8(init);
         uint32_t create = RegisteredCreate(id);
         if (id == kReverbEffect && !v.reverb) {
-            v.reverb = MakeReverb(v.channels);
+            v.reverb = MakeReverb(v.channels, v.effect_channels);
             if (v.reverb) v.reverb->index = i;
         } else if (create && v.source && !v.effect) {
             v.effect = MakeGuestEffect(ctx, create, init, v.channels);
@@ -436,18 +438,20 @@ float* Destination(Voice* dest, std::vector<float>& master, uint32_t& channels) 
     return dest->mix.data();
 }
 
-void Route(const Voice& v, const float* in, std::vector<float>& master) {
+// in holds the voice's frame at in_channels; map entries past the destination's channels are dropped
+void Route(const Voice& v, const float* in, uint32_t in_channels, std::vector<float>& master) {
     for (const Output& o : v.outputs) {
         uint32_t channels = 0;
         float* dst = Destination(o.dest, master, channels);
         for (const MapEntry& m : o.map) {
-            if (m.in >= v.channels || m.out >= channels) continue;
-            for (uint32_t s = 0; s < kFrame; s++) dst[s * channels + m.out] += in[s * v.channels + m.in] * m.volume;
+            if (m.in >= in_channels || m.out >= channels) continue;
+            for (uint32_t s = 0; s < kFrame; s++) dst[s * channels + m.out] += in[s * in_channels + m.in] * m.volume;
         }
     }
 }
 
-void RunReverb(Voice& v, std::vector<float>& buf) {
+// buf comes back holding the reverb's output, the channel count returned
+uint32_t RunReverb(Voice& v, std::vector<float>& buf) {
     Reverb& r = *v.reverb;
     uint32_t in = r.host->InChannels();
     uint32_t out = r.host->OutChannels();
@@ -459,9 +463,8 @@ void RunReverb(Voice& v, std::vector<float>& buf) {
         }
     }
     r.host->Process(r.in.data(), r.out.data(), kFrame);
-    std::fill(buf.begin(), buf.end(), 0.0f);
-    for (uint32_t s = 0; s < kFrame; s++)
-        for (uint32_t c = 0; c < out && c < v.channels; c++) buf[s * v.channels + c] = r.out[s * out + c];
+    buf = r.out;
+    return out;
 }
 
 // a source voice's frame, rendered under g_lock and run through its effect outside it
@@ -496,13 +499,14 @@ void MixFrame(PPCContext& ctx, float* out) {
     for (Voice* v : g_order)
         if (!v->source) std::fill(v->mix.begin(), v->mix.end(), 0.0f);
     for (const Rendered& r : sources)
-        if (Voice* v = Find(r.handle)) Route(*v, r.samples.data(), master);
+        if (Voice* v = Find(r.handle)) Route(*v, r.samples.data(), r.channels, master);
     for (Voice* v : g_order) {
         if (v->source) continue;
         buf = v->mix;
-        if (v->reverb && v->reverb->enabled) RunReverb(*v, buf);
+        uint32_t channels = v->channels;
+        if (v->reverb && v->reverb->enabled) channels = RunReverb(*v, buf);
         for (float& x : buf) x *= v->volume;
-        Route(*v, buf.data(), master);
+        Route(*v, buf.data(), channels, master);
     }
     std::copy(master.begin(), master.end(), out);
 }
@@ -682,6 +686,7 @@ HLE_FUNC(XAudioCreateSubmixVoice) {
     v->rate = R32(init + kSubmixRate);
     if (v->rate != kRate) LOGR("xaudio: submix at %u Hz mixes at %u", v->rate, kRate);
     v->mix.assign(size_t(kFrame) * v->channels, 0.0f);
+    if (uint32_t effect = R8(init + kSubmixEffectChannels)) v->effect_channels = effect;
     ReadEffects(ctx, *v, R32(init + kSubmixEffects));
     std::lock_guard lock(g_lock);
     uint32_t output = R32(init + kSubmixOutput);

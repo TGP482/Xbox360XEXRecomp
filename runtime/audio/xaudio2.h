@@ -50,7 +50,7 @@ public:
     virtual void Process(const float* in, float* out, uint32_t frames) = 0;
 };
 
-// a reverb as near channels out as the host's takes; null when none can be made
-std::unique_ptr<Reverb> MakeReverb(uint32_t channels, uint32_t frames);
+// a reverb as near the channels in and out as the host's takes; null when none can be made
+std::unique_ptr<Reverb> MakeReverb(uint32_t in, uint32_t out, uint32_t frames);
 
 }  // namespace audio

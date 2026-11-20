@@ -245,7 +245,7 @@ void SetOutputMode(uint32_t mode) {
     if (g_mode.exchange(mode) != mode) g_mode_changed = true;
 }
 
-std::unique_ptr<Reverb> MakeReverb(uint32_t channels, uint32_t frames) {
+std::unique_ptr<Reverb> MakeReverb(uint32_t in_channels, uint32_t out_channels, uint32_t frames) {
     auto r = std::make_unique<HostReverb>();
     ComPtr<IUnknown> unknown;
     if (FAILED(XAudio2CreateReverb(&unknown)) || FAILED(unknown.As(&r->apo)) || FAILED(unknown.As(&r->params))) {
@@ -253,7 +253,8 @@ std::unique_ptr<Reverb> MakeReverb(uint32_t channels, uint32_t frames) {
         return nullptr;
     }
     // the shapes the host reverb takes, nearest the console's first
-    const std::pair<uint32_t, uint32_t> shapes[] = {{1, channels}, {2, channels}, {1, 2}, {2, 2}};
+    const std::pair<uint32_t, uint32_t> shapes[] = {
+        {in_channels, out_channels}, {1, out_channels}, {2, out_channels}, {1, 2}, {2, 2}};
     for (auto [in, out] : shapes) {
         WAVEFORMATEXTENSIBLE fin = FloatFormat(in);
         WAVEFORMATEXTENSIBLE fout = FloatFormat(out);
@@ -264,7 +265,7 @@ std::unique_ptr<Reverb> MakeReverb(uint32_t channels, uint32_t frames) {
         r->out = out;
         return r;
     }
-    LOGE("audio: no host reverb shape for %u channels", channels);
+    LOGE("audio: no host reverb shape for %u to %u channels", in_channels, out_channels);
     return nullptr;
 }
 

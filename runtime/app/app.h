@@ -20,7 +20,7 @@ struct Settings {
     DisplayMode display_mode = DisplayMode::Borderless;
     uint32_t width = 0, height = 0;  // 0 is the desktop mode
     uint32_t render_percent = 100;   // of the output height
-    uint32_t fps_cap = 60;           // 0 unlimited, kFpsCapRefresh the monitor's refresh rate
+    uint32_t fps_cap = kFpsCapRefresh;  // 0 unlimited, kFpsCapRefresh the monitor's refresh rate
     bool vsync = true;
     uint32_t aniso = 0;              // forced on every texture in place of the game's, 0 off
     uint32_t msaa = 0;               // samples of the title's multisampled targets, 0 off

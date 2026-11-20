@@ -335,8 +335,9 @@ void CodeGen::EmitCall(const Insn& i, uint32_t target) {
         reloads_.insert(target);
         exact_called_.insert(target);
         callee_ = target;
-        // never overridden, so the body itself, which the host compiler may inline
-        Line(Fmt("\tPPC_SPILL; __imp__sub_%08X(ctx, base); PPC_RELOAD_%08X;", target, target));
+        // never overridden, so the body itself or this partition's copy, which the host compiler may inline
+        const char* body = local_.count(target) ? "local" : "__imp_";
+        Line(Fmt("\tPPC_SPILL; %s_sub_%08X(ctx, base); PPC_RELOAD_%08X;", body, target, target));
         callee_ = 0;
     }
 }
@@ -600,6 +601,26 @@ std::string CodeGen::EmitFunction(uint32_t entry) {
     else
         out += Fmt("PPC_WEAK_FUNC(sub_%08X, __imp__sub_%08X)\n\n", entry, entry);
     return out;
+}
+
+// an exact function few instructions long: other partitions may hold a copy
+bool CodeGen::SmallBody(uint32_t entry) const {
+    constexpr size_t kMaxInsns = 64;
+    return Exact(entry) && an_.Body(entry).size() <= kMaxInsns;
+}
+
+// the same body under a name of this partition only
+std::string CodeGen::EmitLocalCopy(uint32_t entry) {
+    size_t insn_count = insn_count_;
+    std::map<std::string, size_t> unimpl = unimpl_;
+    std::string out = EmitFunction(entry);
+    insn_count_ = insn_count;
+    unimpl_ = unimpl;
+    std::string head = Fmt("PPC_FUNC(__imp__sub_%08X) {", entry);
+    out.replace(out.find(head), head.size(),
+                Fmt("static void local_sub_%08X(PPCContext& __restrict ctx, uint8_t* base) {", entry));
+    out.erase(out.find(Fmt("PPC_WEAK_FUNC(sub_%08X,", entry)));
+    return out + "\n";
 }
 
 std::string CodeGen::EmitImport(uint32_t entry, uint32_t slot) {

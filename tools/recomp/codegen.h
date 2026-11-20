@@ -75,6 +75,7 @@ private:
     uint32_t callee_ = 0;         // the direct call on the line being emitted, stored and reloaded by its summary
     std::set<uint32_t> reloads_;  // callees with a reload of their own in this function
     std::set<uint32_t> exact_called_;  // callees whose body the calls rely on, checked against overrides at start
+    std::set<uint32_t> local_;         // small functions of other partitions the one being written holds a copy of
     size_t insn_count_ = 0;
     std::map<std::string, size_t> unimpl_;
 
@@ -110,6 +111,8 @@ private:
     const Summary* Exact(uint32_t target) const;
     bool BeginFunction(uint32_t entry);
     std::string EmitFunction(uint32_t entry);
+    bool SmallBody(uint32_t entry) const;
+    std::string EmitLocalCopy(uint32_t entry);
     std::string EmitImport(uint32_t entry, uint32_t slot);
     std::string RegisterBlock(const RegSet& set, bool spill) const;
     void EmitPass(const std::vector<uint32_t>& body, bool entry_first);

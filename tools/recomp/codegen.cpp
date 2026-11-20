@@ -130,13 +130,25 @@ void CodeGen::WritePartitions(const std::vector<uint32_t>& funcs) {
     size_t next = 0;
     for (uint32_t p = 0; p < parts; p++) {
         std::string text = "#include \"ppc_recomp_shared.h\"\n\n";
-        size_t acc = 0;
-        while (next < funcs.size() && (acc < per || p == parts - 1)) {
-            uint32_t f = funcs[next];
-            auto slot = import_slots_.find(f);
-            text += slot != import_slots_.end() ? EmitImport(f, slot->second) : EmitFunction(f);
-            acc += weight[next++];
+        size_t first = next;
+        for (size_t acc = 0; next < funcs.size() && (acc < per || p == parts - 1); next++) acc += weight[next];
+        std::set<uint32_t> members(funcs.begin() + first, funcs.begin() + next);
+        local_.clear();
+        for (uint32_t f : members) {
+            auto s = summaries_.find(f);
+            if (s == summaries_.end()) continue;
+            for (uint32_t c : s->second.callees)
+                if (!members.count(c) && SmallBody(c)) local_.insert(c);
         }
+        // copies may call each other
+        for (uint32_t c : local_)
+            text += Fmt("static void local_sub_%08X(PPCContext& __restrict ctx, uint8_t* base);\n", c);
+        for (uint32_t c : local_) text += EmitLocalCopy(c);
+        for (size_t k = first; k < next; k++) {
+            auto slot = import_slots_.find(funcs[k]);
+            text += slot != import_slots_.end() ? EmitImport(funcs[k], slot->second) : EmitFunction(funcs[k]);
+        }
+        local_.clear();
         WriteIfChanged(out_ / Fmt("ppc_recomp.%u.cpp", p), text);
     }
 }

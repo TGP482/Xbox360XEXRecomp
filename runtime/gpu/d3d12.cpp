@@ -142,7 +142,7 @@ DXGI_FORMAT ColorFormat(uint32_t f) {
 }
 DXGI_FORMAT ColorResourceFormat(uint32_t f) { return f <= 1 ? DXGI_FORMAT_R8G8B8A8_TYPELESS : ColorFormat(f); }
 DXGI_FORMAT ColorReadFormat(uint32_t f) { return f <= 1 ? DXGI_FORMAT_R8G8B8A8_UNORM : ColorFormat(f); }
-bool WideColor(uint32_t f) { return f == 5 || f == 7 || f == 12 || f == 15; }
+bool WideColor(uint32_t f) { return f == 5 || f == 7 || f == 15; }
 
 // D3D12 compare functions are the console's plus one; depth is stored reversed
 D3D12_COMPARISON_FUNC Compare(uint32_t f) { return D3D12_COMPARISON_FUNC(f + 1); }
@@ -1317,9 +1317,18 @@ uint32_t TargetWidth(const State& s) { return std::max(SurfacePitch(s), s.tiled_
 
 uint32_t ColorInfo(const State& s, uint32_t i) { return s.Reg(i == 0 ? kRbColorInfo : kRbColor1Info + i - 1); }
 
+// the _AS_ formats keep the same EDRAM bytes as their base format, so they are one target with it
+uint32_t EdramColorFormat(uint32_t f) {
+    constexpr uint32_t k2_10_10_10_As10_10_10_10 = 10;
+    constexpr uint32_t k2_10_10_10_FloatAs16_16_16_16 = 12;
+    if (f == k2_10_10_10_As10_10_10_10) return 2;
+    if (f == k2_10_10_10_FloatAs16_16_16_16) return 3;
+    return f;
+}
+
 Target* D3D12Backend::ColorTarget(const State& s, uint32_t i, uint32_t height) {
     uint32_t info = ColorInfo(s, i);
-    Surface sf{Bits(info, 0, 12), Bits(info, 16, 4), SurfaceSamples(s), SurfacePitch(s)};
+    Surface sf{Bits(info, 0, 12), EdramColorFormat(Bits(info, 16, 4)), SurfaceSamples(s), SurfacePitch(s)};
     return EnsureTarget(sf, false, TargetWidth(s), height);
 }
 

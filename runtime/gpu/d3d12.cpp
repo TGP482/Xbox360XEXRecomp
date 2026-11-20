@@ -718,6 +718,7 @@ private:
     void CapState(const State& s);
     void CapFetch(const uint32_t fetch[6], const xenos::TextureFetch& t);
     void CapShader(const Shader* sh, const ShaderOptions& opt, uint64_t key);
+    void CapConstants(const char* stage, const uint8_t* be, const ShaderInfo& info);
     FILE* cap_ = nullptr;
     std::unordered_set<uint64_t> cap_shaders_;  // variant keys whose HLSL this capture wrote
     std::filesystem::path cap_dir_;
@@ -1917,6 +1918,11 @@ UINT ComponentMapping(const xenos::TextureFetch& t) {
 }
 
 // the resolve a fetch reads in place of guest memory, null for none
+// a 3D or stacked fetch whose fetch constant holds a 2D texture: one layer, sampled as 2D
+bool FlatFetch(const TextureBinding& b, const xenos::TextureFetch& t) {
+    return b.dimension == uint8_t(xenos::Dimension::D3) && t.dimension == xenos::Dimension::D2;
+}
+
 Resolved* D3D12Backend::FindResolved(const xenos::TextureFetch& t, const TextureBinding& b, ShaderStage stage,
                                      uint32_t slot) {
     uint64_t key = 0;
@@ -1925,20 +1931,20 @@ Resolved* D3D12Backend::FindResolved(const xenos::TextureFetch& t, const Texture
     if (resolved == resolved_.end()) return nullptr;
     // a block compressed fetch never reads a resolve: the address was reused since
     bool blocks = xenos::Info(t.format).block > 1 && resolved->second.copied != int32_t(t.format);
-    return b.dimension <= 1 && !blocks ? &resolved->second : nullptr;
+    return (b.dimension <= 1 || FlatFetch(b, t)) && !blocks ? &resolved->second : nullptr;
 }
 
 void ReadFetch(const State& s, uint32_t index, uint32_t out[6]) {
     for (uint32_t k = 0; k < 6; k++) out[k] = Be32(s.fetch + (index * 6 + k) * 4);
 }
 
-// the 3D or stacked fetches whose fetch constant holds a 2D texture: one layer, sampled as 2D
+// which of the stage's fetches are flat (FlatFetch)
 void FlatFetches(const State& s, const ShaderInfo& info, bool flat[32]) {
     for (uint32_t i = 0; i < info.textures.size() && i < 32; i++) {
         if (info.textures[i].dimension != uint8_t(xenos::Dimension::D3)) continue;
         uint32_t fetch[6];
         ReadFetch(s, info.textures[i].fetch, fetch);
-        flat[i] = xenos::DecodeTextureFetch(fetch).dimension == xenos::Dimension::D2;
+        flat[i] = FlatFetch(info.textures[i], xenos::DecodeTextureFetch(fetch));
     }
 }
 
@@ -1971,7 +1977,7 @@ void D3D12Backend::FillTextureView(const TextureBinding& b, const uint32_t fetch
     Texture* tex = FrameTexture(fetch, t);
     if (tex && tex->swap) tex = tex->swap;
     v.Format = tex ? tex->format : DXGI_FORMAT_R8G8B8A8_UNORM;
-    bool flat = b.dimension == uint8_t(xenos::Dimension::D3) && t.dimension == xenos::Dimension::D2;
+    bool flat = FlatFetch(b, t);
     switch (flat ? uint8_t(xenos::Dimension::D2) : b.dimension) {
         case 2:
             v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
@@ -2614,6 +2620,8 @@ void D3D12Backend::Draw(const State& s, const DrawArgs& a) {
         CapState(s);
         CapShader(s.vs, vs_opt, k.vs);
         if (s.ps) CapShader(s.ps, ps_opt, k.ps);
+        CapConstants("vs", s.consts, vs->info);
+        CapConstants("ps", s.consts + kConstBytes, ps_info);
         // what each pixel shader fetch reads: a resolve, or guest memory
         for (uint32_t i = 0; i < ps_info.textures.size(); i++) {
             uint32_t fetch[6];
@@ -3261,6 +3269,23 @@ void D3D12Backend::CapFetch(const uint32_t fetch[6], const xenos::TextureFetch& 
     std::fprintf(cap_, "       texels");
     for (size_t i = 0; i < std::min(rows.size(), kShownBytes); i++) std::fprintf(cap_, " %02X", rows[i]);
     std::fputc('\n', cap_);
+}
+
+// the float constants a shader reads, as the draw has them
+void D3D12Backend::CapConstants(const char* stage, const uint8_t* be, const ShaderInfo& info) {
+    if (info.constants[0] == ~0ull && info.constants[1] == ~0ull) {
+        std::fprintf(cap_, "     %s constants read relative\n", stage);
+        return;
+    }
+    for (uint32_t i = 0; i < 256; i++) {
+        if (!(info.constants[i / 128] >> (i / 2 % 64) & 1)) continue;
+        float v[4];
+        for (uint32_t k = 0; k < 4; k++) {
+            uint32_t bits = Be32(be + i * 16 + k * 4);
+            std::memcpy(&v[k], &bits, 4);
+        }
+        std::fprintf(cap_, "     %s c%u %g %g %g %g\n", stage, i, v[0], v[1], v[2], v[3]);
+    }
 }
 
 // a shader's HLSL as the draw used it, once per capture in the shaders folder, named by its key in draws.txt

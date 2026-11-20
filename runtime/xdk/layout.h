@@ -102,6 +102,18 @@ constexpr bool AllKnown(const LayoutKey (&keys)[N]) {
 #ifndef XDK_Device_StreamStrides
 #define XDK_Device_StreamStrides 0xFFFFFFFFu
 #endif
+#ifndef XDK_PixelShader_Literals
+#define XDK_PixelShader_Literals 0xFFFFFFFFu
+#endif
+#ifndef XDK_PixelShader_LiteralBase
+#define XDK_PixelShader_LiteralBase 0xFFFFFFFFu
+#endif
+#ifndef XDK_VertexShader_Literals
+#define XDK_VertexShader_Literals 0xFFFFFFFFu
+#endif
+#ifndef XDK_VertexShader_LiteralBase
+#define XDK_VertexShader_LiteralBase 0xFFFFFFFFu
+#endif
 #ifndef XDK_Device_PixelShader
 #define XDK_Device_PixelShader 0xFFFFFFFFu
 #endif

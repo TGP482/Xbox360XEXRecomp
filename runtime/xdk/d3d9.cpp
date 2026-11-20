@@ -54,6 +54,13 @@ constexpr uint32_t kVbSize = XDK_VertexBuffer_Size;
 constexpr uint32_t kDevPixelShader = XDK_Device_PixelShader;
 constexpr uint32_t kDevClipPlanes = XDK_Device_ClipPlanes;  // SetClipPlane's copies, 16 bytes each
 constexpr uint32_t kDevVertexShader = XDK_Device_VertexShader;
+// shader objects: the block listing their float literals, and the CPU address the list's data offsets count from
+constexpr uint32_t kPsLiterals = XDK_PixelShader_Literals;
+constexpr uint32_t kPsLiteralBase = XDK_PixelShader_LiteralBase;
+constexpr uint32_t kVsLiterals = XDK_VertexShader_Literals;
+constexpr uint32_t kVsLiteralBase = XDK_VertexShader_LiteralBase;
+constexpr bool kLiterals = kPsLiterals != xdk::kUnknown && kPsLiteralBase != xdk::kUnknown &&
+                           kVsLiterals != xdk::kUnknown && kVsLiteralBase != xdk::kUnknown;
 // the register shadow, a bank per 0x80 registers from 0x2000
 constexpr uint32_t kDevBanks[] = {XDK_Device_Reg2000, XDK_Device_Reg2080, XDK_Device_Reg2100, XDK_Device_Reg2180,
                                   XDK_Device_Reg2200, XDK_Device_Reg2280, XDK_Device_Reg2300, XDK_Device_Reg2380};
@@ -461,12 +468,40 @@ void Streams(uint32_t dev, ShaderEntry& vs, uint32_t up_data, uint32_t up_bytes,
     }
 }
 
+// the float constants a shader's compiler fixed, which the library has the GPU load from the shader's data as the
+// draw binds it: written over the device's constants, as the GPU's are
+void LoadLiterals(uint32_t dev, uint32_t shader, uint32_t block_at, uint32_t base_at) {
+    constexpr uint32_t kListAt = 0x14;     // block: offset of the list
+    constexpr uint32_t kListBytes = 0x10;  // list: bytes of entries, which follow
+    constexpr uint32_t kEntries = 0x14;
+    constexpr uint32_t kEntryBytes = 8;
+    constexpr uint32_t kConstDwords = 512 * 4;
+    if (!shader) return;
+    uint32_t block = shader + block_at;
+    uint32_t offset = R32(block + kListAt);
+    if (!offset) return;
+    uint32_t list = block + offset;
+    uint32_t end = list + kEntries + R32(list + kListBytes);
+    uint32_t base = R32(shader + base_at);
+    // first constant, dwords, data offset; no dwords ends the list
+    for (uint32_t e = list + kEntries; e + kEntryBytes <= end; e += kEntryBytes) {
+        uint32_t first = R16(e);
+        uint32_t dwords = R16(e + 2);
+        if (!dwords || first * 4 + dwords > kConstDwords) break;
+        std::memcpy(HostPtr(dev + kDevConsts + first * 16), HostPtr(base + R32(e + 4)), dwords * 4);
+    }
+}
+
 // the state of a draw from the device; false when its shaders are not known
 bool ReadState(uint32_t dev, gpu::State& s, uint32_t* raw, ShaderEntry*& vs) {
     vs = FindShader(R32(dev + kDevVertexShader));
     if (!vs) return false;
     const ShaderEntry* ps = FindShader(R32(dev + kDevPixelShader));
     ReadRegisters(dev, s, raw);
+    if constexpr (kLiterals) {
+        LoadLiterals(dev, R32(dev + kDevVertexShader), kVsLiterals, kVsLiteralBase);
+        LoadLiterals(dev, R32(dev + kDevPixelShader), kPsLiterals, kPsLiteralBase);
+    }
     s.consts = static_cast<const uint8_t*>(HostPtr(dev + kDevConsts));
     s.bools = static_cast<const uint8_t*>(HostPtr(dev + kDevBools));
     s.loops = static_cast<const uint8_t*>(HostPtr(dev + kDevLoops));

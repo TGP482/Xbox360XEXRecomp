@@ -48,6 +48,12 @@ Device_TileRectsAlignedStride = 8
 Device_TilingTargets = 0x30A0
 Device_TilingExtent = 0x3264
 Texture_FetchConstant = 0x1C
+# shader objects: the block listing the float literals the library has the GPU load at the draw (821FDEC8), and the
+# CPU address their data offsets count from
+PixelShader_Literals = 0x28
+PixelShader_LiteralBase = 0x18
+VertexShader_Literals = 0x368
+VertexShader_LiteralBase = 0x20
 VertexDeclaration_Count = 0x18
 VertexDeclaration_Elements = 0x34
 # index buffer: format (bit 31 32 bit indices, endian at 29), CPU address

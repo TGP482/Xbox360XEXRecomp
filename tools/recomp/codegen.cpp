@@ -102,6 +102,7 @@ void CodeGen::WriteShared(const std::vector<uint32_t>& funcs, const std::vector<
     std::string s = "#pragma once\n#include \"cpu/ppc_ops.h\"\n\n";
     for (const std::vector<uint32_t>* list : {&funcs, &absent})
         for (uint32_t f : *list) s += Fmt("PPC_EXTERN_FUNC(sub_%08X);\n", f);
+    for (uint32_t f : funcs) s += Fmt("PPC_FUNC(__imp__sub_%08X);\n", f);
     std::map<std::string, bool> hooks;
     for (auto& [va, h] : an_.cfg.hooks) hooks.emplace(h.call, h.Returns());
     std::string exports = "#pragma once\n";

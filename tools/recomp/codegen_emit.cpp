@@ -335,7 +335,8 @@ void CodeGen::EmitCall(const Insn& i, uint32_t target) {
         reloads_.insert(target);
         exact_called_.insert(target);
         callee_ = target;
-        Line(Fmt("\tPPC_SPILL; sub_%08X(ctx, base); PPC_RELOAD_%08X;", target, target));
+        // never overridden, so the body itself, which the host compiler may inline
+        Line(Fmt("\tPPC_SPILL; __imp__sub_%08X(ctx, base); PPC_RELOAD_%08X;", target, target));
         callee_ = 0;
     }
 }

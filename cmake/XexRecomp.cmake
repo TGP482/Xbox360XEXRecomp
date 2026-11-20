@@ -160,7 +160,8 @@ function(add_xex_image target xex config partitions game_dir)
 
     # without a C runtime: the executable passes on what the code calls. Built for the CPU it runs on; the executable
     # stays at the x86-64-v2 floor. No fused multiply add or errno: PowerPC rounds each step, fma is explicit. No stack
-    # probes: there is no __chkstk, guest threads run on committed host stacks.
+    # probes: there is no __chkstk, guest threads run on committed host stacks. A higher inline threshold: a small
+    # guest function's context loads and stores count against inlining, yet fold away once inlined.
     add_library(${target}_code SHARED ${GEN_SOURCES})
     set_target_properties(${target}_code PROPERTIES OUTPUT_NAME ${target} CXX_EXTENSIONS OFF)
     set_source_files_properties(${GEN_SOURCES} PROPERTIES GENERATED TRUE)
@@ -169,7 +170,8 @@ function(add_xex_image target xex config partitions game_dir)
     target_include_directories(${target}_code SYSTEM PRIVATE ${XEX_SDK_DIR}/runtime/cpu/freestanding)
     target_compile_definitions(${target}_code PRIVATE PPC_GAME_CODE)
     target_compile_options(${target}_code PRIVATE -fms-compatibility-version=19.40 -O2 -march=native -ffp-contract=off
-        -fno-math-errno -mno-stack-arg-probe -fno-strict-aliasing -nostdinc -nostdinc++ -w)
+        -fno-math-errno -mno-stack-arg-probe -fno-strict-aliasing -nostdinc -nostdinc++ -w
+        "SHELL:-mllvm -inline-threshold=500")
     target_link_libraries(${target}_code PRIVATE ${target})
     target_link_options(${target}_code PRIVATE -fuse-ld=lld -Wl,/noentry,/nodefaultlib,/opt:noicf
         -Wl,/def:${GEN}/exports.def)

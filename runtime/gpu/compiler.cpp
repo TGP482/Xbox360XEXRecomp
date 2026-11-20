@@ -31,7 +31,7 @@ namespace {
 using Microsoft::WRL::ComPtr;
 
 // raise when the translator's output changes for the same microcode
-constexpr uint64_t kCacheVersion = 1;
+constexpr uint64_t kCacheVersion = 2;
 constexpr uint64_t kCheckSeed = 0x5EC0D0C4EC4ull;  // the second source hash, so a key collision is a miss
 constexpr uint32_t kShaderMagic = 0x4C495844;      // 'DXIL'
 constexpr uint64_t kMaxShaderFile = 256ull << 20;
@@ -98,7 +98,8 @@ bool Compile(const std::string& hlsl, const wchar_t* profile, std::vector<uint8_
     IDxcCompiler3* compiler = ThreadCompiler();
     if (!compiler) return false;
     DxcBuffer src{hlsl.data(), hlsl.size(), DXC_CP_UTF8};
-    const wchar_t* args[] = {L"-E", L"main", L"-T", profile, L"-HV", L"2021", L"-O3", L"-Qstrip_debug",
+    // IEEE strict: no fused or reordered math, so the same microcode rounds the same in every shader, as on the console
+    const wchar_t* args[] = {L"-E", L"main", L"-T", profile, L"-HV", L"2021", L"-O3", L"-Gis", L"-Qstrip_debug",
                              L"-Qstrip_reflect"};
     ComPtr<IDxcResult> result;
     if (FAILED(compiler->Compile(&src, args, UINT32(std::size(args)), nullptr, IID_PPV_ARGS(&result)))) {

@@ -116,7 +116,7 @@ struct ResolveArgs {
     Rect rect{};          // in the target's pixels
     uint32_t dst_base = 0;  // GPU address
     uint32_t dst_format = 6;  // xenos::TexFormat
-    uint32_t dst_pitch = 0;   // texels
+    uint32_t dst_pitch = 0;   // the texture's width in texels
     uint32_t dst_height = 0;
     int32_t dst_x = 0;
     int32_t dst_y = 0;

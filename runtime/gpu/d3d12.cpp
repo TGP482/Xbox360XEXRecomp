@@ -2594,6 +2594,7 @@ void D3D12Backend::Draw(const State& s, const DrawArgs& a) {
 
     DrawConstants c;
     FillDrawConstants(s, bound, c);
+    c.base_vertex = a.base_vertex;
     // the source factor of colour 0, 1 without blending
     uint32_t b0 = k.blend[0];
     uint32_t src_blend = (b0 & 0x1FFF1FFF) != 0x00010001 ? Bits(b0, 0, 5) : 1;
@@ -2609,7 +2610,7 @@ void D3D12Backend::Draw(const State& s, const DrawArgs& a) {
     if (Latch(binds_.stencil_ref, stencil_ref)) cl_->OMSetStencilRef(stencil_ref);
     if (Latch(binds_.pso, pso)) cl_->SetPipelineState(pso);
     if (Latch(binds_.topology, topo)) cl_->IASetPrimitiveTopology(topo);
-    cl_->DrawIndexedInstanced(count, 1, 0, a.base_vertex, 0);
+    cl_->DrawIndexedInstanced(count, 1, 0, 0, 0);
     binds_.valid = true;
     if (cap_) {
         uint32_t rt = bound.rt ? bound.rt->surface.base : 0;

@@ -87,6 +87,7 @@ struct DrawConstants {
     uint32_t vtx_fmt;  // PA_CL_VTE_CNTL bits 8 to 10: xy and z already divided by w, w given as w (clear: 1/w)
     float ext[4];      // a renderer extension's, declared by ShaderHooks::Constants
     float clip[6][4];  // the user clip planes PA_CL_CLIP_CNTL enables, 0 for the others
+    int32_t base_vertex;  // added to each index before the shader sees it, as on the console
 };
 
 // b3, per fetch instruction

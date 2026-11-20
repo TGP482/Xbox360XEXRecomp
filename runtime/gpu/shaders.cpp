@@ -288,6 +288,7 @@ cbuffer Draw : register(b2) {
     uint g_vtx_fmt;
 )";
 const char* kPreludeEnd = R"(    float4 g_clip[6];
+    int g_base_vertex;
 };
 
 static float4 r[64];
@@ -960,7 +961,8 @@ struct VOut {
 };
 
 VOut main(uint id : SV_VertexID) {
-    r[0].x = float(id);
+    // SV_VertexID leaves out the draw's base vertex
+    r[0].x = float(int(id) + g_base_vertex);
     Run();
     float4 pos = o_pos;
 )" + Hooks().Position() + R"(    // VTX_W0_FMT clear: w is given as 1/w

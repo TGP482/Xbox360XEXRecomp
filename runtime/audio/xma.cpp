@@ -115,7 +115,8 @@ void Run(Context& c) {
     size_t samples = kSubframeSamples * c.channels;
     uint32_t step = uint32_t(samples * 2 / kBlockBytes);
     while (Decoded(c, samples)) {
-        if (FreeBlocks(c) < step) {
+        // write never catches up to read, as titles take equal offsets as empty
+        if (FreeBlocks(c) <= step) {
             c.output_valid = false;
             break;
         }
@@ -123,7 +124,6 @@ void Run(Context& c) {
         for (size_t i = 0; i < samples; i++) W16(at + uint32_t(i) * 2, uint16_t(c.pcm[c.pcm_at + i]));
         c.pcm_at += samples;
         c.write = (c.write + step) % c.blocks;
-        if (c.write == c.read) c.output_valid = false;
     }
     c.pcm.erase(c.pcm.begin(), c.pcm.begin() + ptrdiff_t(c.pcm_at));
     c.pcm_at = 0;

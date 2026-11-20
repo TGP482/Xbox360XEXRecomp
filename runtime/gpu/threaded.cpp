@@ -108,7 +108,10 @@ public:
     void Record(const State& s, Command& c, const uint64_t (&consts)[4], const uint64_t (&fetches)[1]) {
         CopyRest(s, c.state);
         c.banks |= 1u << kRegs;
-        TakeBlocks(Bank(s, kRegs), kBankAt[kRegs], s.kept_regs, c);
+        // recorded last, s left its unchanged blocks as they are here
+        const uint64_t(&regs)[2] = &s == last_ ? s.changed_regs : s.kept_regs;
+        last_ = &s;
+        TakeBlocks(Bank(s, kRegs), kBankAt[kRegs], regs, c);
         for (uint32_t b = kConsts; b < kBankCount; b++) {
             const uint8_t* from = Bank(s, b);
             if (!from) continue;
@@ -162,6 +165,7 @@ private:
     }
 
     alignas(64) uint8_t bytes_[kBankTotal] = {};
+    const State* last_ = nullptr;  // the State recorded last
 };
 
 // the fetch bank's blocks holding the texture fetch constants a shader samples

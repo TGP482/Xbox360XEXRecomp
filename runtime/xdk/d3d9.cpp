@@ -303,18 +303,30 @@ gpu::Rect SelectedTiles() {
     return whole ? gpu::Rect{} : area;
 }
 
-void ReadRegisters(uint32_t dev, gpu::State& s) {
+// raw is s's registers as the guest held them when last read here, guest order; blocks still the same are not read
+// again. Null reads every one
+void ReadRegisters(uint32_t dev, gpu::State& s, uint32_t* raw = nullptr) {
     constexpr uint32_t kBankRegs = 0x80;
     constexpr uint32_t kBanks = std::size(kDevBanks);
     constexpr uint32_t kBlockRegs = 8;  // a bit of State::kept_regs
-    s.kept_regs[0] = s.kept_regs[1] = 0;
+    for (uint32_t w = 0; w < 2; w++) s.kept_regs[w] = s.changed_regs[w] = 0;
     for (uint32_t b = 0; b < kBanks; b++) {
         uint32_t count = b + 1 < kBanks ? (kDevBanks[b + 1] - kDevBanks[b]) / 4 : kLastBankRegs;
         count = std::min(count, kBankRegs);
-        for (uint32_t i = 0; i < count; i++) s.regs[b * kBankRegs + i] = R32(dev + kDevBanks[b] + i * 4);
         for (uint32_t i = 0; i < count; i += kBlockRegs) {
-            uint32_t block = (b * kBankRegs + i) / kBlockRegs;
-            s.kept_regs[block / 64] |= 1ull << (block % 64);
+            uint32_t at = b * kBankRegs + i;
+            uint64_t bit = 1ull << (at / kBlockRegs % 64);
+            uint32_t word = at / kBlockRegs / 64;
+            s.kept_regs[word] |= bit;
+            const void* guest = HostPtr(dev + kDevBanks[b] + i * 4);
+            // whole blocks compared, past a bank's end too, so the compare stays inline
+            if (raw) {
+                if (std::memcmp(raw + at, guest, kBlockRegs * 4) == 0) continue;
+                std::memcpy(raw + at, guest, kBlockRegs * 4);
+            }
+            s.changed_regs[word] |= bit;
+            uint32_t regs = std::min(kBlockRegs, count - i);
+            for (uint32_t k = 0; k < regs; k++) s.regs[at + k] = R32(dev + kDevBanks[b] + (i + k) * 4);
         }
     }
     s.tiled_width = g_tiling.on ? uint32_t(g_tiling.extent.x2) : 0;
@@ -450,11 +462,11 @@ void Streams(uint32_t dev, ShaderEntry& vs, uint32_t up_data, uint32_t up_bytes,
 }
 
 // the state of a draw from the device; false when its shaders are not known
-bool ReadState(uint32_t dev, gpu::State& s, ShaderEntry*& vs) {
+bool ReadState(uint32_t dev, gpu::State& s, uint32_t* raw, ShaderEntry*& vs) {
     vs = FindShader(R32(dev + kDevVertexShader));
     if (!vs) return false;
     const ShaderEntry* ps = FindShader(R32(dev + kDevPixelShader));
-    ReadRegisters(dev, s);
+    ReadRegisters(dev, s, raw);
     s.consts = static_cast<const uint8_t*>(HostPtr(dev + kDevConsts));
     s.bools = static_cast<const uint8_t*>(HostPtr(dev + kDevBools));
     s.loops = static_cast<const uint8_t*>(HostPtr(dev + kDevLoops));
@@ -469,8 +481,9 @@ void Draw(uint32_t dev, gpu::DrawArgs& a, uint32_t up_data = 0, uint32_t up_byte
     std::lock_guard lock(g_lock);
     gpu::Backend* backend = Backend();
     static gpu::State s;  // kept from draw to draw, under g_lock: its 4 KB of registers are cleared once
+    static uint32_t raw[gpu::kRegCount];  // s's registers in guest order
     ShaderEntry* vs = nullptr;
-    if (!ReadState(dev, s, vs)) return;
+    if (!ReadState(dev, s, raw, vs)) return;
     static std::vector<gpu::StreamFetch> streams;  // kept from draw to draw, under g_lock
     Streams(dev, *vs, up_data, up_bytes, up_stride, streams);
     a.streams = streams.data();

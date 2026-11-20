@@ -124,6 +124,7 @@ public:
                 TakeBlocks(from, kBankAt[b], fetches, c);
                 continue;
             }
+            if (std::memcmp(from, bytes_ + kBankAt[b], kBankBytes[b]) == 0) continue;
             for (uint32_t i = 0; i < kBankBytes[b]; i += kBlock) Take(from + i, kBankAt[b] + i, c);
         }
     }
@@ -148,6 +149,9 @@ private:
     template <size_t N>
     void TakeBlocks(const uint8_t* from, uint32_t bank_at, const uint64_t (&mask)[N], Command& c) {
         for (uint32_t w = 0; w < N; w++) {
+            // a whole span read, as a relative read takes them, mostly matches: one compare first
+            uint32_t span = w * 64 * kBlock;
+            if (mask[w] == ~0ull && std::memcmp(from + span, bytes_ + bank_at + span, 64 * kBlock) == 0) continue;
             for (uint64_t m = mask[w]; m; m &= m - 1) {
                 uint32_t at = (w * 64 + uint32_t(std::countr_zero(m))) * kBlock;
                 Take(from + at, bank_at + at, c);

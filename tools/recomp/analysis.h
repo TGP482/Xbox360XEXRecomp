@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -21,6 +22,7 @@ struct Hook {
     bool after = false;
     Exit on_true;
     Exit on_false;
+    std::optional<std::vector<std::string>> regs;  // what the call reads or writes, if named
     bool Returns() const { return on_true.set || on_false.set; }
 };
 

@@ -96,7 +96,7 @@ void CodeGen::Line(std::string s) {
     bool always = s.rfind("\t" + kSpill, 0) == 0 || s.rfind("\tif (true) {", 0) == 0;
     bool call = always && s.find("PPC_RELOAD;") != std::string::npos;
     bool every = sync_.all || !reachable_;
-    const RegSet* touched = callee_ ? &summaries_.at(callee_).touched : nullptr;
+    const RegSet* touched = callee_ ? &summaries_.at(callee_).touched : hook_regs_;
     if (!every && s.find(kSpill) != std::string::npos) {
         std::string stores = RegisterBlock(touched ? Both(sync_.dirty, *touched) : sync_.dirty, true);
         if (!stores.empty()) stores.erase(0, 1);
@@ -108,7 +108,7 @@ void CodeGen::Line(std::string s) {
     }
     // past a call that always runs every local is the context's
     if (call && !conditional_) sync_ = {};
-    // past a direct call the callee's registers are the context's, the others keep what they had
+    // past a direct call or a hook naming its registers, those are the context's, the others keep what they had
     if (touched && !conditional_) sync_.dirty = Without(sync_.dirty, *touched);
     body_ += s;
     body_ += '\n';

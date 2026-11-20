@@ -73,6 +73,7 @@ private:
     bool unknown_calls_ = false;
     std::vector<uint32_t> callees_;
     uint32_t callee_ = 0;         // the direct call on the line being emitted, stored and reloaded by its summary
+    const RegSet* hook_regs_ = nullptr;  // the named registers of the hook call on the line being emitted
     std::set<uint32_t> reloads_;  // callees with a reload of their own in this function
     std::set<uint32_t> exact_called_;  // callees whose body the calls rely on, checked against overrides at start
     std::set<uint32_t> local_;         // small functions of other partitions the one being written holds a copy of
@@ -171,3 +172,4 @@ private:
 };
 
 std::string Fmt(const char* f, ...) __attribute__((format(printf, 1, 2)));
+void Add(RegSet& into, const RegSet& from);

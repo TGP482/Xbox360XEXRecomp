@@ -16,6 +16,8 @@ partitions = 128
 # after = false              # true runs it after the instruction (not after branches or blr)
 # on_true = "ret"            # with on_true or on_false the hook returns bool: "ret" returns as the function's blr does,
 # on_false = 0x8212AC00      # an address jumps to that instruction of the same function
+# regs = ["r3", "f1"]        # optional, every register it reads or writes: only those are stored and reloaded, so
+#                            # the function stays exact for its callers; leave it out when the hook calls guest code
 #
 # [[function]]               # entry the analysis missed or ran past
 # at = 0x82123450

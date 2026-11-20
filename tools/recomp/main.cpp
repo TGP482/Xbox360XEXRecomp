@@ -85,6 +85,14 @@ static bool LoadHooks(const toml::table& t, Config& cfg) {
             k.at = uint32_t(*at);
             k.call = *call;
             k.after = (*h)["after"].value_or(false);
+            if (auto regs = (*h)["regs"].as_array()) {
+                k.regs.emplace();
+                for (auto& r : *regs) {
+                    auto name = r.value<std::string>();
+                    if (!name) return false;
+                    k.regs->push_back(*name);
+                }
+            }
             cfg.hooks.emplace(k.at, k);
         }
     return true;
@@ -119,7 +127,8 @@ static bool LoadOverrides(const toml::table& t, Config& cfg) {
 //   [xex] data_ranges = [[lo, hi], ...]  words in code sections that are never code, hi exclusive
 //   [xex] trace = [address, ...]  log each call of these functions (caller, arguments) and its r3
 //   [[hook]] at, call, after, on_true, on_false  call a host function before or after a guest instruction;
-//     on_true/on_false make it return bool and name "ret" or an instruction of the same function to jump to
+//     on_true/on_false make it return bool and name "ret" or an instruction of the same function to jump to;
+//     regs names every register it reads or writes, so only those are stored and reloaded around it
 //   [[function]] at, end  an entry decoded no further than end (exclusive)
 //   [[switch]] at, targets  the targets of a bctr, replacing table detection
 //   [xex] xdk = build  includes <--xdk folder>/<build>/layout.toml

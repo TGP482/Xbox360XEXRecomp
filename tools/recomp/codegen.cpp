@@ -30,6 +30,26 @@ bool IsIdentifier(const std::string& s) {
     return true;
 }
 
+// a register as the generated code names it: r3, f1, v0, cr6, ctr, lr, xer_ca, xer_ov, xer_so
+bool AddReg(const std::string& name, RegSet& set) {
+    unsigned n = 0;
+    char rest = 0;
+    auto number = [&](const char* format, unsigned count) {
+        return std::sscanf(name.c_str(), format, &n, &rest) == 1 && n < count;
+    };
+    if (name == "ctr") set.ctr = true;
+    else if (name == "lr") set.lr = true;
+    else if (name == "xer_ca") set.ca = true;
+    else if (name == "xer_ov") set.ov = true;
+    else if (name == "xer_so") set.so = true;
+    else if (number("cr%u%c", 8)) set.cr.set(n);
+    else if (number("r%u%c", 32)) set.gpr.set(n);
+    else if (number("f%u%c", 32)) set.fpr.set(n);
+    else if (number("v%u%c", 128)) set.vr.set(n);
+    else return false;
+    return true;
+}
+
 }  // namespace
 
 bool CodeGen::CheckHooks(const std::vector<uint32_t>& funcs) const {
@@ -58,24 +78,42 @@ bool CodeGen::CheckHooks(const std::vector<uint32_t>& funcs) const {
     for (auto& [va, h] : an_.cfg.hooks) {
         if (!placed.count(va)) fail(h, "not an instruction in a recompiled function");
         if (!IsIdentifier(h.call)) fail(h, "call is not an identifier");
+        RegSet regs;
+        for (const std::string& r : h.regs.value_or(std::vector<std::string>{}))
+            if (!AddReg(r, regs)) fail(h, "regs holds a name that is not a register");
         if (auto [k, fresh] = kind.emplace(h.call, h.Returns()); !fresh && k->second != h.Returns())
             fail(h, "call used both with and without on_true/on_false");
     }
     return ok;
 }
 
-// the hook reads and writes the guest registers in ctx, so they are stored before and reloaded after
+// the hook reads and writes the guest registers in ctx: the ones it names, else every one, are stored before and
+// reloaded after
 void CodeGen::EmitHooks(uint32_t va, bool after) {
     for (auto [it, e] = an_.cfg.hooks.equal_range(va); it != e; ++it) {
         const Hook& h = it->second;
         if (h.after != after) continue;
-        unknown_calls_ = true;
+        RegSet regs;
+        std::string reload = " PPC_RELOAD;";
+        if (h.regs) {
+            for (const std::string& r : *h.regs) AddReg(r, regs);
+            Add(used_, regs);
+            Add(written_, regs);
+            reload = RegisterBlock(regs, false);
+            hook_regs_ = &regs;
+        } else {
+            unknown_calls_ = true;
+        }
         auto leave = [&](const Hook::Exit& x) { return x.ret ? std::string("PPC_SPILL; return;") : Jump(va, x.to); };
         if (!h.Returns()) {
-            Line(Fmt("\tPPC_SPILL; %s(ctx, base); PPC_RELOAD;", h.call.c_str()));
+            Line(Fmt("\tPPC_SPILL; %s(ctx, base);%s", h.call.c_str(), reload.c_str()));
+            hook_regs_ = nullptr;
             continue;
         }
-        std::string s = Fmt("\t{ PPC_SPILL; bool hook = %s(ctx, base); PPC_RELOAD;", h.call.c_str());
+        Line(Fmt("\t{ PPC_SPILL; bool hook = %s(ctx, base);%s", h.call.c_str(), reload.c_str()));
+        hook_regs_ = nullptr;
+        // the exits store what the hook left as it was
+        std::string s = "\t";
         if (h.on_true.set) s += " if (hook) { " + leave(h.on_true) + " }";
         if (h.on_false.set) s += " if (!hook) { " + leave(h.on_false) + " }";
         Line(s + " }");

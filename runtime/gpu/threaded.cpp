@@ -20,6 +20,7 @@
 
 #include "gpu/backend.h"
 #include "gpu/xenos_format.h"
+#include "kernel/kernel.h"
 
 namespace gpu {
 
@@ -312,7 +313,10 @@ public:
 
     bool Init(uint32_t width, uint32_t height) override {
         if (!inner_->Init(width, height)) return false;
-        thread_ = std::thread([this] { Run(); });
+        thread_ = std::thread([this] {
+            kernel::UseHostCores();
+            Run();
+        });
         return true;
     }
     Shader* CreateShader(ShaderStage stage, const uint32_t* code, size_t dwords) override {

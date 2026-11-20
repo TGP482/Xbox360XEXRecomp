@@ -138,6 +138,39 @@ void Spawn(std::function<void()> fn) {
 #endif
 }
 
+#ifdef _WIN32
+// guest processor p runs on host physical core p, so busy guest threads never share a core
+constexpr size_t kGuestProcessors = 6;
+
+// each physical core's logical processors, in processor group 0
+const std::vector<KAFFINITY>& HostCores() {
+    static const std::vector<KAFFINITY> cores = [] {
+        std::vector<KAFFINITY> out;
+        DWORD bytes = 0;
+        ::GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &bytes);
+        std::vector<uint8_t> buf(bytes);
+        if (!::GetLogicalProcessorInformationEx(RelationProcessorCore,
+                                                reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data()),
+                                                &bytes)) {
+            return out;
+        }
+        for (DWORD at = 0; at < bytes;) {
+            auto* e = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data() + at);
+            if (e->Processor.GroupMask[0].Group == 0) out.push_back(e->Processor.GroupMask[0].Mask);
+            at += e->Size;
+        }
+        return out;
+    }();
+    return cores;
+}
+
+void PlaceOnCore(const Thread& t) {
+    const std::vector<KAFFINITY>& cores = HostCores();
+    if (cores.empty()) return;
+    ::SetThreadAffinityMask(static_cast<HANDLE>(t.host), cores[t.processor % cores.size()]);
+}
+#endif
+
 ThreadRef NewThread(uint32_t stack_size, uint8_t processor) {
     auto t = std::make_shared<Thread>();
     t->id = g_next_id.fetch_add(4);
@@ -194,6 +227,13 @@ void StartThread(ThreadRef t) {
         char name[32];
         std::snprintf(name, sizeof(name), "guest %X", t->id);
         NameHostThread(name);
+#ifdef _WIN32
+        HANDLE self = nullptr;
+        ::DuplicateHandle(::GetCurrentProcess(), ::GetCurrentThread(), ::GetCurrentProcess(), &self, 0, FALSE,
+                          DUPLICATE_SAME_ACCESS);
+        t->host = self;
+        PlaceOnCore(*t);
+#endif
         PPCContext ctx;
         InitContext(*t, ctx);
         {
@@ -263,6 +303,18 @@ void SuspendPoint() {
 void SetProcessor(Thread& t, uint8_t processor) {
     t.processor = processor;
     W8(t.pcr + kPcrProcessor, processor);
+#ifdef _WIN32
+    if (t.host) PlaceOnCore(t);
+#endif
+}
+
+void UseHostCores() {
+#ifdef _WIN32
+    const std::vector<KAFFINITY>& cores = HostCores();
+    KAFFINITY rest = 0;
+    for (size_t c = kGuestProcessors; c < cores.size(); c++) rest |= cores[c];
+    if (rest) ::SetThreadAffinityMask(::GetCurrentThread(), rest);
+#endif
 }
 
 void QueueApc(Thread& t, uint32_t routine, uint32_t a1, uint32_t a2, uint32_t a3) {

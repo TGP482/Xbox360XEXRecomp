@@ -194,6 +194,7 @@ struct Thread : Object {
     std::condition_variable resume_cv;
     std::vector<uint32_t> tls_slots;  // KeTlsGetValue and KeTlsSetValue
     PPCContext* ctx = nullptr;
+    void* host = nullptr;  // its host thread, placed on its processor's core
     Thread() : Object(ObjType::Thread) {}
 };
 using ThreadRef = std::shared_ptr<Thread>;
@@ -219,6 +220,7 @@ void Resume(Thread& t);
 uint32_t Suspend(Thread& t);  // previous count; another thread stops at its next kernel wait, delay or yield
 void SuspendPoint();           // blocks the current thread while it is suspended
 void SetProcessor(Thread& t, uint8_t processor);
+void UseHostCores();  // the calling host thread runs on the cores the guest's processors leave
 bool RunApcs(Thread& t);
 void QueueApc(Thread& t, uint32_t routine, uint32_t a1, uint32_t a2, uint32_t a3);
 std::vector<ThreadRef> Threads();

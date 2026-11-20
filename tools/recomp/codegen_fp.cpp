@@ -82,8 +82,14 @@ bool CodeGen::EmitFloat(const Insn& i) {
 }
 
 void CodeGen::EmitFloatAccess(const Insn& i, bool single, bool store, bool update, bool indexed) {
-    std::string ea = EffectiveAddress(i, indexed, false);
     uint32_t bits = single ? 32 : 64;
+    if (!indexed && !update && i.Ra() != 0) {
+        std::string at = Displaced(i, false);
+        if (store) Line(Fmt("\tppc_stf%u(%s, %s);", bits, at.c_str(), F(i.Rt()).c_str()));
+        else Line(Fmt("\t%s = ppc_ldf%u(%s);", Fw(i.Rt()).c_str(), bits, at.c_str()));
+        return;
+    }
+    std::string ea = EffectiveAddress(i, indexed, false);
     std::string mem = store ? Fmt("PPC_STF%u(ea, %s);", bits, F(i.Rt()).c_str())
                             : Fmt("%s = PPC_LDF%u(ea);", Fw(i.Rt()).c_str(), bits);
     std::string rest = update ? Fmt(" %s = ea;", Rw(i.Ra()).c_str()) : "";

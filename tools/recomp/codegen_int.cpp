@@ -340,9 +340,26 @@ std::string CodeGen::EffectiveAddress(const Insn& i, bool indexed, bool ds) {
     return Offset(base, ds ? i.Ds() : i.Simm());
 }
 
+// rA with a displacement as a host address, for the host to fold the displacement into the access
+std::string CodeGen::Displaced(const Insn& i, bool ds) {
+    return Fmt("PPC_DISP(%s, %d)", R(i.Ra()).c_str(), ds ? i.Ds() : i.Simm());
+}
+
 bool CodeGen::EmitLoadStore(const Insn& i) {
     const Access* a = FindAccess(i.op);
     if (!a) return EmitAtomicOrMultiple(i);
+    uint32_t bits = a->size * 8;
+    if (a->addr != Addr::X && !a->update && i.Ra() != 0) {
+        std::string at = Displaced(i, a->addr == Addr::DS);
+        if (a->store) {
+            Line(Fmt("\tppc_st%u(%s, %s);", bits, at.c_str(), R(i.Rt()).c_str()));
+            return true;
+        }
+        std::string v = Fmt("ppc_ld%u(%s)", bits, at.c_str());
+        if (a->sign) v = Fmt("uint64_t(int64_t(int%u_t(%s)))", bits, v.c_str());
+        Line(Fmt("\t%s = %s;", Rw(i.Rt()).c_str(), v.c_str()));
+        return true;
+    }
     std::string ea = EffectiveAddress(i, a->addr == Addr::X, a->addr == Addr::DS);
     std::string mem;
     if (a->store) {

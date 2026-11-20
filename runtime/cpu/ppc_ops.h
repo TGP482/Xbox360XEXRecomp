@@ -46,9 +46,14 @@ extern "C" __attribute__((used)) inline int _fltused = 0;
 #define PPC_ST16(a, v) ppc_st16(base + (uint32_t)(a), (uint16_t)(v))
 #define PPC_ST32(a, v) ppc_st32(base + (uint32_t)(a), (uint32_t)(v))
 #define PPC_ST64(a, v) ppc_st64(base + (uint32_t)(a), (uint64_t)(v))
+// rA plus a displacement folded into the host access; the guest space's edges show its other end, so an
+// address that wraps at 32 bits reads what the console reads
+#define PPC_DISP(r, d) (base + (uint32_t)(r) + (d))
 // spin loops and other threads' writes: memory is reread after every backward branch
 #define PPC_BARRIER() __asm__ volatile("" ::: "memory")
 
+inline uint8_t ppc_ld8(const uint8_t* p) { return *p; }
+inline void ppc_st8(uint8_t* p, uint8_t v) { *p = v; }
 inline uint16_t ppc_ld16(const uint8_t* p) {
     uint16_t v;
     std::memcpy(&v, p, 2);
@@ -200,7 +205,6 @@ inline uint64_t ppc_mulhdu(uint64_t a, uint64_t b) { return uint64_t((unsigned _
 
 // single precision results: the double result rounded to single
 inline double ppc_single(double v) { return double(float(v)); }
-
 // fsel: a >= 0 picks c, anything else (NaN too) picks b
 inline double ppc_fsel(double a, double b, double c) { return a >= 0.0 ? c : b; }
 

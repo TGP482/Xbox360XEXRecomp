@@ -148,6 +148,7 @@ private:
     bool EmitLoadStore(const ppc::Insn& i);
     bool EmitAtomicOrMultiple(const ppc::Insn& i);
     std::string EffectiveAddress(const ppc::Insn& i, bool indexed, bool ds);
+    std::string Displaced(const ppc::Insn& i, bool ds);
     bool EmitSystem(const ppc::Insn& i);
     bool EmitSpr(const ppc::Insn& i);
     bool EmitConditionRegister(const ppc::Insn& i);

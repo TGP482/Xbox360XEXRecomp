@@ -28,6 +28,10 @@ static uint8_t* g_base = nullptr;
 static std::recursive_mutex g_lock;
 
 constexpr uint64_t kSpace = 1ull << 32;
+// a displacement reaches 32 KB past either end of the space, where the console's 32 bit address wraps: below it the
+// 4 KB window's last 64 KB show again, above it the first 64 KB stay without access as the allocators never use them
+constexpr uint64_t kEdge = kLargePage;
+static_assert(kVirtualBase >= kEdge);
 constexpr uint32_t k16mbPage = 0x1000000;
 
 // NTSTATUS results
@@ -42,19 +46,19 @@ uint8_t* Base() { return g_base; }
 bool InPhysical(uint32_t va) { return va >= kPhysical64k; }
 
 #ifdef _WIN32
-// the 4 KB window shows physical memory one page up, its last page wrapping to page 0; a view at a page offset needs a
-// placeholder
-static bool MapWindow4k(uint8_t* b, HANDLE ram) {
+// the last size bytes of the 4 KB window at w: it shows physical memory one page up, its last page wrapping to page 0;
+// a view at a page offset needs a placeholder
+static bool MapWindowEnd(uint8_t* w, uint64_t size, HANDLE ram) {
     HMODULE kernel = GetModuleHandleW(L"kernelbase.dll");
     auto alloc2 = reinterpret_cast<decltype(&VirtualAlloc2)>(GetProcAddress(kernel, "VirtualAlloc2"));
     auto map3 = reinterpret_cast<decltype(&MapViewOfFile3)>(GetProcAddress(kernel, "MapViewOfFile3"));
     if (!alloc2 || !map3) return false;
     HANDLE self = GetCurrentProcess();
-    uint8_t* w = b + kPhysical4k;
-    uint8_t* last = w + kPhysicalSize - kPage;
-    if (!alloc2(self, w, kPhysicalSize, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0)) return false;
-    bool ok = VirtualFree(w, kPhysicalSize - kPage, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
-    ok = ok && map3(ram, self, w, kPage, kPhysicalSize - kPage, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0);
+    uint8_t* last = w + size - kPage;
+    if (!alloc2(self, w, size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0)) return false;
+    bool ok = VirtualFree(w, size - kPage, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+    uint64_t first = kPhysicalSize - size + kPage;
+    ok = ok && map3(ram, self, w, first, size - kPage, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0);
     return ok && map3(ram, self, last, 0, kPage, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0);
 }
 
@@ -62,14 +66,16 @@ static bool MapSpace(uint8_t* b, HANDLE ram) {
     bool ok = ram && VirtualAlloc(b, kPhysical64k, MEM_RESERVE, PAGE_NOACCESS) == b;
     for (uint32_t w : {kPhysical64k, kPhysical16m})
         ok = ok && MapViewOfFileEx(ram, FILE_MAP_ALL_ACCESS, 0, 0, kPhysicalSize, b + w) == b + w;
-    return ok && MapWindow4k(b, ram);
+    ok = ok && VirtualAlloc(b + kSpace, kEdge, MEM_RESERVE, PAGE_NOACCESS) == b + kSpace;
+    return ok && MapWindowEnd(b + kPhysical4k, kPhysicalSize, ram) && MapWindowEnd(b - kEdge, kEdge, ram);
 }
 
 static void UnmapSpace(uint8_t* b) {
     VirtualFree(b, 0, MEM_RELEASE);
+    VirtualFree(b + kSpace, 0, MEM_RELEASE);
     for (uint32_t w : {kPhysical64k, kPhysical16m}) UnmapViewOfFile(b + w);
     // a 4 KB window piece is a view or a placeholder left unmapped
-    for (uint8_t* p : {b + kPhysical4k, b + kPhysical4k + kPhysicalSize - kPage}) {
+    for (uint8_t* p : {b + kPhysical4k, b + kPhysical4k + kPhysicalSize - kPage, b - kEdge, b - kPage}) {
         if (!UnmapViewOfFile(p)) VirtualFree(p, 0, MEM_RELEASE);
     }
 }
@@ -84,10 +90,11 @@ static uint8_t* Reserve() {
                                     nullptr);
     // a fixed base keeps crash dumps comparable between runs
     for (uint64_t hint : {0x100000000ull, 0x200000000ull, 0x300000000ull, 0ull}) {
-        void* p = VirtualAlloc(reinterpret_cast<void*>(hint), kSpace, MEM_RESERVE, PAGE_NOACCESS);
+        void* want = hint ? reinterpret_cast<void*>(hint - kEdge) : nullptr;
+        void* p = VirtualAlloc(want, kSpace + 2 * kEdge, MEM_RESERVE, PAGE_NOACCESS);
         if (!p) continue;
-        auto* b = static_cast<uint8_t*>(p);
-        VirtualFree(b, 0, MEM_RELEASE);
+        VirtualFree(p, 0, MEM_RELEASE);
+        auto* b = static_cast<uint8_t*>(p) + kEdge;
         if (MapSpace(b, ram)) return b;
         UnmapSpace(b);
     }
@@ -97,19 +104,22 @@ static uint8_t* Reserve() {
 static bool CommitPhysical(uint32_t, uint32_t) { return true; }
 
 static uint8_t* Reserve() {
-    void* p = mmap(reinterpret_cast<void*>(0x100000000ull), kSpace, PROT_NONE,
+    void* p = mmap(reinterpret_cast<void*>(0x100000000ull - kEdge), kSpace + 2 * kEdge, PROT_NONE,
                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (p == MAP_FAILED) return nullptr;
-    auto* b = static_cast<uint8_t*>(p);
+    auto* b = static_cast<uint8_t*>(p) + kEdge;
     int fd = memfd_create("ram", 0);
     if (fd < 0 || ftruncate(fd, kPhysicalSize)) return nullptr;
-    // address, size, physical offset: the 4 KB window one page up, its last page wrapping to page 0
-    const uint64_t views[][3] = {{kPhysical64k, kPhysicalSize, 0},
-                                 {kPhysical16m, kPhysicalSize, 0},
-                                 {kPhysical4k, kPhysicalSize - kPage, kPage},
-                                 {kPhysical4k + kPhysicalSize - kPage, kPage, 0}};
+    // address, size, physical offset: the 4 KB window one page up, its last page wrapping to page 0, and its last
+    // 64 KB again below the space
+    const int64_t views[][3] = {{kPhysical64k, kPhysicalSize, 0},
+                                {kPhysical16m, kPhysicalSize, 0},
+                                {kPhysical4k, kPhysicalSize - kPage, kPage},
+                                {kPhysical4k + kPhysicalSize - kPage, kPage, 0},
+                                {-int64_t(kEdge), kEdge - kPage, kPhysicalSize - kEdge + kPage},
+                                {-int64_t(kPage), kPage, 0}};
     for (const auto& v : views) {
-        void* at = mmap(b + v[0], v[1], PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, off_t(v[2]));
+        void* at = mmap(b + v[0], size_t(v[1]), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, off_t(v[2]));
         if (at == MAP_FAILED) return nullptr;
     }
     return b;
@@ -541,9 +551,19 @@ uint64_t WriteSum(uint32_t pa, uint32_t size) {
 }
 
 #ifdef _WIN32
+// the 4 KB window's last 64 KB show again below the space
+static void ProtectEdge(uint32_t page, uint32_t count, DWORD protect) {
+    DWORD old;
+    for (uint32_t p = page; p < page + count; p++) {
+        uint64_t va = p ? kPhysical4k + uint64_t(p) * kPage - kPage : kSpace - kPage;
+        if (va >= kSpace - kEdge) VirtualProtect(g_base - (kSpace - va), kPage, protect, &old);
+    }
+}
+
 // a run of physical pages in all three windows; the 4 KB window shows page 0 at its end
 static void ProtectPages(uint32_t page, uint32_t count, DWORD protect) {
     DWORD old;
+    ProtectEdge(page, count, protect);
     uint32_t pa = page * kPage;
     size_t bytes = size_t(count) * kPage;
     VirtualProtect(g_base + kPhysical64k + pa, bytes, protect, &old);
@@ -572,8 +592,10 @@ static LONG CALLBACK OnWatchedWrite(EXCEPTION_POINTERS* e) {
     }
     uintptr_t at = r.ExceptionInformation[1];
     uintptr_t base = reinterpret_cast<uintptr_t>(g_base);
-    if (at < base + kPhysical64k || at >= base + kSpace) return EXCEPTION_CONTINUE_SEARCH;
-    uint32_t page = PhysicalFromVirtual(uint32_t(at - base)) / kPage;
+    uint64_t va = at - base;
+    if (at < base && at >= base - kEdge) va = kSpace - (base - at);
+    if (va < kPhysical64k || va >= kSpace) return EXCEPTION_CONTINUE_SEARCH;
+    uint32_t page = PhysicalFromVirtual(uint32_t(va)) / kPage;
     std::lock_guard<std::mutex> lock(g_watch_lock);
     if (g_watched[page]) {
         Open(page);

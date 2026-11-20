@@ -205,6 +205,17 @@ inline uint64_t ppc_mulhdu(uint64_t a, uint64_t b) { return uint64_t((unsigned _
 
 // single precision results: the double result rounded to single
 inline double ppc_single(double v) { return double(float(v)); }
+// single multiply add, rounded once as the console does when every operand holds a single; ordered compares so the
+// host compiler drops the check for operands it knows are singles
+inline double ppc_fmadds(double a, double c, double b) {
+    float fa = float(a);
+    float fc = float(c);
+    float fb = float(b);
+    bool singles = !(fa < a || fa > a) && !(fc < c || fc > c) && !(fb < b || fb > b);
+    if (singles) return __builtin_fmaf(fa, fc, fb);
+    return double(float(__builtin_fma(a, c, b)));
+}
+
 // fsel: a >= 0 picks c, anything else (NaN too) picks b
 inline double ppc_fsel(double a, double b, double c) { return a >= 0.0 ? c : b; }
 

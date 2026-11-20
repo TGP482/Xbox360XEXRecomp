@@ -24,7 +24,8 @@ public:
     virtual void Clear(const State& s, uint32_t flags, const float color[4], float z, uint32_t stencil,
                        const Rect* rect) = 0;
     virtual void Resolve(const State& s, const ResolveArgs& r) = 0;
-    // the title copies a texture through guest memory, which holds no resolve the renderer keeps
+    // the title copies a texture through guest memory, which holds no resolve the renderer keeps; with no destination
+    // the title's CPU reads src from now on, so resolves to it land in guest memory
     virtual void Copy(const CopyArgs&) {}
     // front: the frame buffer's texture fetch constant, host order
     virtual void Present(const uint32_t front[6]) = 0;

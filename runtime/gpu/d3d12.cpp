@@ -237,6 +237,19 @@ struct Resolved {
     int32_t copied = -1;  // the guest format a D3DX copy wrote, which block compressed fetches may read
 };
 
+constexpr uint32_t kReadSlots = 4;  // copies of one texture on their way back: frames in flight plus one
+
+// a texture the title's CPU reads: each resolve to it copied back and written to guest memory once the GPU finished
+// it, as the console's resolve lands in RAM
+struct CpuRead {
+    uint32_t fetch[6] = {};  // from its lock, host order
+    ComPtr<ID3D12Resource> buffer[kReadSlots];
+    uint64_t fence[kReadSlots] = {};  // the submission each copy lands in, 0 once written
+    uint32_t row_pitch[kReadSlots] = {};
+    float scale[kReadSlots] = {};  // host texels per title texel in the copy
+    uint32_t next = 0;
+};
+
 // everything a pipeline depends on beyond the root signature
 struct PipelineKey {
     uint64_t vs = 0;
@@ -682,6 +695,9 @@ private:
     void RenderUi();
     void ShowFrame(const xenos::TextureFetch& t);
     void CopyResolve(Target& src, Resolved& dst, const ResolveArgs& r);
+    void LatchCpuRead(const uint32_t fetch[6]);
+    void ReadBackResolve(CpuRead& read, Resolved& from);
+    void LandCpuReads();
     Resolved& EnsureResolved(uint64_t key, DXGI_FORMAT format, uint32_t w, uint32_t h);
     void DropResolved(uint32_t base);
     void CopyResolved(Resolved& from, Resolved& to, const Rect& src, const Rect& dst);
@@ -743,6 +759,7 @@ private:
     std::function<void(size_t)> hash_job_ = [this](size_t i) { TakeHash(*hash_ahead_[i]); };
     WorkPool pool_;  // after what its jobs use, so it stops first
     std::unordered_map<uint64_t, Resolved> resolved_;  // by ResolvedKey
+    std::unordered_map<uint32_t, CpuRead> cpu_reads_;  // by address
     std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> pass_pipelines_;
     std::vector<std::unique_ptr<Shader>> shaders_;
     std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> pipelines_;
@@ -1915,6 +1932,16 @@ void ReadFetch(const State& s, uint32_t index, uint32_t out[6]) {
     for (uint32_t k = 0; k < 6; k++) out[k] = Be32(s.fetch + (index * 6 + k) * 4);
 }
 
+// the 3D or stacked fetches whose fetch constant holds a 2D texture: one layer, sampled as 2D
+void FlatFetches(const State& s, const ShaderInfo& info, bool flat[32]) {
+    for (uint32_t i = 0; i < info.textures.size() && i < 32; i++) {
+        if (info.textures[i].dimension != uint8_t(xenos::Dimension::D3)) continue;
+        uint32_t fetch[6];
+        ReadFetch(s, info.textures[i].fetch, fetch);
+        flat[i] = xenos::DecodeTextureFetch(fetch).dimension == xenos::Dimension::D2;
+    }
+}
+
 // what the extension's Sampled makes of each texture the stage binds
 void D3D12Backend::TexFlags(const State& s, const ShaderInfo& info, ShaderStage stage, uint8_t flags[32]) {
     for (uint32_t i = 0; i < info.textures.size() && i < 32; i++) {
@@ -1944,7 +1971,8 @@ void D3D12Backend::FillTextureView(const TextureBinding& b, const uint32_t fetch
     Texture* tex = FrameTexture(fetch, t);
     if (tex && tex->swap) tex = tex->swap;
     v.Format = tex ? tex->format : DXGI_FORMAT_R8G8B8A8_UNORM;
-    switch (b.dimension) {
+    bool flat = b.dimension == uint8_t(xenos::Dimension::D3) && t.dimension == xenos::Dimension::D2;
+    switch (flat ? uint8_t(xenos::Dimension::D2) : b.dimension) {
         case 2:
             v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
             v.Texture3D.MipLevels = tex ? tex->levels : 1;
@@ -1960,7 +1988,7 @@ void D3D12Backend::FillTextureView(const TextureBinding& b, const uint32_t fetch
     }
     // a fetch whose texture the host cannot hold reads zero, as does a dimension the texture lacks
     bool fits = tex && (b.dimension != 3 || t.dimension == xenos::Dimension::Cube) &&
-                (b.dimension != 2 || t.dimension == xenos::Dimension::D3);
+                (b.dimension != 2 || t.dimension == xenos::Dimension::D3 || flat);
     if (fits) Transition(tex->res.Get(), tex->state, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
     // made once, copied after
     if (texture_views_.size() >= kTextureViews) {
@@ -2514,6 +2542,8 @@ void D3D12Backend::Draw(const State& s, const DrawArgs& a) {
     ShaderOptions ps_opt;
     ps_opt.vpos_reg = s.link.vpos_reg;
     ps_opt.alpha_test = Bits(s.Reg(kRbColorControl), 3, 1) && Bits(s.Reg(kRbColorControl), 0, 3) != 7;
+    FlatFetches(s, s.vs->info, vs_opt.flat);
+    if (s.ps) FlatFetches(s, s.ps->info, ps_opt.flat);
     if (ext_) {
         TexFlags(s, s.vs->info, ShaderStage::Vertex, vs_opt.tex_flags);
         if (s.ps) TexFlags(s, s.ps->info, ShaderStage::Pixel, ps_opt.tex_flags);
@@ -2650,6 +2680,8 @@ void D3D12Backend::Resolve(const State& s, const ResolveArgs& r) {
         Resolved& dst = EnsureResolved(ResolvedKey(r.dst_base, src->key), fi.host, w, h);
         dst.copied = -1;
         if (dst.res) CopyResolve(*src, dst, r);
+        auto read = cpu_reads_.find(r.dst_base);
+        if (read != cpu_reads_.end()) ReadBackResolve(read->second, dst);
     } else if (src) {
         static bool logged = false;
         if (!std::exchange(logged, true)) LOGR("D3D12: resolve to format %u left out", r.dst_format);
@@ -2705,6 +2737,10 @@ void D3D12Backend::DropResolved(uint32_t base) {
 void D3D12Backend::Copy(const CopyArgs& c) {
     xenos::TextureFetch src = xenos::DecodeTextureFetch(c.src);
     xenos::TextureFetch dst = xenos::DecodeTextureFetch(c.dst);
+    if (!dst.base) {
+        LatchCpuRead(c.src);
+        return;
+    }
     if (dst.mip_min || src.base == dst.base) return;
     std::vector<uint64_t> keys;  // the source's resolves, one per target key
     for (auto& [key, r] : resolved_) {
@@ -2744,6 +2780,83 @@ void D3D12Backend::CopyResolved(Resolved& from, Resolved& to, const Rect& src, c
     float h = float(from.height);
     float uv[4] = {src.x1 / w, src.y1 / h, (src.x2 - src.x1) / w, (src.y2 - src.y1) / h};
     Blit(from.res.Get(), from.format, uv, false, true, 1, 1, to.format);
+}
+
+// a lock: resolves to the texture are read back from now on, when the host holds its texels as the guest's bytes
+void D3D12Backend::LatchCpuRead(const uint32_t fetch[6]) {
+    xenos::TextureFetch t = xenos::DecodeTextureFetch(fetch);
+    const xenos::FormatInfo& fi = xenos::Info(t.format);
+    bool same_bytes = fi.block == 1 && fi.convert == xenos::Convert::None && fi.host_bytes == fi.bytes;
+    if (!t.base || t.mip_min || t.dimension != xenos::Dimension::D2 || !same_bytes) return;
+    std::memcpy(cpu_reads_[t.base].fetch, fetch, sizeof(CpuRead::fetch));
+}
+
+// a resolve the CPU reads: its host texels into the next readback slot, unless the GPU is a whole ring behind
+void D3D12Backend::ReadBackResolve(CpuRead& read, Resolved& from) {
+    uint32_t slot = read.next;
+    xenos::TextureFetch t = xenos::DecodeTextureFetch(read.fetch);
+    // another texture took the address
+    if (read.fence[slot] || !from.res || xenos::Info(t.format).host != from.format) return;
+    D3D12_RESOURCE_DESC rd = from.res->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp;
+    UINT64 bytes = 0;
+    dev_->GetCopyableFootprints(&rd, 0, 1, 0, &fp, nullptr, nullptr, &bytes);
+    ComPtr<ID3D12Resource>& buffer = read.buffer[slot];
+    if (buffer && buffer->GetDesc().Width < bytes) Release(std::move(buffer));
+    if (!buffer) {
+        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_READBACK};
+        D3D12_RESOURCE_DESC bd = BufferDesc(bytes);
+        HRESULT hr = dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                   nullptr, IID_PPV_ARGS(&buffer));
+        if (FAILED(hr)) return;
+    }
+    Transition(from.res.Get(), from.state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION to{buffer.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+    to.PlacedFootprint = fp;
+    D3D12_TEXTURE_COPY_LOCATION texels{from.res.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+    cl_->CopyTextureRegion(&to, 0, 0, 0, &texels, nullptr);
+    read.fence[slot] = fence_value_ + 1;
+    read.row_pitch[slot] = fp.Footprint.RowPitch;
+    read.scale[slot] = from.scale;
+    read.next = (slot + 1) % kReadSlots;
+}
+
+// a host copy at scale into guest memory as the texture lays it out, each title texel the host texel at its centre
+void WriteTexels(const uint8_t* p, uint32_t row_pitch, float scale, const xenos::TextureFetch& t) {
+    uint32_t bytes = xenos::Info(t.format).bytes;
+    uint32_t log2 = uint32_t(std::countr_zero(bytes));
+    xenos::Level l = xenos::Levels(t)[0];
+    uint8_t* memory = const_cast<uint8_t*>(Guest(l.address));
+    uint32_t w = std::min(t.width, l.pitch_blocks);
+    uint32_t h = std::min(t.height, l.rows_blocks);
+    for (uint32_t y = 0; y < h; y++) {
+        const uint8_t* row = p + size_t((y + 0.5f) * scale) * row_pitch;
+        for (uint32_t x = 0; x < w; x++) {
+            uint8_t texel[16];
+            std::memcpy(texel, row + size_t((x + 0.5f) * scale) * bytes, bytes);
+            xenos::SwapEndian(texel, bytes, t.endian);
+            uint32_t index = t.tiled ? xenos::TiledOffset2D(x, y, l.pitch_blocks, log2) : y * l.pitch_blocks + x;
+            std::memcpy(memory + (size_t(index) << log2), texel, bytes);
+        }
+    }
+}
+
+// copies the GPU finished, oldest first per texture
+void D3D12Backend::LandCpuReads() {
+    uint64_t done = fence_->GetCompletedValue();
+    for (auto& [base, read] : cpu_reads_) {
+        xenos::TextureFetch t = xenos::DecodeTextureFetch(read.fetch);
+        for (uint32_t i = 0; i < kReadSlots; i++) {
+            uint32_t slot = (read.next + i) % kReadSlots;
+            if (!read.fence[slot] || read.fence[slot] > done) continue;
+            read.fence[slot] = 0;
+            uint8_t* p = nullptr;
+            if (FAILED(read.buffer[slot]->Map(0, nullptr, reinterpret_cast<void**>(&p)))) continue;
+            WriteTexels(p, read.row_pitch[slot], read.scale[slot], t);
+            D3D12_RANGE none{0, 0};
+            read.buffer[slot]->Unmap(0, &none);
+        }
+    }
 }
 
 void D3D12Backend::CopyResolve(Target& src, Resolved& dst, const ResolveArgs& r) {
@@ -2891,6 +3004,7 @@ void D3D12Backend::Present(const uint32_t front[6]) {
     frame_textures_.clear();
     Frame& next = CurrentFrame();
     WaitFence(next.fence);
+    LandCpuReads();
     next.alloc->Reset();
     next.garbage.clear();
     next.used = 0;

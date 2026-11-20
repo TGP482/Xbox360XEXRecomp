@@ -687,6 +687,17 @@ HLE_FUNC(D3DDevice_Resolve) {
     return 0;
 }
 
+#ifdef SUB_D3DTexture_LockRect
+// (texture, level, locked rect, rect, flags): the CPU reads level 0 from now on, so its resolves reach guest memory
+HLE_AFTER(D3DTexture_LockRect) {
+    if (!a[0] || a[1]) return;
+    gpu::CopyArgs c;
+    SurfaceFetch(a[0], c.src);
+    std::lock_guard lock(g_lock);
+    Backend()->Copy(c);
+}
+#endif
+
 #ifdef SUB_D3DXLoadSurfaceFromSurface
 // (dst surface, palette, dst rect, src surface, palette, src rect, filter, colour key): D3DX copies guest memory,
 // which holds no resolve, so the renderer copies a resolved source too

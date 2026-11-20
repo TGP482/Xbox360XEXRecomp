@@ -48,6 +48,7 @@ struct ShaderOptions {
     int8_t vpos_reg = -1;  // pixel: register the shader reads VPOS and VFACE from, -1 none
     bool alpha_test = false;
     uint8_t tex_flags[32] = {};  // per ShaderInfo::textures entry, an extension's (Extension::Sampled)
+    bool flat[32] = {};  // per ShaderInfo::textures entry: a 3D or stacked fetch whose texture is 2D, sampled as 2D
     bool motion = false;  // also the previous position and a motion vector into colour target kMotionTarget
 };
 constexpr uint32_t kMotionTarget = 4;  // past the title's four

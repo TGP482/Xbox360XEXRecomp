@@ -699,7 +699,11 @@ private:
     void CapSave(ID3D12Resource* res, D3D12_RESOURCE_STATES& state, DXGI_FORMAT view, uint32_t samples, bool depth,
                  uint32_t w, uint32_t h, float mul, const std::string& name);
     void CapSave(Target& t, const std::string& name, float mul);
+    void CapState(const State& s);
+    void CapFetch(const uint32_t fetch[6], const xenos::TextureFetch& t);
+    void CapShader(const Shader* sh, const ShaderOptions& opt, uint64_t key);
     FILE* cap_ = nullptr;
+    std::unordered_set<uint64_t> cap_shaders_;  // variant keys whose HLSL this capture wrote
     std::filesystem::path cap_dir_;
     uint32_t cap_i_ = 0;
     Target* cap_rt_ = nullptr;
@@ -2497,7 +2501,6 @@ void D3D12Backend::Draw(const State& s, const DrawArgs& a) {
     if (!s.vs || !s.consts || !s.fetch || !a.count) return;
     // a cull of both faces draws nothing
     if (Bits(s.Reg(kPaSuScModeCntl), 0, 2) == 3) return;
-    if (cap_) CapStep(ColorTarget(s, 0, TargetHeight(s)));
     // EndDraw on every way out
     struct DrawScope {
         Extension* ext;
@@ -2533,6 +2536,7 @@ void D3D12Backend::Draw(const State& s, const DrawArgs& a) {
         k = unbound;
         if (!BindTargets(s, ps_info, k, bound)) return;
     }
+    if (cap_ && bound.rt) CapStep(bound.rt);
     FillKeyStates(s, k);
     if (!k.ds_format) k.depth_control = 0;
     D3D12_PRIMITIVE_TOPOLOGY topo;
@@ -2577,6 +2581,9 @@ void D3D12Backend::Draw(const State& s, const DrawArgs& a) {
         std::fprintf(cap_, "%04u draw prim %u count %u into %ux%u rt %u ds %u vs %016llx ps %016llx\n", cap_i_++,
                      a.prim, count, bound.w, bound.h, rt, ds, static_cast<unsigned long long>(k.vs),
                      static_cast<unsigned long long>(k.ps));
+        CapState(s);
+        CapShader(s.vs, vs_opt, k.vs);
+        if (s.ps) CapShader(s.ps, ps_opt, k.ps);
         // what each pixel shader fetch reads: a resolve, or guest memory
         for (uint32_t i = 0; i < ps_info.textures.size(); i++) {
             uint32_t fetch[6];
@@ -2585,6 +2592,7 @@ void D3D12Backend::Draw(const State& s, const DrawArgs& a) {
             bool resolve = FindResolved(t, ps_info.textures[i], ShaderStage::Pixel, i) != nullptr;
             std::fprintf(cap_, "     tex %u at %08X format %u %ux%u%s\n", i, t.base, uint32_t(t.format), t.width,
                          t.height, resolve ? " resolve" : "");
+            CapFetch(fetch, t);
         }
     }
 }
@@ -2601,6 +2609,11 @@ void D3D12Backend::Clear(const State& s, uint32_t flags, const float color[4], f
     }
     if (r.x1 >= r.x2 || r.y1 >= r.y2) return;
     bool whole = r.x1 == 0 && r.y1 == 0 && r.x2 == int32_t(width) && r.y2 == int32_t(height);
+    if (cap_) {
+        std::fprintf(cap_, "%04u clear flags %X colour %g %g %g %g z %g stencil %u rect %d %d %d %d\n", cap_i_++, flags,
+                     color[0], color[1], color[2], color[3], z, stencil, r.x1, r.y1, r.x2, r.y2);
+        CapState(s);
+    }
     auto clear = [&](Target* t, uint32_t which) {
         if (!t) return;
         D3D12_RECT host = HostRect(r, t->scale);
@@ -2623,6 +2636,10 @@ void D3D12Backend::Resolve(const State& s, const ResolveArgs& r) {
     if (src && cap_) {
         std::fprintf(cap_, "%04u resolve %s %u to %08X format %u\n", cap_i_, src->depth ? "depth" : "colour",
                      src->surface.base, r.dst_base, r.dst_format);
+        std::fprintf(cap_, "     rect %d %d %d %d at %d %d bias %d clear %X colour %g %g %g %g z %g\n", r.rect.x1,
+                     r.rect.y1, r.rect.x2, r.rect.y2, r.dst_x, r.dst_y, r.exp_bias, r.clear, r.clear_color[0],
+                     r.clear_color[1], r.clear_color[2], r.clear_color[3], r.clear_z);
+        CapState(s);
         char name[48];
         std::snprintf(name, sizeof(name), "%04u_resolve_%08X", cap_i_++, r.dst_base);
         CapSave(*src, name, 1);
@@ -3066,6 +3083,7 @@ void D3D12Backend::StartCapture() {
     cap_ = _wfopen((cap_dir_ / "draws.txt").c_str(), L"w");
     cap_i_ = 0;
     cap_rt_ = nullptr;
+    cap_shaders_.clear();
     if (cap_) LOGR("capture: frame %llu into %ls", static_cast<unsigned long long>(presents_), cap_dir_.c_str());
 }
 
@@ -3106,6 +3124,42 @@ void D3D12Backend::Capture(Target& t, const char* tag, float mul) {
     char name[48];
     std::snprintf(name, sizeof(name), "%04u_%s_%u", cap_i_++, tag, t.surface.base);
     CapSave(t, name, mul);
+}
+
+// the registers that pick a step's targets and how it blends and tests
+void D3D12Backend::CapState(const State& s) {
+    std::fprintf(cap_, "     colour %08X %08X %08X %08X mask %08X surface %08X depth %08X %08X blend %08X stencil %08X\n",
+                 ColorInfo(s, 0), ColorInfo(s, 1), ColorInfo(s, 2), ColorInfo(s, 3), s.Reg(kRbColorMask),
+                 s.Reg(kRbSurfaceInfo), s.Reg(kRbDepthInfo), s.Reg(kRbDepthControl), s.Reg(kRbBlendControl0),
+                 s.Reg(kRbStencilRefMask));
+}
+
+// a fetch constant as the guest wrote it, and the first bytes of a small texture as the host decodes them
+void D3D12Backend::CapFetch(const uint32_t fetch[6], const xenos::TextureFetch& t) {
+    std::fprintf(cap_, "       fetch %08X %08X %08X %08X %08X %08X\n", fetch[0], fetch[1], fetch[2], fetch[3], fetch[4],
+                 fetch[5]);
+    constexpr uint32_t kSmallTexels = 256;
+    constexpr size_t kShownBytes = 16;
+    if (!t.base || t.width * t.height > kSmallTexels) return;
+    std::vector<uint8_t> rows;
+    uint32_t pitch = 0;
+    xenos::LoadLevel(Guest(0), t, xenos::Levels(t)[0], 0, rows, pitch);
+    std::fprintf(cap_, "       texels");
+    for (size_t i = 0; i < std::min(rows.size(), kShownBytes); i++) std::fprintf(cap_, " %02X", rows[i]);
+    std::fputc('\n', cap_);
+}
+
+// a shader's HLSL as the draw used it, once per capture in the shaders folder, named by its key in draws.txt
+void D3D12Backend::CapShader(const Shader* sh, const ShaderOptions& opt, uint64_t key) {
+    if (!cap_shaders_.insert(key).second) return;
+    ShaderInfo info;
+    std::string hlsl = TranslateShader(sh->stage, sh->code.data(), sh->code.size(), opt, info);
+    std::filesystem::path dir = cap_dir_ / "shaders";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    char name[32];
+    std::snprintf(name, sizeof(name), "%016llx.hlsl", static_cast<unsigned long long>(key));
+    std::ofstream(dir / name, std::ios::binary) << hlsl;
 }
 
 // drawn into an 8 bit copy, read back and written as a BMP; waits for the GPU

@@ -730,7 +730,7 @@ void Translator::EmitTextureFetch(const Fetch& f) {
         uint32_t t = Binding(f);
         uint32_t dim = f.Dimension();
         bool cube = dim == kDimCube;
-        bool volume = dim == kDim3D;
+        bool volume = dim == kDim3D && !opt_.flat[t & 31];
         const char* uvt = volume ? "float3" : "float2";
         if (volume) Line(F("float3 size; t%u.GetDimensions(size.x, size.y, size.z);", t));
         else Line(F("float2 size; t%u.GetDimensions(size.x, size.y);", t));
@@ -943,8 +943,8 @@ void CommitAlu() {
                  : "float Kill(bool c) { return c ? 1 : 0; }\n";
     for (uint32_t i = 0; i < info_.textures.size(); i++) {
         static const char* kTypes[4] = {"Texture2D", "Texture2D", "Texture3D", "TextureCube"};
-        s += F("%s<float4> t%u : register(t%u);\nSamplerState s%u : register(s%u);\n",
-               kTypes[info_.textures[i].dimension & 3], i, i, i, i);
+        uint32_t dim = opt_.flat[i & 31] ? kDim2D : info_.textures[i].dimension & 3;
+        s += F("%s<float4> t%u : register(t%u);\nSamplerState s%u : register(s%u);\n", kTypes[dim], i, i, i, i);
     }
     return s;
 }

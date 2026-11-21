@@ -126,6 +126,9 @@ constexpr bool AllKnown(const LayoutKey (&keys)[N]) {
 #ifndef XDK_VertexShader_Code
 #define XDK_VertexShader_Code 0xFFFFFFFFu
 #endif
+#ifndef XDK_Device_ConstantsDirty
+#define XDK_Device_ConstantsDirty 0xFFFFFFFFu
+#endif
 #ifndef XDK_Device_VerticesEnd
 #define XDK_Device_VerticesEnd 0xFFFFFFFFu
 #endif

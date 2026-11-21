@@ -156,6 +156,9 @@ void RequireLayout() {
 #ifdef SUB_D3DDevice_BeginVertices
     XDK_REQUIRE("d3d9", XDK_KEY(Device_VerticesEnd));
 #endif
+#ifdef SUB_D3DDevice_GpuLoadShaderConstantF4
+    XDK_REQUIRE("d3d9", XDK_KEY(Device_ConstantsDirty));
+#endif
 }
 
 gpu::Backend* Backend() {
@@ -526,6 +529,46 @@ void LoadLiterals(uint32_t dev, uint32_t shader, uint32_t block_at, uint32_t bas
     }
 }
 
+// Constants the GPU loads from the title's memory as it runs the draws after the load. The title marks their
+// registers clean in the device's dirty bits; one it sets afterwards is dirty again and the device's copy wins.
+constexpr uint32_t kDevConstDirty = XDK_Device_ConstantsDirty;  // vertex then pixel, a bit per 4 registers, top first
+constexpr uint32_t kStageRegs = 256;
+constexpr uint32_t kRegBytes = 16;
+
+struct GpuLoad {
+    uint32_t first = 0;  // register, vertex 0 to 255 then pixel
+    uint32_t count = 0;
+    uint32_t address = 0;
+};
+std::unordered_map<uint32_t, std::vector<GpuLoad>> g_loads;  // by device, under g_lock
+
+// the device's loads cut to the registers still clean, in load order
+void LoadsFor(uint32_t dev, std::vector<GpuLoad>& out) {
+    constexpr uint32_t kGroup = 4;
+    out.clear();
+    auto it = g_loads.find(dev);
+    if (it == g_loads.end()) return;
+    const uint64_t dirty[2] = {R64(dev + kDevConstDirty), R64(dev + kDevConstDirty + 8)};
+    for (const GpuLoad& l : it->second) {
+        uint32_t end = l.first + l.count;
+        for (uint32_t r = l.first; r < end;) {
+            uint32_t next = std::min((r / kGroup + 1) * kGroup, end);
+            uint32_t group = r % kStageRegs / kGroup;
+            bool clean = !(dirty[r / kStageRegs] >> (63 - group) & 1);
+            uint32_t from = l.address + (r - l.first) * kRegBytes;
+            bool joins = !out.empty() && out.back().first + out.back().count == r &&
+                         out.back().address + out.back().count * kRegBytes == from;
+            if (clean && joins) out.back().count += next - r;
+            if (clean && !joins) out.push_back({r, next - r, from});
+            r = next;
+        }
+    }
+}
+
+void ApplyLoads(const std::vector<GpuLoad>& loads, uint8_t* consts) {
+    for (const GpuLoad& l : loads) std::memcpy(consts + l.first * kRegBytes, HostPtr(l.address), l.count * kRegBytes);
+}
+
 // the state of a draw from the device; false when its shaders are not known
 bool ReadState(uint32_t dev, gpu::State& s, uint32_t* raw, ShaderEntry*& vs) {
     vs = FindShader(R32(dev + kDevVertexShader), true);
@@ -571,6 +614,7 @@ struct Recorded {
     bool has_rect = false;
     gpu::ResolveArgs resolve;
     std::vector<uint8_t> vertices;  // a BeginVertices draw's copy of what the title wrote
+    std::vector<GpuLoad> loads;     // read again each time it runs, as the GPU does
 };
 
 std::unordered_map<uint32_t, std::vector<Recorded>> g_buffers;  // by command buffer, under g_lock
@@ -604,6 +648,7 @@ bool Snapshot(uint32_t dev, const gpu::DrawArgs& a, uint32_t up_data, uint32_t u
     ShaderEntry* vs = nullptr;
     if (!ReadState(dev, r.state, nullptr, vs)) return false;
     CopyBanks(r.state, r);
+    LoadsFor(dev, r.loads);
     Streams(dev, *vs, up_data, up_bytes, up_stride, r.streams);
     r.draw = a;
     r.draw.fenced = false;
@@ -619,6 +664,7 @@ void RecordDraw(uint32_t dev, uint32_t buffer, const gpu::DrawArgs& a, uint32_t 
 
 // a recorded command on the renderer, tiled as the title's device is now
 void RunRecorded(gpu::Backend* backend, Recorded& r) {
+    ApplyLoads(r.loads, r.bank_bytes.data());
     if (r.banks) PointBanks(r);
     r.state.tiled_width = g_tiling.on ? uint32_t(g_tiling.extent.x2) : 0;
     r.state.tiled_height = g_tiling.on ? uint32_t(g_tiling.extent.y2) : 0;
@@ -715,6 +761,9 @@ void Draw(uint32_t dev, gpu::DrawArgs& a, uint32_t up_data = 0, uint32_t up_byte
     static uint32_t raw[gpu::kRegCount];  // s's registers in guest order
     ShaderEntry* vs = nullptr;
     if (!ReadState(dev, s, raw, vs)) return;
+    static std::vector<GpuLoad> loads;  // kept from draw to draw, under g_lock
+    LoadsFor(dev, loads);
+    ApplyLoads(loads, static_cast<uint8_t*>(HostPtr(dev + kDevConsts)));
     static std::vector<gpu::StreamFetch> streams;  // kept from draw to draw, under g_lock
     Streams(dev, *vs, up_data, up_bytes, up_stride, streams);
     a.streams = streams.data();
@@ -1131,6 +1180,8 @@ PPC_FUNC(GUEST(D3DDevice_BeginCommandBuffer)) {
     {
         std::lock_guard lock(g_lock);
         FlushVertices(dev);
+        // a recording starts with every constant dirty
+        g_loads.erase(dev);
     }
     GUEST_ORIG(D3DDevice_BeginCommandBuffer)(ctx, base);
     std::lock_guard lock(g_lock);
@@ -1147,15 +1198,15 @@ HLE_FUNC(D3DDevice_RunCommandBuffer) {
 #endif
 
 #ifdef SUB_D3DDevice_GpuLoadShaderConstantF4
-// (device, stage 0 vertex 1 pixel, first register, data, float4 count): the GPU loads the constants from memory;
-// the device's copy takes them, which the draws after it read
+// (device, stage 0 vertex 1 pixel, first register, data, float4 count): the GPU loads the constants from memory as
+// it reaches this, so the draws after it read the memory as it is when they run; an older load it covers is gone
 HLE_FUNC(D3DDevice_GpuLoadShaderConstantF4) {
-    constexpr uint32_t kStageRegs = 256;
-    constexpr uint32_t kRegBytes = 16;
-    uint32_t first = a[1] * kStageRegs + a[2];
-    uint32_t count = std::min(a[4], 2 * kStageRegs - std::min(first, 2 * kStageRegs));
+    uint32_t first = std::min(a[1] * kStageRegs + a[2], 2 * kStageRegs);
+    uint32_t count = std::min(a[4], 2 * kStageRegs - first);
     std::lock_guard lock(g_lock);
-    std::memcpy(HostPtr(a[0] + kDevConsts + first * kRegBytes), HostPtr(a[3]), count * kRegBytes);
+    std::vector<GpuLoad>& loads = g_loads[a[0]];
+    std::erase_if(loads, [&](const GpuLoad& l) { return l.first >= first && l.first + l.count <= first + count; });
+    loads.push_back({first, count, a[3]});
     return 0;
 }
 #endif

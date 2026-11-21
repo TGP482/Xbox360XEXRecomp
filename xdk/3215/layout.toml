@@ -1,6 +1,8 @@
 # XDK 2.0.3215 data layout the host reads, emitted as XDK_<name> in image_symbols.h
 [layout]
 # the device: fetch constants (32 x 6 dwords), float constants (vertex 256 float4 then pixel 256), bools, loops
+# constants a draw must send (BeginVertices 825D1680): vertex then pixel, a bit per 4 registers, top bit first
+Device_ConstantsDirty = 0x0
 Device_FetchConstants = 0x400
 Device_VsConstants = 0x700
 Device_BoolConstants = 0x2700

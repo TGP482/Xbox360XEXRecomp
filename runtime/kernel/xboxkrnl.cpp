@@ -318,6 +318,8 @@ KERNEL_EXPORT(0xBD, MmFreePhysicalMemory) {
 KERNEL_EXPORT(0xBE, MmGetPhysicalAddress) { return mem::PhysicalFromVirtual(a[0]); }
 KERNEL_EXPORT(0xC5, MmQueryAllocationSize) { return mem::AllocationSize(a[0]); }
 KERNEL_EXPORT(0xC4, MmQueryAddressProtect) { return 4; }  // PAGE_READWRITE
+// (address, size, protect): titles set the caching of physical pages, host pages stay read write
+KERNEL_EXPORT(0xC7, MmSetAddressProtect) { return 0; }
 
 // MM_STATISTICS: Length, TotalPhysicalPages, KernelPages, TitleAvailablePages, TitleTotalVirtualMemoryBytes,
 // TitleReservedVirtualMemoryBytes, TitlePhysicalPages, then counts left at zero

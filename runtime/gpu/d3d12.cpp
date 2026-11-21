@@ -2695,9 +2695,14 @@ void D3D12Backend::Resolve(const State& s, const ResolveArgs& r) {
         static bool logged = false;
         if (!std::exchange(logged, true)) LOGR("D3D12: resolve to format %u left out", r.dst_format);
     }
+    // the copy clears only the rect it copied, as a title resolving tile by tile needs
     if (src && r.clear) {
-        ClearTarget(*src, r.clear, r.clear_color, r.clear_z, uint8_t(r.clear_stencil), nullptr, 0);
-        ClearSpan(*src, r.clear, r.clear_color, r.clear_z, uint8_t(r.clear_stencil));
+        const Rect& c = r.rect;
+        bool whole = c.x1 <= 0 && c.y1 <= 0 && c.x2 >= int32_t(TargetWidth(s)) && c.y2 >= int32_t(height);
+        D3D12_RECT host = HostRect(c, src->scale);
+        uint8_t stencil = uint8_t(r.clear_stencil);
+        ClearTarget(*src, r.clear, r.clear_color, r.clear_z, stencil, whole ? nullptr : &host, whole ? 0 : 1);
+        if (whole) ClearSpan(*src, r.clear, r.clear_color, r.clear_z, stencil);
     }
 }
 

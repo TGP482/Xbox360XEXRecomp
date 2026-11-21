@@ -1146,6 +1146,20 @@ HLE_FUNC(D3DDevice_RunCommandBuffer) {
 }
 #endif
 
+#ifdef SUB_D3DDevice_GpuLoadShaderConstantF4
+// (device, stage 0 vertex 1 pixel, first register, data, float4 count): the GPU loads the constants from memory;
+// the device's copy takes them, which the draws after it read
+HLE_FUNC(D3DDevice_GpuLoadShaderConstantF4) {
+    constexpr uint32_t kStageRegs = 256;
+    constexpr uint32_t kRegBytes = 16;
+    uint32_t first = a[1] * kStageRegs + a[2];
+    uint32_t count = std::min(a[4], 2 * kStageRegs - std::min(first, 2 * kStageRegs));
+    std::lock_guard lock(g_lock);
+    std::memcpy(HostPtr(a[0] + kDevConsts + first * kRegBytes), HostPtr(a[3]), count * kRegBytes);
+    return 0;
+}
+#endif
+
 #ifdef SUB_D3DDevice_BeginVertices
 // (device, primitive, vertex count, stride): room the title writes the vertices into, 0 for none
 HLE_FUNC(D3DDevice_BeginVertices) {

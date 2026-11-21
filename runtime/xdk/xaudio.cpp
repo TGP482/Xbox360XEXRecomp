@@ -677,10 +677,8 @@ HLE_FUNC(XAudioCreateSourceVoice) {
 }
 #endif
 
-#ifdef SUB_XAudioCreateSubmixVoice
-// (init, voice out)
-HLE_FUNC(XAudioCreateSubmixVoice) {
-    uint32_t init = a[0];
+#if defined(SUB_XAudioCreateSubmixVoice) || defined(SUB_XAudioCreateSubmixVoiceInner)
+static uint32_t CreateSubmixVoice(PPCContext& ctx, uint32_t init, uint32_t voice_out) {
     auto v = std::make_unique<Voice>();
     v->channels = std::clamp<uint32_t>(R8(init + kSubmixChannels), 1, kMaxChannels);
     v->rate = R32(init + kSubmixRate);
@@ -696,9 +694,19 @@ HLE_FUNC(XAudioCreateSubmixVoice) {
     v->handle = h;
     g_order.push_back(v.get());
     g_voices[h] = std::move(v);
-    W32(a[1], h);
+    W32(voice_out, h);
     return kOk;
 }
+#endif
+
+#ifdef SUB_XAudioCreateSubmixVoice
+// (init, voice out)
+HLE_FUNC(XAudioCreateSubmixVoice) { return CreateSubmixVoice(ctx, a[0], a[1]); }
+#endif
+
+#ifdef SUB_XAudioCreateSubmixVoiceInner
+// (init, 0, voice out): the function XAudioCreateSubmixVoice wraps in its lock, called by titles that inline the wrapper
+HLE_FUNC(XAudioCreateSubmixVoiceInner) { return CreateSubmixVoice(ctx, a[0], a[2]); }
 #endif
 
 #ifdef SUB_XAudioVoice_Release

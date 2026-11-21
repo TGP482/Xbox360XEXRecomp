@@ -32,6 +32,7 @@ enum : uint32_t {
 
 constexpr uint32_t kUserIndexNone = 0xFF;
 constexpr uint64_t kOfflineXuid = 0xE000000000000001ull;
+inline constexpr char kGamertag[] = "Player";  // the offline profile's
 
 // XOVERLAPPED: the result is written, the event set and the completion routine queued, before the call returns
 // ERROR_IO_PENDING; without one the result is the return value
@@ -56,5 +57,10 @@ void CloseSockets();
 
 // a content type's packages kept in a host folder of the game's, for every user
 void MountContent(uint32_t type, const std::string& host);
+
+// the stats messages of XMsgStartIORequest, false for any other message
+bool StatsMessage(uint32_t message, uint32_t args, uint32_t& result);
+// the file the signed in player's stats are kept in, empty for stats.bin beside the profile; read on next use
+void UseStatsFile(const std::string& path);
 
 }  // namespace xam

@@ -28,10 +28,9 @@ XAM_EXPORT(0x210, XamUserGetSigninState) { return SignedIn(a[0]) ? kSignedInLoca
 
 // (user, buffer, size): the offline profile's gamertag
 XAM_EXPORT(0x20E, XamUserGetName) {
-    constexpr char kName[] = "Player";
     if (!SignedIn(a[0])) return kErrorNoSuchUser;
-    uint32_t n = std::min<uint32_t>(a[2], sizeof(kName));
-    std::memcpy(HostPtr(a[1]), kName, n);
+    uint32_t n = std::min<uint32_t>(a[2], sizeof(kGamertag));
+    std::memcpy(HostPtr(a[1]), kGamertag, n);
     if (n) W8(a[1] + n - 1, 0);
     return kErrorSuccess;
 }
@@ -56,17 +55,6 @@ XAM_EXPORT(0x2EE, XamUserCreateAchievementEnumerator) {
     auto e = std::make_shared<Enumerator>();
     e->item_size = kAchievementDetails;
     if (a[6]) W32(a[6], std::max(a[5], 1u) * kAchievementDetails);
-    W32(a[7], NewEnumerator(e));
-    return kErrorSuccess;
-}
-
-// leaderboards are Live's: an empty enumerator
-// (title, kind, key, rows, spec count, specs, buffer size out, handle out)
-XAM_EXPORT(0x2F7, XamUserCreateStatsEnumerator) {
-    constexpr uint32_t kStatsResults = 0x8;  // XUSER_STATS_READ_RESULTS: view count, views
-    auto e = std::make_shared<Enumerator>();
-    e->item_size = kStatsResults;
-    if (a[6]) W32(a[6], kStatsResults);
     W32(a[7], NewEnumerator(e));
     return kErrorSuccess;
 }

@@ -933,6 +933,8 @@ XAM_EXPORT(0x44, NetDll_XNetDnsRelease) {
 
 XAM_EXPORT(0x45, NetDll_XNetQosListen) { return 0; }
 XAM_EXPORT(0x46, NetDll_XNetQosLookup) { return kNetDown; }
+// (caller, flags, event, qos out): the Live service probe, no service here
+XAM_EXPORT(0x47, NetDll_XNetQosServiceLookup) { return kNetDown; }
 XAM_EXPORT(0x48, NetDll_XNetQosRelease) { return 0; }
 
 // (caller, XNADDR out)

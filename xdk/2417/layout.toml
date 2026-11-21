@@ -74,8 +74,10 @@ PixelInfo_Inputs = 0x20
 VertexInfo_Skip = 0x18
 VertexInfo_ElementCount = 0x1C
 VertexInfo_Elements = 0x28
-# XAudio source voice types past 1 (16 bit PCM): 8 bit PCM (Bink 828715B8), XMA
+# XAudio source voice types other than 1 (16 bit PCM): 8 bit PCM (Bink 828715B8), XMA, 32 bit float as the mixer's own
+# format (82761CB8 gives every voice output type 0)
 XAudio_SourcePcm8 = 2
+XAudio_SourceFloat = 0
 XAudio_SourceXma = 3
 
 # voices as guest objects: vtable slots read from the wrappers 8275C730 to 8275CD50, the source part at +0x4C

@@ -75,6 +75,7 @@ constexpr uint32_t kSourceEffects = 0x44;
 // 16 bit PCM is 1 in every build, the other numbers move between builds
 constexpr uint32_t kTypePcm = 1;
 constexpr uint32_t kTypePcm8 = XDK_XAudio_SourcePcm8;
+constexpr uint32_t kTypeFloat = XDK_XAudio_SourceFloat;
 constexpr uint32_t kTypeXma = XDK_XAudio_SourceXma;
 // submix voice init: its input format {u8 type, u8 channels, u32 rate}, then the channels its effects put out
 constexpr uint32_t kSubmixChannels = 0x01;
@@ -336,7 +337,11 @@ void SetReverb(Reverb& r, uint32_t p) {
 
 // Sources
 
-uint32_t BlockAlign(const Voice& v) { return v.channels * (v.type == kTypePcm8 ? 1 : 2); }
+uint32_t BlockAlign(const Voice& v) {
+    if (v.type == kTypePcm8) return v.channels;
+    if (v.type == kTypeFloat) return v.channels * 4;
+    return v.channels * 2;
+}
 
 // the voice's current packet starts over, or the next one; false once the queue is empty
 bool NextPacket(Voice& v) {
@@ -359,6 +364,7 @@ float SourceSample(Voice& v, uint32_t f, uint32_t c) {
     if (v.type == kTypeXma) return v.pcm[size_t(f) * v.channels + c] / 32768.0f;
     const Packet& p = v.packets.front();
     if (v.type == kTypePcm8) return (int(R8(p.buffer + f * BlockAlign(v) + c)) - 128) / 128.0f;
+    if (v.type == kTypeFloat) return GF(p.buffer + f * BlockAlign(v) + c * 4);
     return int16_t(R16(p.buffer + f * BlockAlign(v) + c * 2)) / 32768.0f;
 }
 
@@ -755,7 +761,7 @@ HLE_FUNC(XAudioCreateSourceVoice) {
     auto v = std::make_unique<Voice>();
     v->source = true;
     v->type = R8(init + kSourceType);
-    if (v->type == kTypePcm || v->type == kTypePcm8) {
+    if (v->type == kTypePcm || v->type == kTypePcm8 || v->type == kTypeFloat) {
         v->channels = R8(init + kPcmChannels);
         v->rate = R32(init + kPcmRate);
     } else if (v->type == kTypeXma) {

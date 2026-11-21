@@ -246,6 +246,9 @@ constexpr bool AllKnown(const LayoutKey (&keys)[N]) {
 #ifndef XDK_XAudio_SourcePcm8
 #define XDK_XAudio_SourcePcm8 0xFFFFFFFFu
 #endif
+#ifndef XDK_XAudio_SourceFloat
+#define XDK_XAudio_SourceFloat 0xFFFFFFFFu
+#endif
 #ifndef XDK_XAudio_SourceXma
 #define XDK_XAudio_SourceXma 0xFFFFFFFFu
 #endif

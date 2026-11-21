@@ -438,6 +438,7 @@ private:
     void EmitTextureFetch(const Fetch& f);
     void EmitExport(const Alu& a, bool vector, bool scalar);
     void EmitWrite(const std::string& dst, uint32_t swizzle, const char* src);
+    void NoteWrite(uint32_t reg, bool rel, bool x);
 
     std::string Source(const Alu& a, int n, bool force_const);
     std::string VectorExpr(const Alu& a);
@@ -454,6 +455,7 @@ private:
     ShaderInfo& info_;
     std::string body_;
     int indent_ = 0;
+    bool index_written_ = false;  // vertex: r0.x, where the vertex's index arrives, written
 };
 
 std::string Translator::Reg(uint32_t index, bool rel) const {
@@ -627,9 +629,11 @@ void Translator::EmitAlu(const Alu& a) {
         if (a.VectorMask()) {
             const char* m = kMasks[a.VectorMask()];
             Line(F("%s.%s = vt.%s;", Reg(a.VectorDest(), a.VectorDestRel()).c_str(), m, m));
+            NoteWrite(a.VectorDest(), a.VectorDestRel(), a.VectorMask() & 1);
         }
         if (a.ScalarMask()) {
             Line(F("%s.%s = st;", Reg(a.ScalarDest(), a.ScalarDestRel()).c_str(), kMasks[a.ScalarMask()]));
+            NoteWrite(a.ScalarDest(), a.ScalarDestRel(), a.ScalarMask() & 1);
         }
     }
     if (scalar && sop != kRetainPrev) Line("ps = st;");
@@ -680,17 +684,25 @@ void Translator::EmitWrite(const std::string& dst, uint32_t swizzle, const char*
     }
 }
 
+// r0.x holds the vertex's index until something writes it
+void Translator::NoteWrite(uint32_t reg, bool rel, bool x) {
+    if (rel || (reg == 0 && x)) index_written_ = true;
+}
+
 void Translator::EmitVertexFetch(const Fetch& f, uint32_t address) {
     if (Pixel()) {
         info_.unknown++;
         return;
     }
+    bool own_index = f.Src() == 0 && !f.SrcRel() && f.IndexComponent() == 0 && !index_written_;
+    if (!own_index) info_.fetch_anywhere = true;
     uint32_t k = uint32_t(info_.fetches.size());
     info_.fetches.push_back({uint16_t(address), uint8_t(f.VertexConst()), uint8_t(f.Dst())});
     Open(f.Predicated() ? (f.PredCondition() ? "if (p)" : "if (!p)") : "");
     std::string index = Reg(f.Src(), f.SrcRel()) + "." + kComp[f.IndexComponent()];
     Line(F("float4 fv = VertexFetch(%u, %s);", k, index.c_str()));
     EmitWrite(Reg(f.Dst(), f.DstRel()), f.DstSwizzle(), "fv");
+    NoteWrite(f.Dst(), f.DstRel(), Bits(f.DstSwizzle(), 0, 3) != 7);
     Close();
 }
 
@@ -715,6 +727,7 @@ uint32_t Translator::Binding(const Fetch& f) {
 
 void Translator::EmitTextureFetch(const Fetch& f) {
     uint32_t op = f.Op();
+    NoteWrite(f.Dst(), f.DstRel(), Bits(f.DstSwizzle(), 0, 3) != 7);
     std::string src = Reg(f.Src(), f.SrcRel());
     std::string coord = F("%s.%c%c%c", src.c_str(), kComp[f.CoordComponent(0)], kComp[f.CoordComponent(1)],
                           kComp[f.CoordComponent(2)]);

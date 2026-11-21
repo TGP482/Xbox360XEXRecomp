@@ -38,6 +38,7 @@ struct ShaderInfo {
     bool writes_depth = false;
     bool kills = false;
     bool memexport = false;  // left out
+    bool fetch_anywhere = false;  // vertex: a fetch reads at an index the shader computed, not its own
     uint32_t unknown = 0;    // instructions not understood, translated as zero
     uint64_t constants[2] = {};  // a bit per two float constants read, all when read relative
 };

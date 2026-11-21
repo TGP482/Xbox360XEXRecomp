@@ -233,15 +233,16 @@ bool VertexRange(const DrawArgs& a, int64_t& low, int64_t& high) {
 }
 
 // the bytes of each stream the draw reads, once per stream and stride
-void CopyDraw(const DrawArgs& a, size_t stream_count, Command& c) {
+void CopyDraw(const DrawArgs& a, size_t stream_count, bool whole, Command& c) {
     c.draw = a;
     c.streams.assign(a.streams, a.streams + (a.streams ? stream_count : 0));
     c.draw.streams = c.streams.empty() ? nullptr : c.streams.data();
     // read as the draw runs, before the render thread signals a fence past it
     if (a.fenced) return;
     int64_t low = 0;
-    int64_t high = 0;
-    bool any = VertexRange(a, low, high);
+    int64_t high = UINT32_MAX;
+    // a shader computing its fetch indices may read any vertex of a stream
+    bool any = whole || VertexRange(a, low, high);
     size_t index_bytes = a.indices ? size_t(a.count) * (a.index32 ? 4 : 2) : 0;
 
     // a draw has a few streams: a linear search, in memory kept from draw to draw
@@ -286,13 +287,13 @@ void CopyDraw(const DrawArgs& a, size_t stream_count, Command& c) {
 }
 
 // a queued draw's buffers copied into it, as for a draw whose buffers the title may rewrite at once
-void Detach(Command& c) {
+void Detach(Command& c, bool whole) {
     static thread_local std::vector<StreamFetch> streams;
     streams = c.streams;
     DrawArgs a = c.draw;
     a.streams = streams.empty() ? nullptr : streams.data();
     a.fenced = false;
-    CopyDraw(a, streams.size(), c);
+    CopyDraw(a, streams.size(), whole, c);
 }
 
 // a big endian fence stored at where, unless a later one is there already
@@ -346,7 +347,7 @@ public:
             AddFetchBlocks(ps, fetches[0]);
         }
         recorded_banks_.Record(s, *c, consts, fetches);
-        CopyDraw(a, vs.fetches.size(), *c);
+        CopyDraw(a, vs.fetches.size(), vs.fetch_anywhere, *c);
         Push(std::move(c));
     }
     void Clear(const State& s, uint32_t flags, const float color[4], float z, uint32_t stencil,
@@ -438,7 +439,7 @@ public:
             std::lock_guard lock(queue_lock_);
             if (!signal_where_) return;
             for (std::unique_ptr<Command>& c : queue_) {
-                if (c->op == Op::Draw && c->draw.fenced) Detach(*c);
+                if (c->op == Op::Draw && c->draw.fenced) Detach(*c, inner_->Info(c->state.vs).fetch_anywhere);
             }
             where = signal_where_;
             value = signal_value_;

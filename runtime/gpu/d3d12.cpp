@@ -686,7 +686,7 @@ private:
     void BindConstants(const State& s, D3D12_GPU_VIRTUAL_ADDRESS fetch, DrawConstants& c, const Target* rt,
                        uint32_t src_blend);
     void BindFloats(uint32_t root, const uint8_t* be, const uint64_t (&read)[2]);
-    void FillKeyStates(const State& s, PipelineKey& k) const;
+    void FillKeyStates(const State& s, float scale, PipelineKey& k) const;
 
     // present
     void ResizeSwap();
@@ -2098,7 +2098,7 @@ uint32_t D3D12Backend::BindTextures(const State& s, const ShaderInfo& info, Shad
 
 // Draws
 
-void D3D12Backend::FillKeyStates(const State& s, PipelineKey& k) const {
+void D3D12Backend::FillKeyStates(const State& s, float scale, PipelineKey& k) const {
     for (uint32_t i = 0; i < 4; i++) k.blend[i] = s.Reg(i == 0 ? kRbBlendControl0 : kRbBlendControl1 + i - 1);
     k.color_mask = s.Reg(kRbColorMask);
     k.color_control = s.Reg(kRbColorControl) & 0x10;
@@ -2107,7 +2107,8 @@ void D3D12Backend::FillKeyStates(const State& s, PipelineKey& k) const {
     k.stencil = Bits(sr, 8, 8) | Bits(sr, 16, 8) << 8;
     k.su_mode = s.Reg(kPaSuScModeCntl) & 0x9FFF;
     if (Bits(k.su_mode, 11, 2)) {
-        k.poly_offset[0] = s.RegF(kPaSuPolyOffsetFrontScale);
+        // the console's slope is per sixteenth of a guest pixel, the host's per host pixel
+        k.poly_offset[0] = s.RegF(kPaSuPolyOffsetFrontScale) / 16 * scale;
         k.poly_offset[1] = s.RegF(kPaSuPolyOffsetFrontScale + 1);
     }
 }
@@ -2396,8 +2397,9 @@ D3D12_GPU_VIRTUAL_ADDRESS D3D12Backend::UploadStreams(const DrawArgs& a, const S
         auto key = std::make_pair(sf.data, stride);
         auto it = std::find_if(copied.begin(), copied.end(), [&](const auto& c) { return c.first == key; });
         if (it == copied.end()) {
-            int64_t low = std::max<int64_t>(int64_t(min) + a.base_vertex, 0);
-            int64_t high = std::max<int64_t>(int64_t(max) + a.base_vertex + 1, 0);
+            // a shader computing its fetch indices may read any vertex of a stream
+            int64_t low = vs.fetch_anywhere ? 0 : std::max<int64_t>(int64_t(min) + a.base_vertex, 0);
+            int64_t high = vs.fetch_anywhere ? UINT32_MAX : std::max<int64_t>(int64_t(max) + a.base_vertex + 1, 0);
             uint64_t first = std::max<uint64_t>(uint64_t(low) * stride, sf.first);
             uint64_t end = std::min<uint64_t>(uint64_t(high) * stride, sf.size);
             uint64_t bytes = end > first ? end - first : 0;
@@ -2573,7 +2575,7 @@ void D3D12Backend::Draw(const State& s, const DrawArgs& a) {
         if (!BindTargets(s, ps_info, k, bound)) return;
     }
     if (cap_ && bound.rt) CapStep(bound.rt);
-    FillKeyStates(s, k);
+    FillKeyStates(s, bound.scale, k);
     if (!k.ds_format) k.depth_control = 0;
     D3D12_PRIMITIVE_TOPOLOGY topo;
     uint32_t count = 0;

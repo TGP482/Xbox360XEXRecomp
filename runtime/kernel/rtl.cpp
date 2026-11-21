@@ -40,6 +40,12 @@ KERNEL_EXPORT(0x12E, RtlInitializeCriticalSection) {
     return 0;
 }
 
+// (section, spin count): Enter spins on the host anyway
+KERNEL_EXPORT(0x12F, RtlInitializeCriticalSectionAndSpinCount) {
+    InitCriticalSection(a[0]);
+    return 0;
+}
+
 KERNEL_EXPORT(0x125, RtlEnterCriticalSection) {
     uint32_t cs = a[0];
     uint32_t me = Me();

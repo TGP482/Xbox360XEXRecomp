@@ -624,6 +624,14 @@ KERNEL_EXPORT(0x99, KeSetBasePriorityThread) {
     return uint32_t(old);
 }
 
+KERNEL_EXPORT(0x81, KeQueryBasePriorityThread) {
+    Thread* t = ThreadAt(a[0]);
+    return t ? uint32_t(t->priority) : 0;
+}
+
+// (thread, disable): the host never boosts a thread, so none was ever disabled
+KERNEL_EXPORT(0x9C, KeSetDisableBoostThread) { return 0; }
+
 // thread local slots, the values kept per thread on the host
 
 namespace {

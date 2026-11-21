@@ -570,7 +570,7 @@ KERNEL_EXPORT(0x0D, ExCreateThread) {
     constexpr uint32_t kReturnKthread = 0x80;
     uint32_t processor_mask = a[6] >> 24;
     ThreadStart start;
-    start.stack_size = a[1];
+    start.stack_size = a[1] ? a[1] : LoadedImage().stack_size;  // 0 takes the image's default, as the console
     start.system_routine = a[3];
     start.start_routine = a[4];
     start.start_context = a[5];

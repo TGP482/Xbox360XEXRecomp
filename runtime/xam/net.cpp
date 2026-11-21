@@ -739,8 +739,8 @@ XAM_EXPORT(0x18, NetDll_sendto) {
     Socket k = Find(a[1]);
     if (k.s == INVALID_SOCKET) return Fail(WSAENOTSOCK);
     sockaddr_in to{};
-    if (a[6]) to = GuestAddr(a[6]);
-    int n = Send(k.s, static_cast<const uint8_t*>(HostPtr(a[2])), int(a[3]), a[6] ? &to : nullptr);
+    if (a[5]) to = GuestAddr(a[5]);
+    int n = Send(k.s, static_cast<const uint8_t*>(HostPtr(a[2])), int(a[3]), a[5] ? &to : nullptr);
     return n < 0 ? Fail(HostError()) : uint32_t(n);
 }
 

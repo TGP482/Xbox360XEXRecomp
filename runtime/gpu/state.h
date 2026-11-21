@@ -120,6 +120,8 @@ struct ResolveArgs {
     uint32_t dst_height = 0;
     int32_t dst_x = 0;
     int32_t dst_y = 0;
+    uint32_t dst_faces = 1;  // 6 for a cube, whose faces all resolve to its address
+    uint32_t dst_face = 0;
     bool swap = false;   // red and blue exchanged on the way
     int32_t exp_bias = 0;  // colour scaled by 2 to this power on the way
     uint32_t clear = 0;  // kClear* after the copy

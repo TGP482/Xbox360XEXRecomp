@@ -234,6 +234,7 @@ struct Resolved {
     uint32_t height = 0;
     uint32_t view = 0;  // RTV slot
     float scale = 1;    // host texels per title texel
+    uint32_t faces = 1;  // 6 for a cube, a slice each
     int32_t copied = -1;  // the guest format a D3DX copy wrote, which block compressed fetches may read
 };
 
@@ -698,7 +699,7 @@ private:
     void LatchCpuRead(const uint32_t fetch[6]);
     void ReadBackResolve(CpuRead& read, Resolved& from);
     void LandCpuReads();
-    Resolved& EnsureResolved(uint64_t key, DXGI_FORMAT format, uint32_t w, uint32_t h);
+    Resolved& EnsureResolved(uint64_t key, DXGI_FORMAT format, uint32_t w, uint32_t h, uint32_t faces = 1);
     void DropResolved(uint32_t base);
     void CopyResolved(Resolved& from, Resolved& to, const Rect& src, const Rect& dst);
 
@@ -1931,7 +1932,9 @@ Resolved* D3D12Backend::FindResolved(const xenos::TextureFetch& t, const Texture
     if (resolved == resolved_.end()) return nullptr;
     // a block compressed fetch never reads a resolve: the address was reused since
     bool blocks = xenos::Info(t.format).block > 1 && resolved->second.copied != int32_t(t.format);
-    return (b.dimension <= 1 || FlatFetch(b, t)) && !blocks ? &resolved->second : nullptr;
+    bool cube = b.dimension == uint8_t(xenos::Dimension::Cube);
+    bool fits = resolved->second.faces > 1 ? cube : b.dimension <= 1 || FlatFetch(b, t);
+    return fits && !blocks ? &resolved->second : nullptr;
 }
 
 void ReadFetch(const State& s, uint32_t index, uint32_t out[6]) {
@@ -1969,8 +1972,12 @@ void D3D12Backend::FillTextureView(const TextureBinding& b, const uint32_t fetch
         Resolved& r = *found;
         Transition(r.res.Get(), r.state, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
         v.Format = r.format;
-        v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        v.Texture2D.MipLevels = 1;
+        v.ViewDimension = r.faces > 1 ? D3D12_SRV_DIMENSION_TEXTURECUBE : D3D12_SRV_DIMENSION_TEXTURE2D;
+        if (r.faces > 1) {
+            v.TextureCube.MipLevels = 1;
+        } else {
+            v.Texture2D.MipLevels = 1;
+        }
         dev_->CreateShaderResourceView(r.res.Get(), &v, at);
         return;
     }
@@ -2688,7 +2695,7 @@ void D3D12Backend::Resolve(const State& s, const ResolveArgs& r) {
     if (src && fi.block == 1 && fi.convert != xenos::Convert::Unsupported) {
         uint32_t w = std::max(r.dst_pitch, 1u);
         uint32_t h = std::max(r.dst_height, 1u);
-        Resolved& dst = EnsureResolved(ResolvedKey(r.dst_base, src->key), fi.host, w, h);
+        Resolved& dst = EnsureResolved(ResolvedKey(r.dst_base, src->key), fi.host, w, h, r.dst_faces);
         dst.copied = -1;
         if (dst.res) CopyResolve(*src, dst, r);
         auto read = cpu_reads_.find(r.dst_base);
@@ -2709,9 +2716,10 @@ void D3D12Backend::Resolve(const State& s, const ResolveArgs& r) {
 }
 
 // the host texture read in place of guest memory, made again when the format or size changes
-Resolved& D3D12Backend::EnsureResolved(uint64_t key, DXGI_FORMAT format, uint32_t w, uint32_t h) {
+Resolved& D3D12Backend::EnsureResolved(uint64_t key, DXGI_FORMAT format, uint32_t w, uint32_t h, uint32_t faces) {
     Resolved& dst = resolved_[key];
-    if (dst.res && dst.format == format && dst.width == w && dst.height == h && dst.scale == scale_) return dst;
+    bool same = dst.format == format && dst.width == w && dst.height == h && dst.faces == faces;
+    if (dst.res && same && dst.scale == scale_) return dst;
     if (dst.res) {
         Release(dst.res);
     } else if (!free_rtv_.empty()) {
@@ -2721,10 +2729,11 @@ Resolved& D3D12Backend::EnsureResolved(uint64_t key, DXGI_FORMAT format, uint32_
     dst.format = format;
     dst.width = w;
     dst.height = h;
+    dst.faces = faces;
     dst.scale = scale_;
     uint32_t hw = uint32_t(std::ceil(w * scale_));
     uint32_t hh = uint32_t(std::ceil(h * scale_));
-    D3D12_RESOURCE_DESC d = TextureDesc(format, hw, hh);
+    D3D12_RESOURCE_DESC d = TextureDesc(format, hw, hh, faces);
     d.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
     dst.state = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -2897,6 +2906,14 @@ void D3D12Backend::CopyResolve(Target& src, Resolved& dst, const ResolveArgs& r)
                    float(src.samples), src.depth ? 1.0f : 0.0f, 0, bias};
     D3D12_GPU_VIRTUAL_ADDRESS addr = UploadConstants(cb, sizeof(cb));
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = Rtv(dst.view);
+    if (dst.faces > 1) {
+        D3D12_RENDER_TARGET_VIEW_DESC face{};
+        face.Format = dst.format;
+        face.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+        face.Texture2DArray.FirstArraySlice = r.dst_face;
+        face.Texture2DArray.ArraySize = 1;
+        dev_->CreateRenderTargetView(dst.res.Get(), &face, rtv);
+    }
     cl_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
     float dw = (r.rect.x2 - r.rect.x1) * scale_;
     float dh = (r.rect.y2 - r.rect.y1) * scale_;
@@ -3000,7 +3017,12 @@ void D3D12Backend::ShowFrame(const xenos::TextureFetch& t) {
     Transition(bb_[bi].Get(), bs, D3D12_RESOURCE_STATE_PRESENT);
     Submit(false);
     bool vsync = app::Get().vsync;
-    swap_->Present(vsync ? 1 : 0, !vsync && tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
+    HRESULT hr = swap_->Present(vsync ? 1 : 0, !vsync && tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
+    static bool lost = false;
+    if (FAILED(hr) && !std::exchange(lost, true)) {
+        uint32_t why = uint32_t(dev_->GetDeviceRemovedReason());
+        LOGE("D3D12: present failed %08X, device removed for %08X", uint32_t(hr), why);
+    }
 }
 
 void D3D12Backend::Present(const uint32_t front[6]) {

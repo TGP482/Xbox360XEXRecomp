@@ -153,7 +153,7 @@ void RequireLayout() {
 #ifdef SUB_D3D_InterruptHandler
     XDK_REQUIRE("d3d9", XDK_KEY(Device_Vblank));
 #endif
-#ifdef SUB_D3DDevice_BeginVertices
+#if defined(SUB_D3DDevice_BeginVertices) || defined(SUB_D3DDevice_BeginIndexedVertices)
     XDK_REQUIRE("d3d9", XDK_KEY(Device_VerticesEnd));
 #endif
 #ifdef SUB_D3DDevice_GpuLoadShaderConstantF4
@@ -614,6 +614,7 @@ struct Recorded {
     bool has_rect = false;
     gpu::ResolveArgs resolve;
     std::vector<uint8_t> vertices;  // a BeginVertices draw's copy of what the title wrote
+    std::vector<uint8_t> indices;   // and a BeginIndexedVertices draw's indices
     std::vector<GpuLoad> loads;     // read again each time it runs, as the GPU does
 };
 
@@ -689,6 +690,8 @@ struct PendingVertices {
     uint32_t ring_at = 0;  // the ring write pointer at the begin, which the end moves
     uint32_t data = 0;
     uint32_t bytes = 0;
+    uint32_t index_data = 0;
+    uint32_t index_bytes = 0;
 };
 std::unordered_map<uint32_t, PendingVertices> g_pending;  // by device, under g_lock
 
@@ -718,6 +721,11 @@ void FlushVertices(uint32_t dev) {
     g_pending.erase(it);
     const uint8_t* from = static_cast<const uint8_t*>(HostPtr(p.data));
     p.draw.vertices.assign(from, from + p.bytes);
+    if (p.index_bytes) {
+        const uint8_t* indices = static_cast<const uint8_t*>(HostPtr(p.index_data));
+        p.draw.indices.assign(indices, indices + p.index_bytes);
+        p.draw.draw.indices = p.draw.indices.data();
+    }
     for (gpu::StreamFetch& sf : p.draw.streams) {
         if (sf.data) sf.data = p.draw.vertices.data();
     }
@@ -824,6 +832,7 @@ struct ResolveCall {
     const gpu::Rect* rect = nullptr;
     int32_t dst_x = 0;
     int32_t dst_y = 0;
+    uint32_t face = 0;
     uint32_t color = 0;  // the clear's guest float4, 0 for black
     float z = 1;
     uint32_t stencil = 0;
@@ -854,6 +863,11 @@ void ResolveTo(uint32_t dev, const ResolveCall& c) {
     r.rect = c.rect ? *c.rect : gpu::Rect{0, 0, int32_t(width), int32_t(r.dst_height)};
     r.dst_x = c.dst_x;
     r.dst_y = c.dst_y;
+    constexpr uint32_t kDimensionCube = 3;  // fetch dword 5 bits 9 to 10
+    if ((R32(f + 20) >> 9 & 3) == kDimensionCube && width == r.dst_height && c.face < 6) {
+        r.dst_faces = 6;
+        r.dst_face = c.face;
+    }
     if (c.flags & kResolveClearTarget && r.source != kResolveSourceDepth) r.clear |= 1u << r.source;
     if (c.flags & kResolveClearDepth) r.clear |= kClearDepth | kClearStencil;
     if (c.color) {
@@ -982,6 +996,7 @@ HLE_FUNC(D3DDevice_Resolve) {
         c.dst_x = int32_t(R32(a[4]));
         c.dst_y = int32_t(R32(a[4] + 4));
     }
+    c.face = a[6];
     c.color = a[7];
     c.z = float(a.Float(0));
     c.stencil = a[kClearStencilArg];
@@ -1233,6 +1248,45 @@ HLE_FUNC(D3DDevice_BeginVertices) {
     p.bytes = bytes;
     g_pending[dev] = std::move(p);
     return room;
+}
+#endif
+
+#ifdef SUB_D3DDevice_BeginIndexedVertices
+// (device, primitive, base vertex, vertex count, index count, index format, stride, index room out, vertex room out):
+// as BeginVertices, the title writing the indices too
+HLE_FUNC(D3DDevice_BeginIndexedVertices) {
+    constexpr uint32_t kIndex32 = 4;  // the format's bit for D3DFMT_INDEX32
+    constexpr uint32_t kIndexAlign = 16;
+    uint32_t dev = a[0];
+    uint32_t stride = a[6];
+    bool index32 = a[5] & kIndex32;
+    uint32_t bytes = (a[2] + a[3]) * stride;
+    uint32_t index_at = (bytes + kIndexAlign - 1) & ~(kIndexAlign - 1);
+    uint32_t index_bytes = a[4] * (index32 ? 4 : 2);
+    std::lock_guard lock(g_lock);
+    FlushVertices(dev);
+    uint32_t room = RoomFor(dev, index_at + index_bytes);
+    W32(a[7], room + index_at);
+    W32(a[8], room);
+    uint32_t ring_at = R32(dev + kDevRingWrite);
+    W32(dev + kDevVerticesEnd, ring_at + 4);
+    PendingVertices p;
+    gpu::DrawArgs d;
+    d.prim = a[1];
+    d.count = a[4];
+    d.base_vertex = int32_t(a[2]);
+    d.index32 = index32;
+    // the title's own big endian indices
+    d.index_endian = index32 ? 2 : 1;
+    if (!Snapshot(dev, d, room, bytes, stride, p.draw)) return 0;
+    p.buffer = RecordingTo(dev);
+    p.ring_at = ring_at;
+    p.data = room;
+    p.bytes = bytes;
+    p.index_data = room + index_at;
+    p.index_bytes = index_bytes;
+    g_pending[dev] = std::move(p);
+    return 0;
 }
 #endif
 

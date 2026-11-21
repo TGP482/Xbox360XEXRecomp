@@ -62,6 +62,13 @@ constexpr uint32_t kVsLiterals = XDK_VertexShader_Literals;
 constexpr uint32_t kVsLiteralBase = XDK_VertexShader_LiteralBase;
 constexpr bool kLiterals = kPsLiterals != xdk::kUnknown && kPsLiteralBase != xdk::kUnknown &&
                            kVsLiterals != xdk::kUnknown && kVsLiteralBase != xdk::kUnknown;
+// shader objects: their copy of the container and their microcode, where known read from the object a draw binds
+constexpr uint32_t kPsContainer = XDK_PixelShader_Container;
+constexpr uint32_t kPsCode = XDK_PixelShader_Code;
+constexpr uint32_t kVsContainer = XDK_VertexShader_Container;
+constexpr uint32_t kVsCode = XDK_VertexShader_Code;
+constexpr bool kShaderObjects = kPsContainer != xdk::kUnknown && kPsCode != xdk::kUnknown &&
+                                kVsContainer != xdk::kUnknown && kVsCode != xdk::kUnknown;
 // the register shadow, a bank per 0x80 registers from 0x2000
 constexpr uint32_t kDevBanks[] = {XDK_Device_Reg2000, XDK_Device_Reg2080, XDK_Device_Reg2100, XDK_Device_Reg2180,
                                   XDK_Device_Reg2200, XDK_Device_Reg2280, XDK_Device_Reg2300, XDK_Device_Reg2380};
@@ -176,6 +183,7 @@ struct ShaderEntry {
     std::vector<uint32_t> outputs;   // vertex exports or pixel inputs, as Semantic and SemanticReg read them
     int8_t vpos = -1;                // pixel: the register given VPOS
     uint32_t serial = 0;             // tells apart entries made at the same object
+    uint32_t code = 0;               // the object's microcode it was read from
     // vertex: the pixel shader last linked with it, by serial, and the link
     uint32_t linked_serial = UINT32_MAX;
     gpu::ShaderOptions link;
@@ -193,8 +201,9 @@ std::vector<uint32_t> ReadWords(uint32_t at, uint32_t n) {
     return v;
 }
 
-// a shader container: a virtual block (header, constant table, info) then the physical block holding the microcode
-bool ReadContainer(uint32_t c, bool vertex, ShaderEntry& e) {
+// a shader container: a virtual block (header, constant table, info) then the physical block holding the microcode,
+// or the microcode at code where a shader object keeps it
+bool ReadContainer(uint32_t c, uint32_t code, bool vertex, ShaderEntry& e) {
     constexpr uint32_t kMaxBytes = 0x100000;
     uint32_t virtual_size = R32(c + 4);
     if (R32(c) >> 8 != XDK_Shader_Magic || virtual_size > kMaxBytes) return false;
@@ -207,6 +216,7 @@ bool ReadContainer(uint32_t c, bool vertex, ShaderEntry& e) {
     } else {
         code_bytes = R32(c + XDK_Shader_CodeSize);
     }
+    if (code) code_at = code;
     if (code_bytes > kMaxBytes) return false;
     std::vector<uint32_t> code = ReadWords(code_at, code_bytes / 4);
     if (vertex) {
@@ -235,18 +245,38 @@ bool ReadContainer(uint32_t c, bool vertex, ShaderEntry& e) {
 }
 
 void CreateShader(uint32_t container, uint32_t object, bool vertex) {
+    // read from the object at its first draw instead
+    if constexpr (kShaderObjects) return;
     if (!object) return;
     std::lock_guard lock(g_lock);
     ShaderEntry e;
     e.serial = ++g_shader_serial;
-    if (!ReadContainer(container, vertex, e)) {
+    if (!ReadContainer(container, 0, vertex, e)) {
         LOGR("d3d: %s shader container %08X not understood", vertex ? "vertex" : "pixel", container);
         return;
     }
     g_shaders[object] = std::move(e);
 }
 
-ShaderEntry* FindShader(uint32_t object) {
+// a shader object however the title made it, read again once it holds other microcode
+ShaderEntry* ObjectShader(uint32_t object, bool vertex) {
+    uint32_t code = R32(object + (vertex ? kVsCode : kPsCode));
+    auto it = g_shaders.find(object);
+    if (it != g_shaders.end() && it->second.code == code) return it->second.shader ? &it->second : nullptr;
+    ShaderEntry e;
+    e.serial = ++g_shader_serial;
+    e.code = code;
+    uint32_t container = object + (vertex ? kVsContainer : kPsContainer);
+    if (!ReadContainer(container, code, vertex, e)) {
+        LOGR("d3d: %s shader object %08X not understood", vertex ? "vertex" : "pixel", object);
+    }
+    ShaderEntry& kept = g_shaders[object] = std::move(e);
+    return kept.shader ? &kept : nullptr;
+}
+
+ShaderEntry* FindShader(uint32_t object, bool vertex) {
+    if (!object) return nullptr;
+    if constexpr (kShaderObjects) return ObjectShader(object, vertex);
     auto it = g_shaders.find(object);
     return it != g_shaders.end() && it->second.shader ? &it->second : nullptr;
 }
@@ -495,9 +525,9 @@ void LoadLiterals(uint32_t dev, uint32_t shader, uint32_t block_at, uint32_t bas
 
 // the state of a draw from the device; false when its shaders are not known
 bool ReadState(uint32_t dev, gpu::State& s, uint32_t* raw, ShaderEntry*& vs) {
-    vs = FindShader(R32(dev + kDevVertexShader));
+    vs = FindShader(R32(dev + kDevVertexShader), true);
     if (!vs) return false;
-    const ShaderEntry* ps = FindShader(R32(dev + kDevPixelShader));
+    const ShaderEntry* ps = FindShader(R32(dev + kDevPixelShader), false);
     ReadRegisters(dev, s, raw);
     if constexpr (kLiterals) {
         LoadLiterals(dev, R32(dev + kDevVertexShader), kVsLiterals, kVsLiteralBase);

@@ -71,6 +71,12 @@ PixelInfo_Inputs = 0x20
 VertexInfo_Skip = 0x18
 VertexInfo_ElementCount = 0x1C
 VertexInfo_Elements = 0x28
+# shader objects: the container's copy and the microcode (CreatePixelShader 825D0FA0, vertex init 825D11B8); titles
+# fill them without the create calls too (82249E10)
+PixelShader_Container = 0x38
+PixelShader_Code = 0x18
+VertexShader_Container = 0x250
+VertexShader_Code = 0x30
 # XAudio source voice types past 1 (16 bit PCM): 8 bit PCM (Bink 8278CA48), XMA (XACT 825EA418)
 XAudio_SourcePcm8 = 2
 XAudio_SourceXma = 4

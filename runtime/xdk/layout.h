@@ -291,3 +291,6 @@ constexpr bool AllKnown(const LayoutKey (&keys)[N]) {
 #ifndef XDK_XAudioSourceSlot_SetPitch
 #define XDK_XAudioSourceSlot_SetPitch 0xFFFFFFFFu
 #endif
+#ifndef XDK_Device_CommandBuffer
+#define XDK_Device_CommandBuffer 0xFFFFFFFFu
+#endif

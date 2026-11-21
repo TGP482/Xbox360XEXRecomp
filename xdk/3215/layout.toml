@@ -27,6 +27,8 @@ Device_DepthStencil = 0x2FA8
 Device_StreamStrides = 0x2FF0
 Device_PixelShader = 0x3090
 Device_VertexShader = 0x3094
+# the command buffer BeginCommandBuffer 825D9C40 records into, cleared by EndCommandBuffer 825DA050
+Device_CommandBuffer = 0x3368
 # the command ring: write pointer, segment end, limit, base, segment size, segment start
 Device_RingWrite = 0x28
 Device_RingSegmentEnd = 0x2C

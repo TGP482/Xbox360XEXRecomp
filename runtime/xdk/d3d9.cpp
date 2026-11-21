@@ -10,6 +10,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -512,8 +513,99 @@ bool ReadState(uint32_t dev, gpu::State& s, uint32_t* raw, ShaderEntry*& vs) {
     return true;
 }
 
+// Command buffers: the title records them on other threads, each with its own device, and runs them on its own later.
+// A recording device's draws, clears and resolves wait in the buffer's list until it runs, as the GPU runs them then.
+constexpr uint32_t kDevCommandBuffer = XDK_Device_CommandBuffer;  // the buffer being recorded, 0 for none
+constexpr size_t kConstBytes = 512 * 16;
+constexpr size_t kBoolBytes = 8 * 4;
+constexpr size_t kLoopBytes = 32 * 4;
+constexpr size_t kFetchBytes = 32 * 6 * 4;
+
+enum class RecordedOp { Draw, Clear, Resolve };
+
+struct Recorded {
+    RecordedOp op = RecordedOp::Draw;
+    gpu::State state;
+    bool banks = false;  // the draw's constants copied below, clears and resolves read none
+    std::array<uint8_t, kConstBytes + kBoolBytes + kLoopBytes + kFetchBytes> bank_bytes{};
+    gpu::DrawArgs draw;
+    std::vector<gpu::StreamFetch> streams;
+    uint32_t flags = 0;
+    float color[4] = {};
+    float z = 1;
+    uint32_t stencil = 0;
+    gpu::Rect rect{};
+    bool has_rect = false;
+    gpu::ResolveArgs resolve;
+};
+
+std::unordered_map<uint32_t, std::vector<Recorded>> g_buffers;  // by command buffer, under g_lock
+
+uint32_t RecordingTo(uint32_t dev) {
+    if constexpr (kDevCommandBuffer == xdk::kUnknown) return 0;
+    return R32(dev + kDevCommandBuffer);
+}
+
+void CopyBanks(const gpu::State& s, Recorded& r) {
+    uint8_t* to = r.bank_bytes.data();
+    std::memcpy(to, s.consts, kConstBytes);
+    std::memcpy(to + kConstBytes, s.bools, kBoolBytes);
+    std::memcpy(to + kConstBytes + kBoolBytes, s.loops, kLoopBytes);
+    std::memcpy(to + kConstBytes + kBoolBytes + kLoopBytes, s.fetch, kFetchBytes);
+    r.banks = true;
+}
+
+void PointBanks(Recorded& r) {
+    const uint8_t* from = r.bank_bytes.data();
+    r.state.consts = from;
+    r.state.bools = from + kConstBytes;
+    r.state.loops = from + kConstBytes + kBoolBytes;
+    r.state.fetch = from + kConstBytes + kBoolBytes + kLoopBytes;
+}
+
+// a draw on a recording device, its state read whole as the device has it now; the buffers it reads stay the
+// title's until the command buffer ran, as on the console
+void RecordDraw(uint32_t dev, uint32_t buffer, const gpu::DrawArgs& a, uint32_t up_data, uint32_t up_bytes,
+                uint32_t up_stride) {
+    Backend();
+    Recorded r;
+    ShaderEntry* vs = nullptr;
+    if (!ReadState(dev, r.state, nullptr, vs)) return;
+    CopyBanks(r.state, r);
+    Streams(dev, *vs, up_data, up_bytes, up_stride, r.streams);
+    r.draw = a;
+    r.draw.fenced = false;
+    g_buffers[buffer].push_back(std::move(r));
+}
+
+// a command buffer's list on the renderer, in order, tiled as the title's device is now
+void Replay(uint32_t buffer) {
+    std::lock_guard lock(g_lock);
+    auto it = g_buffers.find(buffer);
+    if (it == g_buffers.end()) return;
+    gpu::Backend* backend = Backend();
+    for (Recorded& r : it->second) {
+        if (r.banks) PointBanks(r);
+        r.state.tiled_width = g_tiling.on ? uint32_t(g_tiling.extent.x2) : 0;
+        r.state.tiled_height = g_tiling.on ? uint32_t(g_tiling.extent.y2) : 0;
+        r.state.predicated = g_tiling.on ? SelectedTiles() : gpu::Rect{};
+        if (r.op == RecordedOp::Draw) {
+            r.draw.streams = r.streams.empty() ? nullptr : r.streams.data();
+            backend->Draw(r.state, r.draw);
+        } else if (r.op == RecordedOp::Clear) {
+            backend->Clear(r.state, r.flags, r.color, r.z, r.stencil, r.has_rect ? &r.rect : nullptr);
+        } else {
+            backend->Resolve(r.state, r.resolve);
+        }
+    }
+}
+
 void Draw(uint32_t dev, gpu::DrawArgs& a, uint32_t up_data = 0, uint32_t up_bytes = 0, uint32_t up_stride = 0) {
     std::lock_guard lock(g_lock);
+    if (uint32_t buffer = RecordingTo(dev)) {
+        RecordDraw(dev, buffer, a, up_data, up_bytes, up_stride);
+        return;
+    }
     gpu::Backend* backend = Backend();
     static gpu::State s;  // kept from draw to draw, under g_lock: its 4 KB of registers are cleared once
     static uint32_t raw[gpu::kRegCount];  // s's registers in guest order
@@ -554,6 +646,19 @@ void PassFence(uint32_t writeback, uint32_t fence) {
     float rgba[4] = {};
     if (color) {
         for (uint32_t i = 0; i < 4; i++) rgba[i] = GF(color + i * 4);
+    }
+    if (uint32_t buffer = RecordingTo(dev)) {
+        Recorded r;
+        r.op = RecordedOp::Clear;
+        r.state = s;
+        r.flags = flags;
+        std::memcpy(r.color, rgba, sizeof(rgba));
+        r.z = z;
+        r.stencil = stencil;
+        r.has_rect = rect != nullptr;
+        if (rect) r.rect = *rect;
+        g_buffers[buffer].push_back(std::move(r));
+        return;
     }
     Backend()->Clear(s, flags, rgba, z, stencil, rect);
 }
@@ -601,6 +706,14 @@ void ResolveTo(uint32_t dev, const ResolveCall& c) {
     }
     r.clear_z = c.z;
     r.clear_stencil = c.stencil;
+    if (uint32_t buffer = RecordingTo(dev)) {
+        Recorded rec;
+        rec.op = RecordedOp::Resolve;
+        rec.state = s;
+        rec.resolve = r;
+        g_buffers[buffer].push_back(std::move(rec));
+        return;
+    }
     Backend()->Resolve(s, r);
 }
 
@@ -873,9 +986,15 @@ HLE_FUNC(D3DDevice_Swap) {
 // The library asks for room in its command ring. Nothing reads the ring, so it starts over; the fence its kick writes
 // passes once the commands before it ran.
 HLE_FUNC(D3D_MakeSpace) {
+    constexpr uint32_t kScratchRing = 0x10000;
     uint32_t dev = a[0];
     UseCpuFences(dev);
     if constexpr (kDevRingBase != xdk::kUnknown) {
+        // a device that only records command buffers has no ring: a scratch one, which nothing reads
+        if (!R32(dev + kDevRingBase)) {
+            W32(dev + kDevRingBase, mem::AllocSystem(kScratchRing));
+            W32(dev + kDevRingSegment, kScratchRing);
+        }
         uint32_t ring = R32(dev + kDevRingBase);
         uint32_t segment = R32(dev + kDevRingSegment) & ~3u;
         W32(dev + kDevRingSegmentStart, ring);
@@ -891,6 +1010,26 @@ HLE_FUNC(D3D_MakeSpace) {
     if (writeback) PassFence(writeback, R32(dev + kDevFence) - 2);
     return R32(dev + kDevRingWrite);
 }
+
+#ifdef SUB_D3DDevice_BeginCommandBuffer
+PPC_EXTERN_FUNC(GUEST_ORIG(D3DDevice_BeginCommandBuffer));
+
+// (device, command buffer, ...): it records from now, what it held before is gone
+PPC_FUNC(GUEST(D3DDevice_BeginCommandBuffer)) {
+    uint32_t buffer = uint32_t(ctx.r[4]);
+    GUEST_ORIG(D3DDevice_BeginCommandBuffer)(ctx, base);
+    std::lock_guard lock(g_lock);
+    g_buffers[buffer].clear();
+}
+#endif
+
+#ifdef SUB_D3DDevice_RunCommandBuffer
+// (device, command buffer): what it recorded runs now; the library's packets for it go nowhere
+HLE_FUNC(D3DDevice_RunCommandBuffer) {
+    Replay(a[1]);
+    return 0;
+}
+#endif
 
 #ifdef SUB_D3D_WaitForGpu
 // (wait state): a turn of the library's wait on a fence, which gives up once the GPU looks hung; the fence passes

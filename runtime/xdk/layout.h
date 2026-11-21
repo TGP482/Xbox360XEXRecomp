@@ -243,3 +243,51 @@ constexpr bool AllKnown(const LayoutKey (&keys)[N]) {
 #ifndef XDK_VertexBuffer_Size
 #define XDK_VertexBuffer_Size 0xFFFFFFFFu
 #endif
+#ifndef XDK_XAudio_VoiceSourcePart
+#define XDK_XAudio_VoiceSourcePart 0xFFFFFFFFu
+#endif
+#ifndef XDK_XAudioVoiceSlot_AddRef
+#define XDK_XAudioVoiceSlot_AddRef 0xFFFFFFFFu
+#endif
+#ifndef XDK_XAudioVoiceSlot_Release
+#define XDK_XAudioVoiceSlot_Release 0xFFFFFFFFu
+#endif
+#ifndef XDK_XAudioVoiceSlot_SetEffectState
+#define XDK_XAudioVoiceSlot_SetEffectState 0xFFFFFFFFu
+#endif
+#ifndef XDK_XAudioVoiceSlot_SetEffectParam
+#define XDK_XAudioVoiceSlot_SetEffectParam 0xFFFFFFFFu
+#endif
+#ifndef XDK_XAudioVoiceSlot_SetVoiceOutput
+#define XDK_XAudioVoiceSlot_SetVoiceOutput 0xFFFFFFFFu
+#endif
+#ifndef XDK_XAudioVoiceSlot_SetVoiceOutputVolume
+#define XDK_XAudioVoiceSlot_SetVoiceOutputVolume 0xFFFFFFFFu
+#endif
+#ifndef XDK_XAudioVoiceSlot_GetVoiceState
+#define XDK_XAudioVoiceSlot_GetVoiceState 0xFFFFFFFFu
+#endif
+#ifndef XDK_XAudioVoiceSlot_Stop
+#define XDK_XAudioVoiceSlot_Stop 0xFFFFFFFFu
+#endif
+#ifndef XDK_XAudioVoiceSlot_SetVolume
+#define XDK_XAudioVoiceSlot_SetVolume 0xFFFFFFFFu
+#endif
+#ifndef XDK_XAudioSourceSlot_SubmitPacket
+#define XDK_XAudioSourceSlot_SubmitPacket 0xFFFFFFFFu
+#endif
+#ifndef XDK_XAudioSourceSlot_GetPacketPosition
+#define XDK_XAudioSourceSlot_GetPacketPosition 0xFFFFFFFFu
+#endif
+#ifndef XDK_XAudioSourceSlot_SetPacketPosition
+#define XDK_XAudioSourceSlot_SetPacketPosition 0xFFFFFFFFu
+#endif
+#ifndef XDK_XAudioSourceSlot_SetPacketLoopCount
+#define XDK_XAudioSourceSlot_SetPacketLoopCount 0xFFFFFFFFu
+#endif
+#ifndef XDK_XAudioSourceSlot_GetStreamPosition
+#define XDK_XAudioSourceSlot_GetStreamPosition 0xFFFFFFFFu
+#endif
+#ifndef XDK_XAudioSourceSlot_SetPitch
+#define XDK_XAudioSourceSlot_SetPitch 0xFFFFFFFFu
+#endif

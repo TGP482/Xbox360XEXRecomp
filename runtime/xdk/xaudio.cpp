@@ -37,6 +37,8 @@ constexpr uint32_t kFrame = 256;        // samples per channel the engine mixes 
 constexpr uint32_t kMasterChannels = 6;  // front left, front right, centre, LFE, back left, back right
 constexpr uint32_t kMaxChannels = 8;
 constexpr uint32_t kHandleBytes = 0x100;
+constexpr uint32_t kSourcePartAt = 0x80;  // the source methods' object, inside the voice's block
+constexpr uint32_t kVtableBytes = 0x80;
 constexpr uint32_t kOk = 0;
 constexpr uint32_t kFail = 0x80004005;        // E_FAIL
 constexpr uint32_t kInvalidArg = 0x80070057;  // E_INVALIDARG
@@ -135,6 +137,7 @@ struct GuestEffect {
 
 struct Voice {
     uint32_t handle = 0;
+    uint32_t refs = 1;
     bool source = false;
     uint8_t type = 0;
     uint32_t channels = 1;
@@ -174,8 +177,10 @@ std::unordered_map<uint8_t, uint32_t> g_effect_create;  // registered id to its 
 std::mutex g_effect_lock;  // held while effect code runs, never together with g_lock
 std::once_flag g_started;
 
+// the voice itself, or its source methods' object
 Voice* Find(uint32_t handle) {
     auto it = g_voices.find(handle);
+    if (it == g_voices.end()) it = g_voices.find(handle - kSourcePartAt);
     return it != g_voices.end() ? it->second.get() : nullptr;
 }
 
@@ -560,20 +565,105 @@ uint32_t XmaChannels(uint32_t init) {
     return total;
 }
 
+// Voices are guest objects shaped like the library's: titles that inline a wrapper call the voice's methods through
+// its vtables, which hold the wrappers the host replaces
+
+struct Slot {
+    uint32_t offset;
+    uint32_t fn;
+};
+
+uint32_t MakeVtable(const std::vector<Slot>& slots) {
+    uint32_t vt = mem::AllocSystem(kVtableBytes);
+    std::memset(HostPtr(vt), 0, kVtableBytes);
+    for (const Slot& s : slots)
+        if (s.offset < kVtableBytes) W32(vt + s.offset, s.fn);
+    return vt;
+}
+
+std::vector<Slot> VoiceSlots() {
+    std::vector<Slot> s;
+#ifdef SUB_XAudioVoice_AddRef
+    s.push_back({XDK_XAudioVoiceSlot_AddRef, SYM(XAudioVoice_AddRef)});
+#endif
+#ifdef SUB_XAudioVoice_Release
+    s.push_back({XDK_XAudioVoiceSlot_Release, SYM(XAudioVoice_Release)});
+#endif
+#ifdef SUB_XAudioVoice_SetEffectState
+    s.push_back({XDK_XAudioVoiceSlot_SetEffectState, SYM(XAudioVoice_SetEffectState)});
+#endif
+#ifdef SUB_XAudioVoice_SetEffectParam
+    s.push_back({XDK_XAudioVoiceSlot_SetEffectParam, SYM(XAudioVoice_SetEffectParam)});
+#endif
+#ifdef SUB_XAudioVoice_SetVoiceOutput
+    s.push_back({XDK_XAudioVoiceSlot_SetVoiceOutput, SYM(XAudioVoice_SetVoiceOutput)});
+#endif
+#ifdef SUB_XAudioVoice_SetVoiceOutputVolume
+    s.push_back({XDK_XAudioVoiceSlot_SetVoiceOutputVolume, SYM(XAudioVoice_SetVoiceOutputVolume)});
+#endif
+#ifdef SUB_XAudioVoice_GetVoiceState
+    s.push_back({XDK_XAudioVoiceSlot_GetVoiceState, SYM(XAudioVoice_GetVoiceState)});
+#endif
+#ifdef SUB_XAudioVoice_Stop
+    s.push_back({XDK_XAudioVoiceSlot_Stop, SYM(XAudioVoice_Stop)});
+#endif
+#ifdef SUB_XAudioVoice_SetVolume
+    s.push_back({XDK_XAudioVoiceSlot_SetVolume, SYM(XAudioVoice_SetVolume)});
+#endif
+    return s;
+}
+
+std::vector<Slot> SourceSlots() {
+    std::vector<Slot> s;
+#ifdef SUB_XAudioSourceVoice_SubmitPacket
+    s.push_back({XDK_XAudioSourceSlot_SubmitPacket, SYM(XAudioSourceVoice_SubmitPacket)});
+#endif
+#ifdef SUB_XAudioSourceVoice_GetPacketPosition
+    s.push_back({XDK_XAudioSourceSlot_GetPacketPosition, SYM(XAudioSourceVoice_GetPacketPosition)});
+#endif
+#ifdef SUB_XAudioSourceVoice_SetPacketPosition
+    s.push_back({XDK_XAudioSourceSlot_SetPacketPosition, SYM(XAudioSourceVoice_SetPacketPosition)});
+#endif
+#ifdef SUB_XAudioSourceVoice_SetPacketLoopCount
+    s.push_back({XDK_XAudioSourceSlot_SetPacketLoopCount, SYM(XAudioSourceVoice_SetPacketLoopCount)});
+#endif
+#ifdef SUB_XAudioSourceVoice_GetStreamPosition
+    s.push_back({XDK_XAudioSourceSlot_GetStreamPosition, SYM(XAudioSourceVoice_GetStreamPosition)});
+#endif
+#ifdef SUB_XAudioSourceVoice_SetPitch
+    s.push_back({XDK_XAudioSourceSlot_SetPitch, SYM(XAudioSourceVoice_SetPitch)});
+#endif
+    return s;
+}
+
+// a build without the source part's place keeps plain handles
+void ShapeVoice(uint32_t h) {
+    constexpr uint32_t kSourcePart = XDK_XAudio_VoiceSourcePart;
+    if constexpr (kSourcePart == xdk::kUnknown) return;
+    static const uint32_t voice_vtable = MakeVtable(VoiceSlots());
+    static const uint32_t source_vtable = MakeVtable(SourceSlots());
+    W32(h, voice_vtable);
+    W32(h + kSourcePart, h + kSourcePartAt);
+    W32(h + kSourcePartAt, source_vtable);
+}
+
 uint32_t NewHandle() {
     uint32_t h = mem::AllocSystem(kHandleBytes);
-    if (h) std::memset(HostPtr(h), 0, kHandleBytes);
+    if (!h) return 0;
+    std::memset(HostPtr(h), 0, kHandleBytes);
+    ShapeVoice(h);
     return h;
 }
 
 void Remove(uint32_t handle) {
     Voice* v = Find(handle);
     if (!v) return;
+    uint32_t h = v->handle;
     for (Voice* o : g_order)
         std::erase_if(o->outputs, [v](const Output& out) { return out.dest == v; });
     g_order.erase(std::remove(g_order.begin(), g_order.end(), v), g_order.end());
-    g_voices.erase(handle);
-    mem::FreeSystem(handle);
+    g_voices.erase(h);
+    mem::FreeSystem(h);
 }
 
 template <typename F>
@@ -709,12 +799,24 @@ HLE_FUNC(XAudioCreateSubmixVoice) { return CreateSubmixVoice(ctx, a[0], a[1]); }
 HLE_FUNC(XAudioCreateSubmixVoiceInner) { return CreateSubmixVoice(ctx, a[0], a[2]); }
 #endif
 
+#ifdef SUB_XAudioVoice_AddRef
+HLE_FUNC(XAudioVoice_AddRef) {
+    std::lock_guard lock(g_lock);
+    Voice* v = Find(a[0]);
+    return v ? ++v->refs : 0;
+}
+#endif
+
 #ifdef SUB_XAudioVoice_Release
+// the count left; the voice goes at 0
 HLE_FUNC(XAudioVoice_Release) {
     std::shared_ptr<GuestEffect> effect;
     {
         std::lock_guard lock(g_lock);
-        if (Voice* v = Find(a[0])) effect = v->effect;
+        Voice* v = Find(a[0]);
+        if (!v) return 0;
+        if (--v->refs) return v->refs;
+        effect = v->effect;
         Remove(a[0]);
     }
     if (effect) ReleaseEffect(ctx, *effect);

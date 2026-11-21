@@ -30,6 +30,7 @@ XAudioSourceVoice_SetPitch = {len = 0x1D, hash = "0x47D6AC37D472A608"}
 XAudioSourceVoice_Start = {len = 0x12, hash = "0x9ED1384182FC974C", calls = [[0x28, "0xF1548E0B4992BDE3", [[0x88, "0x7BA32A8CFA86F87C"], [0x9F, "0xE063737FB5009CAF"], [0x81, "0x98CA00AFE3AB521C"]]]]}
 XAudioSourceVoice_SubmitPacket = {len = 0x17, hash = "0x19963898F1FB9872"}
 XAudioUnregisterRenderCallback = {len = 0x1F, hash = "0x5E0BCAC1EF6DB9EF", calls = [[0x3A, "0x374F7149EAA2698D", [[0x4C, "0xA9CB46A77C115F03"]]]]}
+XAudioVoice_AddRef = {len = 0x19, hash = "0x4F06D0640694E438", count = 2, nth = 0}
 XAudioVoice_GetVoiceState = {len = 0x15, hash = "0x531B0E366BC33D81", count = 4, nth = 2}
 XAudioVoice_Release = {len = 0x19, hash = "0x4F06D0640694E438", count = 2, nth = 1}
 XAudioVoice_SetEffectParam = {len = 0x1B, hash = "0x35EC3F6AC6D06C5"}

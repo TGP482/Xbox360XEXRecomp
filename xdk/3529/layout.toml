@@ -77,3 +77,21 @@ VertexInfo_Elements = 0x24
 # XAudio source voice types past 1 (16 bit PCM): 8 bit PCM (Bink 82C74F60), XMA (DARE 8255F1A8)
 XAudio_SourcePcm8 = 2
 XAudio_SourceXma = 4
+
+# voices as guest objects: vtable slots read from the wrappers 823FCB58 to 823FD1F0, the source part at +0x4C
+XAudio_VoiceSourcePart = 0x4C
+XAudioVoiceSlot_AddRef = 0x4
+XAudioVoiceSlot_Release = 0x8
+XAudioVoiceSlot_SetEffectState = 0x18
+XAudioVoiceSlot_SetEffectParam = 0x20
+XAudioVoiceSlot_SetVoiceOutput = 0x24
+XAudioVoiceSlot_SetVoiceOutputVolume = 0x28
+XAudioVoiceSlot_GetVoiceState = 0x30
+XAudioVoiceSlot_Stop = 0x3C
+XAudioVoiceSlot_SetVolume = 0x5C
+XAudioSourceSlot_SubmitPacket = 0x1C
+XAudioSourceSlot_GetPacketPosition = 0x3C
+XAudioSourceSlot_SetPacketPosition = 0x40
+XAudioSourceSlot_SetPacketLoopCount = 0x48
+XAudioSourceSlot_GetStreamPosition = 0x50
+XAudioSourceSlot_SetPitch = 0x60

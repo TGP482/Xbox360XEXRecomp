@@ -481,6 +481,40 @@ XAM_EXPORT(0x1, NetDll_WSAStartup) {
 XAM_EXPORT(0x2, NetDll_WSACleanup) { return 0; }
 XAM_EXPORT(0x1B, NetDll_WSAGetLastError) { return t_error; }
 
+// WSA events are kernel events, manual reset as on Windows
+XAM_EXPORT(0x1D, NetDll_WSACreateEvent) {
+    auto o = std::make_shared<Object>(ObjType::Event);
+    o->notification = true;
+    return NewHandle(o);
+}
+
+// (count, events, wait all, timeout in ms, alertable): the event's index, or WSA_WAIT_TIMEOUT, as the kernel's wait
+XAM_EXPORT(0x21, NetDll_WSAWaitForMultipleEvents) {
+    constexpr uint32_t kInfinite = 0xFFFFFFFF;
+    constexpr int64_t kTicksPerMs = 10000;  // relative kernel timeouts count 100 ns ticks, negative
+    constexpr uint32_t kWsaInvalidHandle = 6;
+    constexpr uint32_t kWsaWaitFailed = 0xFFFFFFFF;
+    std::vector<ObjectRef> events;
+    for (uint32_t i = 0; i < a[0]; i++) {
+        ObjectRef o = FromHandle(R32(a[1] + i * 4));
+        if (!o) {
+            t_error = kWsaInvalidHandle;
+            return kWsaWaitFailed;
+        }
+        events.push_back(o);
+    }
+    int64_t timeout = a[3] == kInfinite ? INT64_MAX : -int64_t(a[3]) * kTicksPerMs;
+    return Wait(events, a[2] != 0, timeout, a[4] != 0);
+}
+
+// (socket, set): set is {count, sockets}
+XAM_EXPORT(0x22, NetDll___WSAFDIsSet) {
+    uint32_t n = std::min(R32(a[1]), kFdSetMax);
+    for (uint32_t i = 0; i < n; i++)
+        if (R32(a[1] + 4 + 4 * i) == a[0]) return 1;
+    return 0;
+}
+
 // (caller, family, type, protocol): VDP and UDP alike
 XAM_EXPORT(0x3, NetDll_socket) {
     Init();

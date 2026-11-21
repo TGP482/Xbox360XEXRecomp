@@ -76,4 +76,7 @@ XAM_EXPORT(0x28B, XNotifyGetNext) {
     return 1;
 }
 
+// (position): where the system's notifications show; the host draws none
+XAM_EXPORT(0x28C, XNotifyPositionUI) { return 0; }
+
 }  // namespace kernel

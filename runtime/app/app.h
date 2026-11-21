@@ -15,6 +15,13 @@ namespace app {
 
 enum class DisplayMode : uint32_t { Fullscreen, Borderless, Windowed };
 inline constexpr uint32_t kFpsCapRefresh = 1;  // fps_cap: the monitor's refresh rate
+inline constexpr int kPorts = 4;
+
+// what a player's controller port has plugged in: the keyboard and mouse, a controller, or both
+struct Port {
+    bool keyboard = false;
+    int pad = -1;  // controller slot 0-3, -1 for none
+};
 
 struct Settings {
     DisplayMode display_mode = DisplayMode::Borderless;
@@ -29,7 +36,8 @@ struct Settings {
     bool dump_textures = false;      // each texture once into textures\dumps\ beside the exe
     uint32_t texture_dump_format = 0;  // 0 PNG, 1 DDS
     uint32_t audio_output = 0;         // audio::kOutputAuto, Stereo, Surround or Mono
-    std::string join_ip;                   // co-op: a host past the LAN the system link search also asks
+    std::string join_ip;                   // system link: a host past the LAN the session search also asks
+    Port players[kPorts] = {{true, 0}, {false, 1}, {false, 2}, {false, 3}};  // guest ports 0 to 3
 };
 
 Settings& Get();

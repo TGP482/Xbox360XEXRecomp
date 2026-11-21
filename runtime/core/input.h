@@ -36,8 +36,10 @@ enum Button : uint16_t {
 void Init();  // window thread, before boot; the game code window starts it earlier
 uint16_t HeldOnAnyController();  // face buttons as kA/kB/kX/kY masks, GameInfo::pad left out
 bool AnyConnected();
-// the controller on that port, then GameInfo::pad
+bool PadConnected(int slot);  // controller slot 0-3, as the settings name them
+// the controller the settings put on that port, then GameInfo::pad
 Pad Poll(int port);
+int KeyboardPort();  // the port the settings give the keyboard and mouse, -1 for none
 void Rumble(int port, uint16_t left, uint16_t right);
 
 }  // namespace input

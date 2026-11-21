@@ -10,8 +10,11 @@
 #include <algorithm>
 #include <atomic>
 #include <fstream>
+#include <iterator>
 #include <mutex>
 #include <sstream>
+#include <string>
+#include <utility>
 
 #include <toml++/toml.hpp>
 
@@ -26,6 +29,42 @@ namespace {
 const char* kModes[] = {"fullscreen", "borderless", "windowed"};
 
 std::filesystem::path File() { return ExeDir() / kGame.settings; }
+
+// "keyboard", "controllerN", both joined by '+', or "none"
+std::string PortName(const Port& p) {
+    std::string name = p.keyboard ? "keyboard" : "";
+    if (p.pad >= 0) name += (name.empty() ? "controller" : "+controller") + std::to_string(p.pad + 1);
+    return name.empty() ? "none" : name;
+}
+
+Port ParsePort(const std::string& name, Port fallback) {
+    Port p;
+    p.keyboard = name.find("keyboard") != std::string::npos;
+    if (size_t at = name.find("controller"); at != std::string::npos && at + 10 < name.size()) {
+        int n = name[at + 10] - '0';  // the digit after "controller"
+        if (n >= 1 && n <= kPorts) p.pad = n - 1;
+    }
+    return p.keyboard || p.pad >= 0 || name == "none" ? p : fallback;
+}
+
+std::string PlayerKey(int port) { return "player" + std::to_string(port + 1); }
+
+// a device sits on one port only, the first that names it; player 1 drives single player, so never empty
+void LoadPlayers(const toml::table& t, Settings& s) {
+    Port read[kPorts];
+    for (int i = 0; i < kPorts; i++) {
+        std::string name = t[PlayerKey(i)].value_or(PortName(s.players[i]));
+        read[i] = ParsePort(name, s.players[i]);
+    }
+    for (int i = 0; i < kPorts; i++) {
+        for (int j = 0; j < i; j++) {
+            if (read[j].keyboard) read[i].keyboard = false;
+            if (read[j].pad == read[i].pad) read[i].pad = -1;
+        }
+    }
+    for (int i = 1; i < kPorts && !read[0].keyboard && read[0].pad < 0; i++) std::swap(read[0], read[i]);
+    std::copy(std::begin(read), std::end(read), s.players);
+}
 
 }  // namespace
 
@@ -57,6 +96,7 @@ void Load() {
     s.dump_textures = t["dump_textures"].value_or(s.dump_textures);
     s.texture_dump_format = std::min(t["texture_dump_format"].value_or(s.texture_dump_format), 1u);
     s.join_ip = t["join_ip"].value_or(s.join_ip);
+    LoadPlayers(t, s);
     s.audio_output = std::min(t["audio_output"].value_or(s.audio_output), audio::kOutputMono);
     for (const Option& o : kGame.options) {
         if (o.flag) *o.flag = t[o.key].value_or(*o.flag);
@@ -84,6 +124,7 @@ toml::table Table() {
                   {"texture_dump_format", int64_t(s.texture_dump_format)},
                   {"join_ip", s.join_ip},
                   {"audio_output", int64_t(s.audio_output)}};
+    for (int i = 0; i < kPorts; i++) t.insert(PlayerKey(i), PortName(s.players[i]));
     for (const Option& o : kGame.options) {
         if (o.flag) t.insert(o.key, *o.flag);
         else t.insert(o.key, int64_t(*o.value));

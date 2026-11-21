@@ -53,6 +53,12 @@ void UpdatePads() {
     }
 }
 
+// the controller slot the settings put on a guest port
+SDL_Gamepad* PadOn(int port) {
+    int slot = port >= 0 && port < app::kPorts ? app::Get().players[port].pad : -1;
+    return slot >= 0 ? g_pads[slot] : nullptr;
+}
+
 }  // namespace
 
 void Init() {
@@ -85,7 +91,7 @@ Pad Poll(int port) {
     {
         std::lock_guard lock(g_lock);
         UpdatePads();
-        if (SDL_Gamepad* pad = port >= 0 && port < 4 ? g_pads[port] : nullptr) {
+        if (SDL_Gamepad* pad = PadOn(port)) {
             p.connected = true;
             constexpr std::pair<SDL_GamepadButton, uint16_t> kButtons[] = {
                 {SDL_GAMEPAD_BUTTON_DPAD_UP, kDpadUp},
@@ -141,11 +147,23 @@ bool AnyConnected() {
     return std::any_of(std::begin(g_pads), std::end(g_pads), [](SDL_Gamepad* pad) { return pad != nullptr; });
 }
 
+bool PadConnected(int slot) {
+    std::lock_guard lock(g_lock);
+    UpdatePads();
+    return slot >= 0 && slot < 4 && g_pads[slot];
+}
+
 // the motors run until set again
 void Rumble(int port, uint16_t left, uint16_t right) {
     if (app::kGame.rumble) app::kGame.rumble(port, left, right);
     std::lock_guard lock(g_lock);
-    if (port >= 0 && port < 4 && g_pads[port]) SDL_RumbleGamepad(g_pads[port], left, right, 0);
+    if (SDL_Gamepad* pad = PadOn(port)) SDL_RumbleGamepad(pad, left, right, 0);
+}
+
+int KeyboardPort() {
+    for (int port = 0; port < app::kPorts; port++)
+        if (app::Get().players[port].keyboard) return port;
+    return -1;
 }
 
 }  // namespace input

@@ -230,6 +230,7 @@ void MountDefaults(const std::string& game_dir, const std::string& data_dir);
 bool CreateSymbolicLink(const std::string& link, const std::string& target);
 void MountDiscOverlay(const std::string& folder, const std::string& host);  // game:\<folder> laid over by a host folder
 void MountFolder(const std::string& console, const std::string& host);  // a console folder kept in a host folder
+inline constexpr char kContentInfo[] = ".content";  // a content package's names in its folder, left out of listings
 bool DeleteSymbolicLink(const std::string& link);
 std::string QuerySymbolicLink(const std::string& link);
 std::string ResolvePath(const std::string& console_path, uint32_t root_handle);  // host path or empty

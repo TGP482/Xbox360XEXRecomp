@@ -809,8 +809,10 @@ void ListDirectory(File& f, const std::string& pattern) {
             if (WildMatch(pattern, e.name)) f.disc_entries.push_back(&e);
     } else {
         std::error_code ec;
-        for (auto& e : fs::directory_iterator(f.host, ec))
-            if (WildMatch(pattern, e.path().filename().string())) f.entries.push_back(e);
+        for (auto& e : fs::directory_iterator(f.host, ec)) {
+            std::string name = e.path().filename().string();
+            if (name != kContentInfo && WildMatch(pattern, name)) f.entries.push_back(e);
+        }
         std::sort(f.entries.begin(), f.entries.end());
     }
     f.next = 0;

@@ -29,6 +29,8 @@ Device_PixelShader = 0x3090
 Device_VertexShader = 0x3094
 # the command buffer BeginCommandBuffer 825D9C40 records into, cleared by EndCommandBuffer 825DA050
 Device_CommandBuffer = 0x3368
+# BeginVertices 825D1680 leaves its draw packet's end here, the title's inlined end moves the ring write to it
+Device_VerticesEnd = 0x3324
 # the command ring: write pointer, segment end, limit, base, segment size, segment start
 Device_RingWrite = 0x28
 Device_RingSegmentEnd = 0x2C

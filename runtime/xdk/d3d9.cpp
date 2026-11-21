@@ -153,6 +153,9 @@ void RequireLayout() {
 #ifdef SUB_D3D_InterruptHandler
     XDK_REQUIRE("d3d9", XDK_KEY(Device_Vblank));
 #endif
+#ifdef SUB_D3DDevice_BeginVertices
+    XDK_REQUIRE("d3d9", XDK_KEY(Device_VerticesEnd));
+#endif
 }
 
 gpu::Backend* Backend() {
@@ -202,8 +205,8 @@ std::vector<uint32_t> ReadWords(uint32_t at, uint32_t n) {
 }
 
 // a shader container: a virtual block (header, constant table, info) then the physical block holding the microcode,
-// or the microcode at code where a shader object keeps it
-bool ReadContainer(uint32_t c, uint32_t code, bool vertex, ShaderEntry& e) {
+// or the microcode at object_code where a shader object keeps it
+bool ReadContainer(uint32_t c, uint32_t object_code, bool vertex, ShaderEntry& e) {
     constexpr uint32_t kMaxBytes = 0x100000;
     uint32_t virtual_size = R32(c + 4);
     if (R32(c) >> 8 != XDK_Shader_Magic || virtual_size > kMaxBytes) return false;
@@ -216,7 +219,7 @@ bool ReadContainer(uint32_t c, uint32_t code, bool vertex, ShaderEntry& e) {
     } else {
         code_bytes = R32(c + XDK_Shader_CodeSize);
     }
-    if (code) code_at = code;
+    if (object_code) code_at = object_code;
     if (code_bytes > kMaxBytes) return false;
     std::vector<uint32_t> code = ReadWords(code_at, code_bytes / 4);
     if (vertex) {
@@ -567,6 +570,7 @@ struct Recorded {
     gpu::Rect rect{};
     bool has_rect = false;
     gpu::ResolveArgs resolve;
+    std::vector<uint8_t> vertices;  // a BeginVertices draw's copy of what the title wrote
 };
 
 std::unordered_map<uint32_t, std::vector<Recorded>> g_buffers;  // by command buffer, under g_lock
@@ -593,45 +597,115 @@ void PointBanks(Recorded& r) {
     r.state.fetch = from + kConstBytes + kBoolBytes + kLoopBytes;
 }
 
-// a draw on a recording device, its state read whole as the device has it now; the buffers it reads stay the
-// title's until the command buffer ran, as on the console
-void RecordDraw(uint32_t dev, uint32_t buffer, const gpu::DrawArgs& a, uint32_t up_data, uint32_t up_bytes,
-                uint32_t up_stride) {
+// a draw's state read whole as the device has it now; false when its shaders are not known
+bool Snapshot(uint32_t dev, const gpu::DrawArgs& a, uint32_t up_data, uint32_t up_bytes, uint32_t up_stride,
+              Recorded& r) {
     Backend();
-    Recorded r;
     ShaderEntry* vs = nullptr;
-    if (!ReadState(dev, r.state, nullptr, vs)) return;
+    if (!ReadState(dev, r.state, nullptr, vs)) return false;
     CopyBanks(r.state, r);
     Streams(dev, *vs, up_data, up_bytes, up_stride, r.streams);
     r.draw = a;
     r.draw.fenced = false;
-    g_buffers[buffer].push_back(std::move(r));
+    return true;
 }
 
-// a command buffer's list on the renderer, in order, tiled as the title's device is now
-void Replay(uint32_t buffer) {
+// a draw on a recording device; the buffers it reads stay the title's until the command buffer ran, as on the console
+void RecordDraw(uint32_t dev, uint32_t buffer, const gpu::DrawArgs& a, uint32_t up_data, uint32_t up_bytes,
+                uint32_t up_stride) {
+    Recorded r;
+    if (Snapshot(dev, a, up_data, up_bytes, up_stride, r)) g_buffers[buffer].push_back(std::move(r));
+}
+
+// a recorded command on the renderer, tiled as the title's device is now
+void RunRecorded(gpu::Backend* backend, Recorded& r) {
+    if (r.banks) PointBanks(r);
+    r.state.tiled_width = g_tiling.on ? uint32_t(g_tiling.extent.x2) : 0;
+    r.state.tiled_height = g_tiling.on ? uint32_t(g_tiling.extent.y2) : 0;
+    r.state.predicated = g_tiling.on ? SelectedTiles() : gpu::Rect{};
+    if (r.op == RecordedOp::Draw) {
+        r.draw.streams = r.streams.empty() ? nullptr : r.streams.data();
+        backend->Draw(r.state, r.draw);
+    } else if (r.op == RecordedOp::Clear) {
+        backend->Clear(r.state, r.flags, r.color, r.z, r.stencil, r.has_rect ? &r.rect : nullptr);
+    } else {
+        backend->Resolve(r.state, r.resolve);
+    }
+}
+
+// BeginVertices draws: the title writes the vertices after the call and ends it by setting the ring write pointer
+// to Device_VerticesEnd, no call the host sees, so each is drawn at its device's next call in its begin's state
+constexpr uint32_t kDevVerticesEnd = XDK_Device_VerticesEnd;
+
+struct PendingVertices {
+    Recorded draw;
+    uint32_t buffer = 0;   // the command buffer recording it, 0 for none
+    uint32_t ring_at = 0;  // the ring write pointer at the begin, which the end moves
+    uint32_t data = 0;
+    uint32_t bytes = 0;
+};
+std::unordered_map<uint32_t, PendingVertices> g_pending;  // by device, under g_lock
+
+// guest memory a device's title writes its vertices into, one draw at a time
+struct VertexRoom {
+    uint32_t at = 0;
+    uint32_t bytes = 0;
+};
+std::unordered_map<uint32_t, VertexRoom> g_rooms;  // by device, under g_lock
+
+uint32_t RoomFor(uint32_t dev, uint32_t bytes) {
+    constexpr uint32_t kMinRoom = 0x10000;
+    VertexRoom& room = g_rooms[dev];
+    if (room.bytes < bytes) {
+        if (room.at) mem::FreeSystem(room.at);
+        room.bytes = std::max(bytes, kMinRoom);
+        room.at = mem::AllocSystem(room.bytes);
+    }
+    return room.at;
+}
+
+// the device's last BeginVertices draw, written by now: drawn, or kept by the command buffer recording it
+void FlushVertices(uint32_t dev) {
+    auto it = g_pending.find(dev);
+    if (it == g_pending.end()) return;
+    PendingVertices p = std::move(it->second);
+    g_pending.erase(it);
+    const uint8_t* from = static_cast<const uint8_t*>(HostPtr(p.data));
+    p.draw.vertices.assign(from, from + p.bytes);
+    for (gpu::StreamFetch& sf : p.draw.streams) {
+        if (sf.data) sf.data = p.draw.vertices.data();
+    }
+    if (p.buffer) {
+        g_buffers[p.buffer].push_back(std::move(p.draw));
+    } else {
+        RunRecorded(Backend(), p.draw);
+    }
+}
+
+// false while the title may still be writing the device's BeginVertices draw
+bool VerticesEnded(uint32_t dev) {
+    auto it = g_pending.find(dev);
+    return it != g_pending.end() && R32(dev + kDevRingWrite) != it->second.ring_at;
+}
+
+// a command buffer's list on the renderer, in order, after the BeginVertices draws its recording left
+void Replay(uint32_t dev, uint32_t buffer) {
     std::lock_guard lock(g_lock);
+    FlushVertices(dev);
+    std::vector<uint32_t> recording;
+    for (auto& [d, p] : g_pending) {
+        if (p.buffer == buffer) recording.push_back(d);
+    }
+    for (uint32_t d : recording) FlushVertices(d);
     auto it = g_buffers.find(buffer);
     if (it == g_buffers.end()) return;
     gpu::Backend* backend = Backend();
-    for (Recorded& r : it->second) {
-        if (r.banks) PointBanks(r);
-        r.state.tiled_width = g_tiling.on ? uint32_t(g_tiling.extent.x2) : 0;
-        r.state.tiled_height = g_tiling.on ? uint32_t(g_tiling.extent.y2) : 0;
-        r.state.predicated = g_tiling.on ? SelectedTiles() : gpu::Rect{};
-        if (r.op == RecordedOp::Draw) {
-            r.draw.streams = r.streams.empty() ? nullptr : r.streams.data();
-            backend->Draw(r.state, r.draw);
-        } else if (r.op == RecordedOp::Clear) {
-            backend->Clear(r.state, r.flags, r.color, r.z, r.stencil, r.has_rect ? &r.rect : nullptr);
-        } else {
-            backend->Resolve(r.state, r.resolve);
-        }
-    }
+    for (Recorded& r : it->second) RunRecorded(backend, r);
 }
 
 void Draw(uint32_t dev, gpu::DrawArgs& a, uint32_t up_data = 0, uint32_t up_bytes = 0, uint32_t up_stride = 0) {
     std::lock_guard lock(g_lock);
+    FlushVertices(dev);
     if (uint32_t buffer = RecordingTo(dev)) {
         RecordDraw(dev, buffer, a, up_data, up_bytes, up_stride);
         return;
@@ -671,6 +745,7 @@ void PassFence(uint32_t writeback, uint32_t fence) {
     if (!R32(dev + kDevDepth)) flags &= ~(kClearDepth | kClearStencil);
     if (!flags) return;
     std::lock_guard lock(g_lock);
+    FlushVertices(dev);
     gpu::State s;
     ReadRegisters(dev, s);
     float rgba[4] = {};
@@ -708,6 +783,7 @@ struct ResolveCall {
 void ResolveTo(uint32_t dev, const ResolveCall& c) {
     if (!c.tex) return;
     std::lock_guard lock(g_lock);
+    FlushVertices(dev);
     gpu::State s;
     ReadRegisters(dev, s);
     gpu::ResolveArgs r;
@@ -927,6 +1003,7 @@ HLE_FUNC(D3DDevice_BeginTiling) {
     gpu::Rect extent{};
     {
         std::lock_guard lock(g_lock);
+        FlushVertices(dev);
         g_tiling = {};
         for (uint32_t i = 0; i < count; i++) {
             gpu::Rect r = ReadRect(a[3] + i * 16);
@@ -955,6 +1032,7 @@ HLE_FUNC(D3DDevice_EndTiling) {
     uint32_t dev = a[0];
     {
         std::lock_guard lock(g_lock);
+        FlushVertices(dev);
         gpu::Rect area{};
         for (size_t i = 0; i < g_tiling.tiles.size(); i++) {
             gpu::Rect r = a[2] ? ReadRect(a[2] + uint32_t(i) * 16) : g_tiling.tiles[i];
@@ -1001,6 +1079,8 @@ HLE_FUNC(D3DDevice_Swap) {
     app::HandoverSwap();
     {
         std::lock_guard lock(g_lock);
+        // another thread may swap while the title writes them
+        if (VerticesEnded(a[0])) FlushVertices(a[0]);
         UseCpuFences(a[0]);
         if (a[1]) {
             uint32_t front[6];
@@ -1046,7 +1126,12 @@ PPC_EXTERN_FUNC(GUEST_ORIG(D3DDevice_BeginCommandBuffer));
 
 // (device, command buffer, ...): it records from now, what it held before is gone
 PPC_FUNC(GUEST(D3DDevice_BeginCommandBuffer)) {
+    uint32_t dev = uint32_t(ctx.r[3]);
     uint32_t buffer = uint32_t(ctx.r[4]);
+    {
+        std::lock_guard lock(g_lock);
+        FlushVertices(dev);
+    }
     GUEST_ORIG(D3DDevice_BeginCommandBuffer)(ctx, base);
     std::lock_guard lock(g_lock);
     g_buffers[buffer].clear();
@@ -1056,8 +1141,33 @@ PPC_FUNC(GUEST(D3DDevice_BeginCommandBuffer)) {
 #ifdef SUB_D3DDevice_RunCommandBuffer
 // (device, command buffer): what it recorded runs now; the library's packets for it go nowhere
 HLE_FUNC(D3DDevice_RunCommandBuffer) {
-    Replay(a[1]);
+    Replay(a[0], a[1]);
     return 0;
+}
+#endif
+
+#ifdef SUB_D3DDevice_BeginVertices
+// (device, primitive, vertex count, stride): room the title writes the vertices into, 0 for none
+HLE_FUNC(D3DDevice_BeginVertices) {
+    uint32_t dev = a[0];
+    uint32_t bytes = a[2] * a[3];
+    std::lock_guard lock(g_lock);
+    FlushVertices(dev);
+    uint32_t room = RoomFor(dev, bytes);
+    // the title's own end sets the ring write pointer to this: a dword on, so the end shows
+    uint32_t ring_at = R32(dev + kDevRingWrite);
+    W32(dev + kDevVerticesEnd, ring_at + 4);
+    PendingVertices p;
+    gpu::DrawArgs d;
+    d.prim = a[1];
+    d.count = a[2];
+    if (!Snapshot(dev, d, room, bytes, a[3], p.draw)) return room;
+    p.buffer = RecordingTo(dev);
+    p.ring_at = ring_at;
+    p.data = room;
+    p.bytes = bytes;
+    g_pending[dev] = std::move(p);
+    return room;
 }
 #endif
 

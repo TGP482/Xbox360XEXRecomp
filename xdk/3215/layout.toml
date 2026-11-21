@@ -77,6 +77,8 @@ XAudio_SourceXma = 4
 XAudio_VoiceSourcePart = 0x4C
 XAudioVoiceSlot_AddRef = 0x4
 XAudioVoiceSlot_Release = 0x8
+# the title calls it inlined (82106120), no wrapper left
+XAudioVoiceSlot_SetEffectState = 0x18
 XAudioVoiceSlot_SetEffectParam = 0x20
 XAudioVoiceSlot_SetVoiceOutput = 0x24
 XAudioVoiceSlot_SetVoiceOutputVolume = 0x28

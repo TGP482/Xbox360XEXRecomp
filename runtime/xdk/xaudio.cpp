@@ -581,6 +581,8 @@ uint32_t MakeVtable(const std::vector<Slot>& slots) {
     return vt;
 }
 
+void SetEffectStateMethod(PPCContext& ctx, uint8_t*);
+
 std::vector<Slot> VoiceSlots() {
     std::vector<Slot> s;
 #ifdef SUB_XAudioVoice_AddRef
@@ -589,9 +591,8 @@ std::vector<Slot> VoiceSlots() {
 #ifdef SUB_XAudioVoice_Release
     s.push_back({XDK_XAudioVoiceSlot_Release, SYM(XAudioVoice_Release)});
 #endif
-#ifdef SUB_XAudioVoice_SetEffectState
-    s.push_back({XDK_XAudioVoiceSlot_SetEffectState, SYM(XAudioVoice_SetEffectState)});
-#endif
+    // titles that inline it leave no wrapper to point at
+    s.push_back({XDK_XAudioVoiceSlot_SetEffectState, dispatch::HostThunk(SetEffectStateMethod)});
 #ifdef SUB_XAudioVoice_SetEffectParam
     s.push_back({XDK_XAudioVoiceSlot_SetEffectParam, SYM(XAudioVoice_SetEffectParam)});
 #endif
@@ -672,6 +673,19 @@ uint64_t WithVoice(uint32_t handle, F f) {
     Voice* v = Find(handle);
     return v ? f(*v) : kInvalidArg;
 }
+
+// (voice, effect, state): 0 bypasses it
+uint64_t SetEffectState(const kernel::Args& a) {
+    uint32_t index = a[1];
+    uint32_t state = a[2];
+    return WithVoice(a[0], [&](Voice& v) {
+        if (v.reverb && v.reverb->index == index) v.reverb->enabled = state != 0;
+        if (v.effect && v.effect->index == index) v.effect->enabled = state != 0;
+        return kOk;
+    });
+}
+
+void SetEffectStateMethod(PPCContext& ctx, uint8_t*) { ctx.r[3] = SetEffectState(kernel::Args{ctx}); }
 
 }  // namespace
 
@@ -825,16 +839,7 @@ HLE_FUNC(XAudioVoice_Release) {
 #endif
 
 #ifdef SUB_XAudioVoice_SetEffectState
-// (voice, effect, state): 0 bypasses it
-HLE_FUNC(XAudioVoice_SetEffectState) {
-    uint32_t index = a[1];
-    uint32_t state = a[2];
-    return WithVoice(a[0], [&](Voice& v) {
-        if (v.reverb && v.reverb->index == index) v.reverb->enabled = state != 0;
-        if (v.effect && v.effect->index == index) v.effect->enabled = state != 0;
-        return kOk;
-    });
-}
+HLE_FUNC(XAudioVoice_SetEffectState) { return SetEffectState(a); }
 #endif
 
 #ifdef SUB_XAudioVoice_SetEffectParam

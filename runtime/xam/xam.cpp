@@ -353,14 +353,4 @@ XAM_EXPORT(0x317, XamSessionRefObjByHandle) {
     return kErrorSuccess;
 }
 
-// voice: no headset, so no voice object; the third argument of XamVoiceCreate is the voice out
-XAM_EXPORT(0x30C, XamVoiceCreate) {
-    if (a[2]) W32(a[2], 0);
-    return kErrorDeviceNotConnected;
-}
-
-XAM_EXPORT(0x30D, XamVoiceHeadsetPresent) { return 0; }
-XAM_EXPORT(0x30E, XamVoiceSubmitPacket) { return kErrorDeviceNotConnected; }
-XAM_EXPORT(0x30F, XamVoiceClose) { return kErrorSuccess; }
-
 }  // namespace kernel

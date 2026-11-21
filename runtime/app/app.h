@@ -37,6 +37,8 @@ struct Settings {
     uint32_t texture_dump_format = 0;  // 0 PNG, 1 DDS
     uint32_t audio_output = 0;         // audio::kOutputAuto, Stereo, Surround or Mono
     std::string join_ip;                   // system link: a host past the LAN the session search also asks
+    std::string microphone;                // the headset's recording device by name, empty the system default
+    bool push_to_talk = false;             // the headset records only while GameInfo::talk_key is held
     Port players[kPorts] = {{true, 0}, {false, 1}, {false, 2}, {false, 3}};  // guest ports 0 to 3
 };
 
@@ -123,6 +125,7 @@ struct GameInfo {
     void (*ui)(double fps);        // each frame inside the ImGui frame, UiLock held
     void (*pad)(int port, input::Pad& pad);  // a polled pad before the game gets it
     void (*rumble)(int port, uint16_t& left, uint16_t& right);
+    bool (*talk_key)();            // any thread: the game's push to talk key is held
     WindowColours compiler_colours{};
 };
 extern const GameInfo kGame;

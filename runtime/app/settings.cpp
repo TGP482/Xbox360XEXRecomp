@@ -96,6 +96,8 @@ void Load() {
     s.dump_textures = t["dump_textures"].value_or(s.dump_textures);
     s.texture_dump_format = std::min(t["texture_dump_format"].value_or(s.texture_dump_format), 1u);
     s.join_ip = t["join_ip"].value_or(s.join_ip);
+    s.microphone = t["microphone"].value_or(s.microphone);
+    s.push_to_talk = t["push_to_talk"].value_or(s.push_to_talk);
     LoadPlayers(t, s);
     s.audio_output = std::min(t["audio_output"].value_or(s.audio_output), audio::kOutputMono);
     for (const Option& o : kGame.options) {
@@ -123,6 +125,8 @@ toml::table Table() {
                   {"dump_textures", s.dump_textures},
                   {"texture_dump_format", int64_t(s.texture_dump_format)},
                   {"join_ip", s.join_ip},
+                  {"microphone", s.microphone},
+                  {"push_to_talk", s.push_to_talk},
                   {"audio_output", int64_t(s.audio_output)}};
     for (int i = 0; i < kPorts; i++) t.insert(PlayerKey(i), PortName(s.players[i]));
     for (const Option& o : kGame.options) {

@@ -283,6 +283,15 @@ void MountDiscOverlay(const std::string& folder, const std::string& host) {
     LOGR("files: game:\\%s is laid over by %s", folder.c_str(), host.c_str());
 }
 
+// a device of its own: the console folder and everything under it live in the host folder
+void MountFolder(const std::string& console, const std::string& host) {
+    std::error_code ec;
+    fs::create_directories(host, ec);
+    std::lock_guard<std::mutex> lock(g_links_lock);
+    g_devices[Upper(Normalize(console))] = host;
+    LOGR("files: %s is kept in %s", console.c_str(), host.c_str());
+}
+
 bool DeleteSymbolicLink(const std::string& link) {
     std::lock_guard<std::mutex> lock(g_links_lock);
     return g_links.erase(Upper(Normalize(link))) != 0;

@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "kernel/exports.h"
@@ -52,5 +53,8 @@ void Notify(uint32_t id, uint32_t param);
 
 // system link sockets closed, before another executable takes over
 void CloseSockets();
+
+// a content type's packages kept in a host folder of the game's, for every user
+void MountContent(uint32_t type, const std::string& host);
 
 }  // namespace xam

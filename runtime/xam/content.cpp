@@ -199,3 +199,11 @@ XAM_EXPORT(0x262, XamContentGetCreator) {
 }
 
 }  // namespace kernel
+
+namespace xam {
+
+void MountContent(uint32_t type, const std::string& host) {
+    for (uint32_t user : {0u, kUserIndexNone}) kernel::MountFolder(kernel::TypeFolder(user, type), host);
+}
+
+}  // namespace xam

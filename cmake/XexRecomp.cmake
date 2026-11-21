@@ -94,8 +94,8 @@ endif()
 if(NOT XEX_DXC_DIR)
     message(WARNING "dxcompiler.dll and dxil.dll not found, set XEX_DXC_DIR to the folder holding them")
 endif()
-# SDL's headers go to the input code alone (it is linked LINK_ONLY), FFmpeg's to the XMA decoder
-set_source_files_properties(${XEX_SDK_DIR}/runtime/core/input.cpp PROPERTIES
+# SDL's headers go to the input and voice code alone (it is linked LINK_ONLY), FFmpeg's to the XMA decoder
+set_source_files_properties(${XEX_SDK_DIR}/runtime/core/input.cpp ${XEX_SDK_DIR}/runtime/xam/voice.cpp PROPERTIES
     INCLUDE_DIRECTORIES "${sdl3_SOURCE_DIR}/include")
 set_source_files_properties(${XEX_SDK_DIR}/runtime/audio/xma_decoder.cpp PROPERTIES
     INCLUDE_DIRECTORIES "${ffmpeg_SOURCE_DIR}/include")
@@ -114,11 +114,16 @@ function(add_xex_image target xex config partitions game_dir)
         list(APPEND GEN_SOURCES ${GEN}/ppc_recomp.${i}.cpp)
     endforeach()
     file(GLOB configs CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/config/*.toml ${XEX_SDK_DIR}/xdk/*/*.toml)
+    get_filename_component(config_name ${config} NAME_WE)
     add_custom_command(
         OUTPUT ${GEN}/codegen.stamp
         BYPRODUCTS ${GEN_SOURCES} ${GEN}/host_bodies.cpp ${GEN}/ppc_recomp_shared.h ${GEN}/image_symbols.h
-                   ${GEN}/hook_exports.h ${GEN}/exports.def ${GEN}/imports.def ${GEN}/code.lib
+                   ${GEN}/hook_exports.h ${GEN}/exports.def ${GEN}/imports.def ${GEN}/code.lib ${GEN}/overrides.txt
         COMMAND xex_recomp config/${config} --xdk ${XEX_SDK_DIR}/xdk
+        # the executable's own recompile has no src to find overrides in
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${XEX_COMPILER_DIR}/config
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${GEN}/overrides.txt
+                ${XEX_COMPILER_DIR}/config/${config_name}.overrides
         COMMAND ${XEX_LLVM_BIN}/lld-link.exe /lib /machine:x64 /def:${GEN}/imports.def /out:${GEN}/code.lib
         COMMAND ${CMAKE_COMMAND} -E touch ${GEN}/codegen.stamp
         DEPENDS xex_recomp ${configs} ${CMAKE_CURRENT_SOURCE_DIR}/assets/${xex}

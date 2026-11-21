@@ -183,9 +183,12 @@ static bool CheckOverrides(const Analysis& an) {
     return ok;
 }
 
-// the game's host overrides by address, PPC_FUNC(sub_X) anywhere in its sources
-static void FindOverrides(const fs::path& src, Config& cfg) {
+// the game's host overrides by address, PPC_FUNC(sub_X) anywhere in its sources, and the list the build left
+// beside the config for the executable's own recompile, which has no sources
+static void FindOverrides(const fs::path& src, const fs::path& list, Config& cfg) {
     static const std::string kOverride = "PPC_FUNC(sub_";
+    std::ifstream saved(list);
+    for (uint32_t va; saved >> std::hex >> va;) cfg.overridden.insert(va);
     if (!fs::is_directory(src)) return;
     for (auto& e : fs::recursive_directory_iterator(src)) {
         if (!e.is_regular_file()) continue;
@@ -248,11 +251,13 @@ int main(int argc, char** argv) {
     }
     for (auto& [name, va] : cfg.symbols)
         if (va) cfg.overridden.insert(va);
-    FindOverrides(root / "src", cfg);
+    FindOverrides(root / "src", cfg_path.parent_path() / (cfg_path.stem().string() + ".overrides"), cfg);
     fs::path out_dir = args.size() > 2 ? fs::path(args[2]) : root / cfg.out_dir;
     Analysis an(img, cfg);
     an.Run();
     if (!CheckOverrides(an)) return 1;
     fs::create_directories(out_dir);
+    std::ofstream list(out_dir / "overrides.txt");
+    for (uint32_t va : cfg.overridden) list << std::hex << va << "\n";
     return CodeGen(an, out_dir).Run() ? 0 : 1;
 }

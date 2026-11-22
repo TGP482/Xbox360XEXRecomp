@@ -245,6 +245,13 @@ void SetOutputMode(uint32_t mode) {
     if (g_mode.exchange(mode) != mode) g_mode_changed = true;
 }
 
+void SetPaused(bool paused) {
+    std::lock_guard lock(g_lock);
+    if (!g_device) return;
+    if (paused) g_device->voice->Stop();
+    else g_device->voice->Start();
+}
+
 std::unique_ptr<Reverb> MakeReverb(uint32_t in_channels, uint32_t out_channels, uint32_t frames) {
     auto r = std::make_unique<HostReverb>();
     ComPtr<IUnknown> unknown;

@@ -23,6 +23,8 @@ constexpr uint32_t kOutputStereo = 1;
 constexpr uint32_t kOutputSurround = 2;
 constexpr uint32_t kOutputMono = 3;
 void SetOutputMode(uint32_t mode);
+// the host voice stops, so its queue stops draining and the mixer waits
+void SetPaused(bool paused);
 
 // I3DL2 reverb parameters as the XDK's reverb takes them
 struct I3dl2 {

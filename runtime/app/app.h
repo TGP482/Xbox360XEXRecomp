@@ -36,6 +36,7 @@ struct Settings {
     bool dump_textures = false;      // each texture once into textures\dumps\ beside the exe
     uint32_t texture_dump_format = 0;  // 0 PNG, 1 DDS
     uint32_t audio_output = 0;         // audio::kOutputAuto, Stereo, Surround or Mono
+    bool pause_on_focus_loss = true;   // the game and its sound stop while the window is in the background
     std::string join_ip;                   // system link: a host past the LAN the session search also asks
     std::string microphone;                // the headset's recording device by name, empty the system default
     bool push_to_talk = false;             // the headset records only while GameInfo::talk_key is held
@@ -132,5 +133,7 @@ extern const GameInfo kGame;
 
 // sleeps out the rest of the frame for the fps cap
 void Pace();
+// each Swap: waits while the window is in the background or minimized, with the guest's clocks and sound stopped
+void WaitWhileUnfocused();
 
 }  // namespace app

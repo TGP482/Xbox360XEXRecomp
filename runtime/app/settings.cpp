@@ -100,6 +100,7 @@ void Load() {
     s.push_to_talk = t["push_to_talk"].value_or(s.push_to_talk);
     LoadPlayers(t, s);
     s.audio_output = std::min(t["audio_output"].value_or(s.audio_output), audio::kOutputMono);
+    s.pause_on_focus_loss = t["pause_on_focus_loss"].value_or(s.pause_on_focus_loss);
     for (const Option& o : kGame.options) {
         if (o.flag) *o.flag = t[o.key].value_or(*o.flag);
         else *o.value = t[o.key].value_or(*o.value);
@@ -127,7 +128,8 @@ toml::table Table() {
                   {"join_ip", s.join_ip},
                   {"microphone", s.microphone},
                   {"push_to_talk", s.push_to_talk},
-                  {"audio_output", int64_t(s.audio_output)}};
+                  {"audio_output", int64_t(s.audio_output)},
+                  {"pause_on_focus_loss", s.pause_on_focus_loss}};
     for (int i = 0; i < kPorts; i++) t.insert(PlayerKey(i), PortName(s.players[i]));
     for (const Option& o : kGame.options) {
         if (o.flag) t.insert(o.key, *o.flag);

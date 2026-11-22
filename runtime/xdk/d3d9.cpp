@@ -1160,6 +1160,7 @@ PPC_FUNC(GUEST(D3DDevice_SetPredication)) {
 
 // (device, front buffer texture, parameters)
 HLE_FUNC(D3DDevice_Swap) {
+    app::WaitWhileUnfocused();
     app::SplashFirstFrame();
     app::HandoverSwap();
     {

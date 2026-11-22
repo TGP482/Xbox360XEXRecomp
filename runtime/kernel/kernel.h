@@ -165,6 +165,8 @@ int32_t ResetEvent(Object& o);
 int32_t ReleaseSemaphore(Object& o, int32_t count, uint32_t& status);
 int32_t ReleaseMutant(Object& o, uint32_t& status);
 int64_t Now100ns();                     // system time, 100 ns since 1601
+int64_t GuestNs();                      // steady ns since start that stop while held
+void HoldGuestTime(bool held);          // the guest's clocks stand still while held
 int64_t ToDeadline(int64_t due_100ns);  // relative or absolute to a steady clock deadline in ns
 void QueueDpc(uint32_t dpc, uint32_t arg1, uint32_t arg2);
 struct Thread;

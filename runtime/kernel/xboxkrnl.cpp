@@ -50,21 +50,16 @@ constexpr uint32_t kLdrXexHeaderBase = 0x58;
 uint32_t g_title_module = 0;
 uint32_t g_xex_header = 0;
 
-uint64_t InterruptTime() {
-    using namespace std::chrono;
-    static const auto start = steady_clock::now();
-    return uint64_t(duration_cast<nanoseconds>(steady_clock::now() - start).count() / 100);
-}
+uint64_t InterruptTime() { return uint64_t(GuestNs() / 100); }
 
 void PutString(uint32_t va, const char* text) { std::memcpy(HostPtr(va), text, std::strlen(text) + 1); }
 
 // KeTimeStampBundle once a millisecond, which GetTickCount reads
 void RunClock() {
     using namespace std::chrono;
-    auto start = steady_clock::now();
     uint32_t bundle = kdata_KeTimeStampBundle;
     for (;;) {
-        auto ms = duration_cast<milliseconds>(steady_clock::now() - start).count();
+        int64_t ms = GuestNs() / 1000000;
         W64(bundle + kBundleInterruptTime, InterruptTime());
         W64(bundle + kBundleSystemTime, uint64_t(Now100ns()));
         W32(bundle + kBundleTickCount, uint32_t(ms));

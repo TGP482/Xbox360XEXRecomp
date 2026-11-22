@@ -54,6 +54,8 @@ void Notify(uint32_t id, uint32_t param);
 
 // system link sockets closed, before another executable takes over
 void CloseSockets();
+// the title sent to another machine in the last few seconds
+bool InNetSession();
 
 // a content type's packages kept in a host folder of the game's, for every user
 void MountContent(uint32_t type, const std::string& host);

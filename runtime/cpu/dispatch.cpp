@@ -14,7 +14,6 @@
 
 #include <array>
 #include <atomic>
-#include <chrono>
 #include <cstdlib>
 #include <mutex>
 #include <set>
@@ -340,9 +339,7 @@ void ppc_mtspr(PPCContext&, uint32_t spr, uint64_t) { ReportSpr("mtspr", spr); }
 constexpr uint64_t kTimebaseHz = 50000000;
 
 uint64_t ppc_timebase() {
-    using namespace std::chrono;
-    static const auto start = steady_clock::now();
-    auto ns = uint64_t(duration_cast<nanoseconds>(steady_clock::now() - start).count());
+    auto ns = uint64_t(kernel::GuestNs());
     uint64_t sec = ns / 1000000000ull;
     uint64_t rem = ns % 1000000000ull;
     return sec * kTimebaseHz + rem * kTimebaseHz / 1000000000ull;

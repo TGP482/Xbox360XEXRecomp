@@ -46,6 +46,7 @@ constexpr int kOptLinger = 0x80;
 constexpr DWORD kUdpConnReset = 0x9800000C;  // SIO_UDP_CONNRESET: off, or a send to a closed port fails the next recv
 constexpr int kLoopbackInstances = 8;
 constexpr size_t kMaxPublic = 8;
+constexpr uint64_t kSessionHoldMs = 10000;
 
 struct Socket {
     SOCKET s = INVALID_SOCKET;
@@ -81,6 +82,7 @@ std::unordered_map<uint32_t, std::array<uint8_t, kXnAddrSize>> g_peers;
 thread_local uint32_t t_error = 0;
 
 std::atomic<uint32_t> g_remote{0};  // the last public address a packet came from
+std::atomic<uint64_t> g_peer_sent{0};  // GetTickCount64 of the last send to one machine, not a broadcast
 std::mutex g_nat_lock;
 std::unordered_map<uint64_t, uint16_t> g_nat;  // (peer address, our port) to the port its packets come from
 std::vector<uint32_t> g_public;                // public addresses packets came from, the latest last
@@ -289,6 +291,7 @@ int SendTo(SOCKET s, const uint8_t* data, int len, sockaddr_in to) {
 }
 
 int Send(SOCKET s, const uint8_t* data, int len, const sockaddr_in* to) {
+    if (!to || to->sin_addr.s_addr != INADDR_BROADCAST) g_peer_sent = GetTickCount64();
     return to ? SendTo(s, data, len, *to) : ::send(s, reinterpret_cast<const char*>(data), len, 0);
 }
 
@@ -726,6 +729,7 @@ XAM_EXPORT(0x16, NetDll_send) {
     for (;;) {
         Socket k = Find(a[1]);
         if (k.s == INVALID_SOCKET) return Fail(WSAENOTSOCK);
+        g_peer_sent = GetTickCount64();
         int n = ::send(k.s, static_cast<const char*>(HostPtr(a[2])), int(a[3]), int(a[4]));
         if (n >= 0) return uint32_t(n);
         int e = WSAGetLastError();
@@ -947,6 +951,11 @@ XAM_EXPORT(0x49, NetDll_XNetGetTitleXnAddr) {
 XAM_EXPORT(0x4B, NetDll_XNetGetEthernetLinkStatus) { return kLinkUp; }
 
 }  // namespace kernel
+
+bool xam::InNetSession() {
+    uint64_t sent = kernel::g_peer_sent;
+    return sent && GetTickCount64() - sent < kernel::kSessionHoldMs;
+}
 
 // the next executable binds the same ports while this process hands over
 void xam::CloseSockets() {

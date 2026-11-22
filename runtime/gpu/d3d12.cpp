@@ -1,6 +1,7 @@
 #include "gpu/backend.h"
 #include "gpu/compiler.h"
 #include "gpu/ext.h"
+#include "gpu/latency.h"
 #include "gpu/shaders.h"
 #include "gpu/texturedumper.h"
 #include "gpu/xenos_format.h"
@@ -1129,6 +1130,7 @@ void D3D12Backend::Begin() {
 void D3D12Backend::Submit(bool wait) {
     cl_->Close();
     ID3D12CommandList* lists[] = {cl_.Get()};
+    latency::Executed();
     queue_->ExecuteCommandLists(1, lists);
     queue_->Signal(fence_.Get(), ++fence_value_);
     Frame& f = CurrentFrame();
@@ -3034,6 +3036,7 @@ void D3D12Backend::Present(const uint32_t front[6]) {
     }
     ResizeSwap();
     ShowFrame(t);
+    latency::Submitted(fence_.Get(), CurrentFrame().fence);
 
     g_perf.upload_bytes += CurrentFrame().used;
     presents_++;

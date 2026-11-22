@@ -85,6 +85,11 @@ VertexShader_Code = 0x30
 # XAudio source voice types past 1 (16 bit PCM): 8 bit PCM (Bink 8278CA48), XMA (XACT 825EA418)
 XAudio_SourcePcm8 = 2
 XAudio_SourceXma = 4
+# source voice init: packet done callback and its context (8260E3C8, part ctor 826062C8, done 825FF698), the
+# packet's context (SubmitPacket body 82605468)
+XAudio_SourceDoneCallback = 0x50
+XAudio_SourceDoneContext = 0x58
+XAudio_PacketContext = 0x54
 
 # voices as guest objects: vtable slots read from the wrappers 82604500 to 82604A88, the source part at +0x4C
 XAudio_VoiceSourcePart = 0x4C
@@ -98,7 +103,11 @@ XAudioVoiceSlot_SetVoiceOutputVolume = 0x28
 XAudioVoiceSlot_GetVoiceState = 0x30
 XAudioVoiceSlot_Stop = 0x3C
 XAudioVoiceSlot_SetVolume = 0x5C
+# no wrapper, XACT calls them (825F0BC8, 825F09E0): voice vtable 82087628, source part vtable 820873C8
+XAudioVoiceSlot_GetFormat = 0x40
 XAudioSourceSlot_SubmitPacket = 0x1C
+XAudioSourceSlot_SubmitBuffer = 0x24
+XAudioSourceSlot_Discontinuity = 0x38
 XAudioSourceSlot_GetPacketPosition = 0x3C
 XAudioSourceSlot_SetPacketPosition = 0x40
 XAudioSourceSlot_SetPacketLoopCount = 0x48

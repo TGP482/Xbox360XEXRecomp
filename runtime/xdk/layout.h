@@ -255,6 +255,15 @@ constexpr bool AllKnown(const LayoutKey (&keys)[N]) {
 #ifndef XDK_XAudio_SourceXma
 #define XDK_XAudio_SourceXma 0xFFFFFFFFu
 #endif
+#ifndef XDK_XAudio_SourceDoneCallback
+#define XDK_XAudio_SourceDoneCallback 0xFFFFFFFFu
+#endif
+#ifndef XDK_XAudio_SourceDoneContext
+#define XDK_XAudio_SourceDoneContext 0xFFFFFFFFu
+#endif
+#ifndef XDK_XAudio_PacketContext
+#define XDK_XAudio_PacketContext 0xFFFFFFFFu
+#endif
 #ifndef XDK_Device_ClipPlanes
 #define XDK_Device_ClipPlanes 0xFFFFFFFFu
 #endif
@@ -297,8 +306,17 @@ constexpr bool AllKnown(const LayoutKey (&keys)[N]) {
 #ifndef XDK_XAudioVoiceSlot_SetVolume
 #define XDK_XAudioVoiceSlot_SetVolume 0xFFFFFFFFu
 #endif
+#ifndef XDK_XAudioVoiceSlot_GetFormat
+#define XDK_XAudioVoiceSlot_GetFormat 0xFFFFFFFFu
+#endif
 #ifndef XDK_XAudioSourceSlot_SubmitPacket
 #define XDK_XAudioSourceSlot_SubmitPacket 0xFFFFFFFFu
+#endif
+#ifndef XDK_XAudioSourceSlot_SubmitBuffer
+#define XDK_XAudioSourceSlot_SubmitBuffer 0xFFFFFFFFu
+#endif
+#ifndef XDK_XAudioSourceSlot_Discontinuity
+#define XDK_XAudioSourceSlot_Discontinuity 0xFFFFFFFFu
 #endif
 #ifndef XDK_XAudioSourceSlot_GetPacketPosition
 #define XDK_XAudioSourceSlot_GetPacketPosition 0xFFFFFFFFu

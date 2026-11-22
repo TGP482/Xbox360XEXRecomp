@@ -23,16 +23,20 @@ D3D_MakeSpace = {len = 0x3A, hash = "0x3D87DE1D0BF4FC7", calls = [[0x71, "0x7A4C
 XAudioCreateSourceVoice = {len = 0x17, hash = "0x5FE354E37226F93F", calls = [[0x42, "0x471E674685946F23", [[0x3E, "0x92C37E0A83F16AD6"], [0x1E, "0x3A717CBF142F15AE"], [0x3E, "0xAA0F7759603776DC"], [0x37, "0x9915B7941A505C13"]]]]}
 XAudioCreateSubmixVoice = {len = 0x17, hash = "0x5FE354E37226F93F", calls = [[0x52, "0x8A94C81023C01955", [[0x34, "0x7E4C4C8961A3FED2"], [0x1E, "0x3A717CBF142F15AE"], [0x42, "0x8010BCADEE8FF330"], [0x45, "0xC02CB045F30C8DCB"], [0x49, "0x2D1E3122B7EC5BC9"]]]]}
 XAudioCreateSubmixVoiceInner = {len = 0x52, hash = "0x8A94C81023C01955", calls = [[0x34, "0x7E4C4C8961A3FED2", [[0x35, "0xB2D4E513AFA3527"]]], [0x1E, "0x3A717CBF142F15AE", [[0x3C, "0x189EE1813A7A5299"]]], [0x42, "0x8010BCADEE8FF330", [[0x27, "0x313FE1386A632358"]]], [0x45, "0xC02CB045F30C8DCB", [[0x63, "0x5A4E8DDA255052AA"], [0x2C, "0x65CDADC886FFBC0F"]]], [0x49, "0x2D1E3122B7EC5BC9", []]]}
+XAudioGetMasteringVoice = {len = 0x1F, hash = "0xD07A8A55867631C9"}
 XAudioInitialize = {len = 0x39, hash = "0xD6511BBE6B82EA57"}
 XAudioRegisterRenderCallback = {len = 0x20, hash = "0xE135D96DE6037550", calls = [[0x61, "0xC3ED43B73503D2", []]]}
 XAudioShutDown = {len = 0x1F, hash = "0x5FF150C85CF32A6A"}
+XAudioSourceVoice_Discontinuity = {len = 0x19, hash = "0x9E0F62A31AEE40DB"}
 XAudioSourceVoice_FlushPackets = {len = 0x16, hash = "0xC5DCAA864376E389", calls = [[0x19, "0xE540332A588E4C66", []]]}
 XAudioSourceVoice_GetPacketPosition = {len = 0x15, hash = "0x490A28F03F1C1B72", count = 3, nth = 0}
 XAudioSourceVoice_SetPacketLoopCount = {len = 0x15, hash = "0x490A28F03F1C1B72", count = 3, nth = 2}
 XAudioSourceVoice_SetPacketPosition = {len = 0x15, hash = "0x490A28F03F1C1B72", count = 3, nth = 1}
 XAudioSourceVoice_SetPitch = {len = 0x1D, hash = "0x47D6AC37D472A608"}
 XAudioSourceVoice_Start = {len = 0x12, hash = "0x9ED1384182FC974C", calls = [[0x28, "0xF1548E0B4992BDE3", [[0x88, "0x7BA32A8CFA86F87C"], [0x9F, "0xE063737FB5009CAF"], [0x81, "0x98CA00AFE3AB521C"]]]]}
+XAudioSourceVoice_StartInner = {len = 0x28, hash = "0xF1548E0B4992BDE3", calls = [[0x88, "0x7BA32A8CFA86F87C", []], [0x9F, "0xE063737FB5009CAF", [[0x53, "0x25653CD00FB7F92"]]], [0x81, "0x98CA00AFE3AB521C", []]]}
 XAudioSourceVoice_SubmitPacket = {len = 0x17, hash = "0x19963898F1FB9872"}
+XAudioStartDeferredVoices = {len = 0x1D, hash = "0x21EC537D331731E2", calls = [[0x3B, "0xA56F1CC669DEC78B", [[0x28, "0xF1548E0B4992BDE3"]]]]}
 XAudioUnregisterRenderCallback = {len = 0x1F, hash = "0x5E0BCAC1EF6DB9EF", calls = [[0x3A, "0x374F7149EAA2698D", [[0x4C, "0xA9CB46A77C115F03"]]]]}
 XAudioVoice_AddRef = {len = 0x19, hash = "0x4F06D0640694E438", count = 2, nth = 0}
 XAudioVoice_GetVoiceState = {len = 0x15, hash = "0x531B0E366BC33D81", count = 4, nth = 2}

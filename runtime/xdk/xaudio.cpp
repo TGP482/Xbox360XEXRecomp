@@ -72,6 +72,11 @@ constexpr uint32_t kXmaStream = 0x08;
 constexpr uint32_t kXmaStreamBytes = 8;
 constexpr uint32_t kXmaStreamChannels = 0x04;
 constexpr uint32_t kSourceEffects = 0x44;
+// packet done callback fn({context, packet context, status}) and its context
+constexpr uint32_t kSourceDoneCallback = XDK_XAudio_SourceDoneCallback;
+constexpr uint32_t kSourceDoneContext = XDK_XAudio_SourceDoneContext;
+constexpr uint32_t kDoneInfoBytes = 12;
+constexpr uint32_t kAborted = 0x80004004;  // E_ABORT, a flushed packet's status
 // 16 bit PCM is 1 in every build, the other numbers move between builds
 constexpr uint32_t kTypePcm = 1;
 constexpr uint32_t kTypePcm8 = XDK_XAudio_SourcePcm8;
@@ -89,11 +94,16 @@ constexpr uint32_t kPacketBytes = 0x04;
 constexpr uint32_t kPacketLoops = 0x08;
 constexpr uint32_t kPacketLoopStart = 0x0C;
 constexpr uint32_t kPacketLoopLength = 0x10;
+constexpr uint32_t kPacketContext = XDK_XAudio_PacketContext;
+// the source part's 8 word packet: loop start and end in frames
+constexpr uint32_t kBufferLoopEnd = 0x10;
+constexpr uint32_t kBufferPacketContext = 0x1C;
 constexpr uint32_t kLoopForever = 0xFFFFFFFF;
 constexpr uint32_t kMaxLoops = 0xFF;
 // GetVoiceState: started, and running with packets
 constexpr uint8_t kStatePlaying = 0x01;
 constexpr uint8_t kStateStarted = 0x40;
+constexpr uint32_t kStartDeferred = 0x1;  // Start waits for XAudioStartDeferredVoices
 
 struct Voice;
 
@@ -114,6 +124,7 @@ struct Packet {
     uint32_t loops = 0;
     uint32_t loop_start = 0;  // frames
     uint32_t loop_end = 0;
+    uint32_t context = 0;
 };
 
 // the library's reverb, run as the host's
@@ -155,6 +166,10 @@ struct Voice {
     double frame = 0;   // in the current packet, or in the XMA samples decoded
     double played = 0;  // source frames since the voice was made
     bool started = false;
+    bool pending = false;  // a deferred Start
+    bool ending = false;   // Discontinuity: stops once its packets are played
+    uint32_t done_callback = 0;
+    uint32_t done_context = 0;
     std::unique_ptr<audio::XmaDecoder> xma;
     std::vector<int16_t> pcm;  // XMA decoded, interleaved
     uint32_t xma_packet = 0;   // next XMA packet in the current buffer
@@ -167,10 +182,19 @@ struct Callback {
     uint32_t context;
 };
 
+struct Done {
+    uint32_t fn;
+    uint32_t context;
+    uint32_t packet;
+    uint32_t status;
+};
+
 std::recursive_mutex g_lock;
 std::unordered_map<uint32_t, std::unique_ptr<Voice>> g_voices;  // by the handle the title holds
 std::vector<Voice*> g_order;                                     // creation order, submixes mix in it
+Voice* g_master = nullptr;                                       // made when a title first asks for it
 std::unordered_map<uint32_t, Callback> g_callbacks;
+std::vector<Done> g_done;  // packets the mixer finished, their callbacks run outside g_lock
 uint32_t g_next_callback = 1;
 uint32_t g_engine_refs = 0;
 uint32_t g_next_effect = 0x80;
@@ -208,8 +232,9 @@ std::vector<Output> ReadOutputs(uint32_t output) {
     uint32_t e = R32(output + 4);
     for (uint32_t i = 0; i < n && e; i++) {
         uint32_t dest = R32(e + i * 8);
-        if (dest && !Find(dest)) continue;
-        v.push_back({Find(dest), ReadMap(R32(e + i * 8 + 4))});
+        Voice* to = dest ? Find(dest) : nullptr;
+        if (dest && !to) continue;
+        v.push_back({to == g_master ? nullptr : to, ReadMap(R32(e + i * 8 + 4))});
     }
     return v;
 }
@@ -343,6 +368,12 @@ uint32_t BlockAlign(const Voice& v) {
     return v.channels * 2;
 }
 
+void DropPackets(Voice& v, uint32_t status, std::vector<Done>& done) {
+    if (v.done_callback)
+        for (const Packet& p : v.packets) done.push_back({v.done_callback, v.done_context, p.context, status});
+    v.packets.clear();
+}
+
 // the voice's current packet starts over, or the next one; false once the queue is empty
 bool NextPacket(Voice& v) {
     Packet& p = v.packets.front();
@@ -350,6 +381,7 @@ bool NextPacket(Voice& v) {
         if (p.loops != kLoopForever) p.loops--;
         v.frame = v.type == kTypeXma ? 0 : p.loop_start;
     } else {
+        if (v.done_callback) g_done.push_back({v.done_callback, v.done_context, p.context, kOk});
         v.packets.pop_front();
         v.frame = 0;
     }
@@ -420,7 +452,7 @@ void RenderSource(Voice& v, float* out) {
                 break;
             }
             if (++turns > kMaxTurns) {
-                v.packets.clear();
+                DropPackets(v, kOk, g_done);
                 break;
             }
             NextPacket(v);
@@ -493,6 +525,10 @@ void MixFrame(PPCContext& ctx, float* out) {
     {
         std::lock_guard lock(g_lock);
         for (Voice* v : g_order) {
+            if (v->ending && v->packets.empty()) {
+                v->started = false;
+                v->ending = false;
+            }
             if (!v->source || !v->started || v->packets.empty()) continue;
             Rendered r{v->handle, v->channels, v->effect, std::vector<float>(size_t(kFrame) * v->channels, 0.0f)};
             RenderSource(*v, r.samples.data());
@@ -519,7 +555,21 @@ void MixFrame(PPCContext& ctx, float* out) {
         for (float& x : buf) x *= v->volume;
         Route(*v, buf.data(), channels, master);
     }
+    if (g_master)
+        for (float& x : master) x *= g_master->volume;
     std::copy(master.begin(), master.end(), out);
+}
+
+void RunDone(PPCContext& ctx, const std::vector<Done>& done) {
+    if (done.empty()) return;
+    uint32_t info = mem::AllocSystem(kDoneInfoBytes);
+    for (const Done& d : done) {
+        W32(info, d.context);
+        W32(info + 4, d.packet);
+        W32(info + 8, d.status);
+        CallGuest(ctx, d.fn, {info});
+    }
+    mem::FreeSystem(info);
 }
 
 void RunCallbacks(PPCContext& ctx) {
@@ -554,6 +604,12 @@ void StartMixer() {
             }
             RunCallbacks(ctx);
             MixFrame(ctx, frame.data());
+            std::vector<Done> done;
+            {
+                std::lock_guard lock(g_lock);
+                done.swap(g_done);
+            }
+            RunDone(ctx, done);
             audio::Submit(frame.data(), kFrame);
         }
     });
@@ -588,6 +644,8 @@ uint32_t MakeVtable(const std::vector<Slot>& slots) {
 }
 
 void SetEffectStateMethod(PPCContext& ctx, uint8_t*);
+void GetFormatMethod(PPCContext& ctx, uint8_t*);
+void SubmitBufferMethod(PPCContext& ctx, uint8_t*);
 
 std::vector<Slot> VoiceSlots() {
     std::vector<Slot> s;
@@ -599,6 +657,7 @@ std::vector<Slot> VoiceSlots() {
 #endif
     // titles that inline it leave no wrapper to point at
     s.push_back({XDK_XAudioVoiceSlot_SetEffectState, dispatch::HostThunk(SetEffectStateMethod)});
+    s.push_back({XDK_XAudioVoiceSlot_GetFormat, dispatch::HostThunk(GetFormatMethod)});
 #ifdef SUB_XAudioVoice_SetEffectParam
     s.push_back({XDK_XAudioVoiceSlot_SetEffectParam, SYM(XAudioVoice_SetEffectParam)});
 #endif
@@ -624,6 +683,10 @@ std::vector<Slot> SourceSlots() {
     std::vector<Slot> s;
 #ifdef SUB_XAudioSourceVoice_SubmitPacket
     s.push_back({XDK_XAudioSourceSlot_SubmitPacket, SYM(XAudioSourceVoice_SubmitPacket)});
+#endif
+    s.push_back({XDK_XAudioSourceSlot_SubmitBuffer, dispatch::HostThunk(SubmitBufferMethod)});
+#ifdef SUB_XAudioSourceVoice_Discontinuity
+    s.push_back({XDK_XAudioSourceSlot_Discontinuity, SYM(XAudioSourceVoice_Discontinuity)});
 #endif
 #ifdef SUB_XAudioSourceVoice_GetPacketPosition
     s.push_back({XDK_XAudioSourceSlot_GetPacketPosition, SYM(XAudioSourceVoice_GetPacketPosition)});
@@ -665,6 +728,7 @@ uint32_t NewHandle() {
 void Remove(uint32_t handle) {
     Voice* v = Find(handle);
     if (!v) return;
+    if (v == g_master) g_master = nullptr;
     uint32_t h = v->handle;
     for (Voice* o : g_order)
         std::erase_if(o->outputs, [v](const Output& out) { return out.dest == v; });
@@ -693,6 +757,50 @@ uint64_t SetEffectState(const kernel::Args& a) {
 
 void SetEffectStateMethod(PPCContext& ctx, uint8_t*) { ctx.r[3] = SetEffectState(kernel::Args{ctx}); }
 
+// (voice, 8 bytes out): {u8 type, u8 channels, u16 0, u32 rate}
+void GetFormatMethod(PPCContext& ctx, uint8_t*) {
+    uint32_t out = uint32_t(ctx.r[4]);
+    ctx.r[3] = WithVoice(uint32_t(ctx.r[3]), [&](Voice& v) {
+        W8(out, v.type);
+        W8(out + 1, uint8_t(v.channels));
+        W16(out + 2, 0);
+        W32(out + 4, v.rate);
+        return kOk;
+    });
+}
+
+// (source part, {buffer, bytes, loops, loop start, loop end, ...}, flags)
+void SubmitBufferMethod(PPCContext& ctx, uint8_t*) {
+    uint32_t p = uint32_t(ctx.r[4]);
+    ctx.r[3] = WithVoice(uint32_t(ctx.r[3]), [&](Voice& v) {
+        Packet k;
+        k.buffer = Virtual(R32(p + kPacketBuffer));
+        k.bytes = R32(p + kPacketBytes);
+        k.loops = R32(p + kPacketLoops);
+        if (k.loops > kMaxLoops) k.loops = kLoopForever;
+        k.loop_start = R32(p + kPacketLoopStart);
+        k.loop_end = R32(p + kBufferLoopEnd);
+        k.context = R32(p + kBufferPacketContext);
+        if (!k.buffer || !k.bytes) return kInvalidArg;
+        v.packets.push_back(k);
+        return kOk;
+    });
+}
+
+// (voice, flags): one already playing stays as it is; a title without the deferred start call starts at once
+uint64_t Start(uint32_t handle, uint32_t flags) {
+#ifndef SUB_XAudioStartDeferredVoices
+    flags &= ~kStartDeferred;
+#endif
+    return WithVoice(handle, [&](Voice& v) {
+        v.ending = false;
+        if (v.started) return kOk;
+        v.pending = (flags & kStartDeferred) != 0;
+        v.started = !v.pending;
+        return kOk;
+    });
+}
+
 }  // namespace
 
 // Engine
@@ -709,6 +817,35 @@ HLE_FUNC(XAudioInitialize) {
 HLE_FUNC(XAudioShutDown) {
     std::lock_guard lock(g_lock);
     if (g_engine_refs) g_engine_refs--;
+    return kOk;
+}
+#endif
+
+#ifdef SUB_XAudioGetMasteringVoice
+// (voice out): a guest object for its methods, what reaches it is the master mix
+HLE_FUNC(XAudioGetMasteringVoice) {
+    std::lock_guard lock(g_lock);
+    if (!g_engine_refs) return kFail;
+    if (!g_master) {
+        auto v = std::make_unique<Voice>();
+        v->channels = kMasterChannels;
+        v->handle = NewHandle();
+        if (!v->handle) return kFail;
+        g_master = v.get();
+        g_voices[v->handle] = std::move(v);
+    }
+    W32(a[0], g_master->handle);
+    return kOk;
+}
+#endif
+
+#ifdef SUB_XAudioStartDeferredVoices
+HLE_FUNC(XAudioStartDeferredVoices) {
+    std::lock_guard lock(g_lock);
+    for (Voice* v : g_order) {
+        v->started = v->started || v->pending;
+        v->pending = false;
+    }
     return kOk;
 }
 #endif
@@ -776,6 +913,10 @@ HLE_FUNC(XAudioCreateSourceVoice) {
     if (!v->channels || v->channels > kMaxChannels || !v->rate) return kInvalidArg;
     v->outputs = DefaultOutputs(v->channels);
     ReadEffects(ctx, *v, R32(init + kSourceEffects));
+    if constexpr (kSourceDoneCallback != xdk::kUnknown && kSourceDoneContext != xdk::kUnknown) {
+        v->done_callback = R32(init + kSourceDoneCallback);
+        v->done_context = R32(init + kSourceDoneContext);
+    }
     std::lock_guard lock(g_lock);
     uint32_t h = NewHandle();
     if (!h) return kFail;
@@ -903,8 +1044,9 @@ HLE_FUNC(XAudioVoice_SetVoiceOutputVolume) {
 HLE_FUNC(XAudioVoice_GetVoiceState) {
     uint32_t out = a[1];
     return WithVoice(a[0], [&](Voice& v) {
-        bool running = v.started && !v.packets.empty();
-        W8(out, running ? kStatePlaying | kStateStarted : 0);
+        uint8_t state = v.pending ? kStateStarted : 0;
+        if (v.started && !v.packets.empty()) state = kStatePlaying | kStateStarted;
+        W8(out, state);
         return kOk;
     });
 }
@@ -938,15 +1080,28 @@ HLE_FUNC(XAudioVoice_SetVolume) {
 HLE_FUNC(XAudioVoice_Stop) {
     return WithVoice(a[0], [](Voice& v) {
         v.started = false;
+        v.pending = false;
+        v.ending = false;
         return kOk;
     });
 }
 #endif
 
 #ifdef SUB_XAudioSourceVoice_Start
-HLE_FUNC(XAudioSourceVoice_Start) {
+// (voice, flags)
+HLE_FUNC(XAudioSourceVoice_Start) { return Start(a[0], a[1]); }
+#endif
+
+#ifdef SUB_XAudioSourceVoice_StartInner
+// (voice, flags): the function Start wraps in its lock, called by titles that inline the wrapper
+HLE_FUNC(XAudioSourceVoice_StartInner) { return Start(a[0], a[1]); }
+#endif
+
+#ifdef SUB_XAudioSourceVoice_Discontinuity
+// no more packets follow: the voice stops when the queued ones are played
+HLE_FUNC(XAudioSourceVoice_Discontinuity) {
     return WithVoice(a[0], [](Voice& v) {
-        v.started = true;
+        v.ending = true;
         return kOk;
     });
 }
@@ -966,6 +1121,7 @@ HLE_FUNC(XAudioSourceVoice_SubmitPacket) {
         k.loop_start = R32(p + kPacketLoopStart) / align;
         uint32_t length = R32(p + kPacketLoopLength) / align;
         k.loop_end = length ? k.loop_start + length : 0;
+        if constexpr (kPacketContext != xdk::kUnknown) k.context = R32(p + kPacketContext);
         if (!k.buffer || !k.bytes) return kInvalidArg;
         v.packets.push_back(k);
         return kOk;
@@ -974,14 +1130,18 @@ HLE_FUNC(XAudioSourceVoice_SubmitPacket) {
 #endif
 
 #ifdef SUB_XAudioSourceVoice_FlushPackets
+// each packet's callback runs in the caller, as the console's does
 HLE_FUNC(XAudioSourceVoice_FlushPackets) {
-    return WithVoice(a[0], [](Voice& v) {
-        v.packets.clear();
+    std::vector<Done> done;
+    uint64_t hr = WithVoice(a[0], [&](Voice& v) {
+        DropPackets(v, kAborted, done);
         v.frame = 0;
         v.xma_packet = 0;
         v.pcm.clear();
         return kOk;
     });
+    RunDone(ctx, done);
+    return hr;
 }
 #endif
 

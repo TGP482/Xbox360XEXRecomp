@@ -159,7 +159,7 @@ XAM_EXPORT(0x280, XamGetExecutionId) {
 // 2.0.17559.0 as major, minor, build, qfe in 4, 4, 16, 8 bits
 XAM_EXPORT(0x282, XamGetSystemVersion) { return 0x20449700; }
 
-XAM_EXPORT(0x3CD, XGetLanguage) { return 1; }  // English
+XAM_EXPORT(0x3CD, XGetLanguage) { return app::BootLanguage(); }
 XAM_EXPORT(0x3CC, XGetGameRegion) { return 0xFF; }  // North America
 XAM_EXPORT(0x3CB, XGetAVPack) { return 1; }  // component, high definition
 

@@ -37,6 +37,28 @@ std::string PortName(const Port& p) {
     return name.empty() ? "none" : name;
 }
 
+// the Windows display language as a console one, English for one the console lacks
+uint32_t SystemLanguage() {
+    LANGID id = GetUserDefaultUILanguage();
+    switch (PRIMARYLANGID(id)) {
+        case LANG_JAPANESE: return kJapanese;
+        case LANG_GERMAN: return kGerman;
+        case LANG_FRENCH: return kFrench;
+        case LANG_SPANISH: return kSpanish;
+        case LANG_ITALIAN: return kItalian;
+        case LANG_KOREAN: return kKorean;
+        case LANG_PORTUGUESE: return kPortuguese;
+        case LANG_POLISH: return kPolish;
+        case LANG_RUSSIAN: return kRussian;
+        case LANG_CHINESE: {
+            WORD sub = SUBLANGID(id);
+            bool simplified = sub == SUBLANG_CHINESE_SIMPLIFIED || sub == SUBLANG_CHINESE_SINGAPORE;
+            return simplified ? kChineseSimplified : kChineseTraditional;
+        }
+        default: return kEnglish;
+    }
+}
+
 Port ParsePort(const std::string& name, Port fallback) {
     Port p;
     p.keyboard = name.find("keyboard") != std::string::npos;
@@ -101,6 +123,7 @@ void Load() {
     LoadPlayers(t, s);
     s.audio_output = std::min(t["audio_output"].value_or(s.audio_output), audio::kOutputMono);
     s.pause_on_focus_loss = t["pause_on_focus_loss"].value_or(s.pause_on_focus_loss);
+    s.language = std::min(t["language"].value_or(s.language), uint32_t(kRussian));
     for (const Option& o : kGame.options) {
         if (o.flag) *o.flag = t[o.key].value_or(*o.flag);
         else *o.value = t[o.key].value_or(*o.value);
@@ -129,7 +152,8 @@ toml::table Table() {
                   {"microphone", s.microphone},
                   {"push_to_talk", s.push_to_talk},
                   {"audio_output", int64_t(s.audio_output)},
-                  {"pause_on_focus_loss", s.pause_on_focus_loss}};
+                  {"pause_on_focus_loss", s.pause_on_focus_loss},
+                  {"language", int64_t(s.language)}};
     for (int i = 0; i < kPorts; i++) t.insert(PlayerKey(i), PortName(s.players[i]));
     for (const Option& o : kGame.options) {
         if (o.flag) t.insert(o.key, *o.flag);
@@ -210,6 +234,17 @@ Mode CachedOutput() {
 float RenderScale(uint32_t guest_height) {
     float h = CachedOutput().height * (Get().render_percent / 100.0f);
     return guest_height ? std::max(h / guest_height, 0.1f) : 1.0f;
+}
+
+uint32_t ResolveLanguage(uint32_t setting) {
+    uint32_t language = setting ? setting : SystemLanguage();
+    const std::vector<uint32_t>& shipped = kGame.languages;
+    return std::find(shipped.begin(), shipped.end(), language) != shipped.end() ? language : uint32_t(kEnglish);
+}
+
+uint32_t BootLanguage() {
+    static const uint32_t language = ResolveLanguage(Get().language);
+    return language;
 }
 
 }  // namespace app

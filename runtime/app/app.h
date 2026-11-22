@@ -16,6 +16,11 @@ namespace app {
 enum class DisplayMode : uint32_t { Fullscreen, Borderless, Windowed };
 inline constexpr uint32_t kFpsCapRefresh = 1;  // fps_cap: the monitor's refresh rate
 inline constexpr int kPorts = 4;
+// the console's language ids, as XGetLanguage returns them
+enum Language : uint32_t {
+    kEnglish = 1, kJapanese, kGerman, kFrench, kSpanish, kItalian, kKorean, kChineseTraditional, kPortuguese,
+    kChineseSimplified, kPolish, kRussian
+};
 
 // what a player's controller port has plugged in: the keyboard and mouse, a controller, or both
 struct Port {
@@ -37,6 +42,7 @@ struct Settings {
     uint32_t texture_dump_format = 0;  // 0 PNG, 1 DDS
     uint32_t audio_output = 0;         // audio::kOutputAuto, Stereo, Surround or Mono
     bool pause_on_focus_loss = true;   // the game and its sound stop while the window is in the background
+    uint32_t language = 0;             // 0 the Windows display language when the game has it, else a Language
     std::string join_ip;                   // system link: a host past the LAN the session search also asks
     std::string microphone;                // the headset's recording device by name, empty the system default
     bool push_to_talk = false;             // the headset records only while GameInfo::talk_key is held
@@ -55,6 +61,10 @@ struct Mode {
 Mode Desktop();
 Mode Output();
 float RenderScale(uint32_t guest_height);
+// the Language a language setting gives: one GameInfo::languages has, else English
+uint32_t ResolveLanguage(uint32_t setting);
+// the language setting as this run started, resolved: the console's language, which titles read at boot
+uint32_t BootLanguage();
 // the output is 3:2 or wider: the console reports a widescreen TV and the frame is shown 16:9, else 4:3 as on a 4:3 TV
 bool Widescreen();
 
@@ -128,6 +138,7 @@ struct GameInfo {
     void (*rumble)(int port, uint16_t& left, uint16_t& right);
     bool (*talk_key)();            // any thread: the game's push to talk key is held
     WindowColours compiler_colours{};
+    std::vector<uint32_t> languages;  // the Language ids the game ships, English alone when empty
 };
 extern const GameInfo kGame;
 

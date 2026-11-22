@@ -34,7 +34,7 @@ using Microsoft::WRL::ComPtr;
 constexpr uint64_t kCacheVersion = 2;
 constexpr uint64_t kCheckSeed = 0x5EC0D0C4EC4ull;  // the second source hash, so a key collision is a miss
 constexpr uint32_t kShaderMagic = 0x4C495844;      // 'DXIL'
-constexpr uint64_t kMaxShaderFile = 256ull << 20;
+constexpr uint64_t kMaxShaderFile = 2ull << 30;  // a bigger file is started over, a whole ReadFile stays under 4 GB
 
 // cache\shaders.bin: the header, then a Record and its DXIL per shader as it is compiled, by every process sharing
 // the folder; a cut off tail is dropped at the next start

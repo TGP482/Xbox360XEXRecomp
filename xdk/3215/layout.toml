@@ -33,11 +33,12 @@ Device_VertexShader = 0x3094
 Device_CommandBuffer = 0x3368
 # BeginVertices 825D1680 leaves its draw packet's end here, the title's inlined end moves the ring write to it
 Device_VerticesEnd = 0x3324
-# the command ring: write pointer, segment end, limit, base, segment size, segment start
+# the command ring: write pointer, segment end, limit, base, end (its last dword, 825D3DA8), segment size, segment start
 Device_RingWrite = 0x28
 Device_RingSegmentEnd = 0x2C
 Device_RingLimit = 0x30
 Device_RingBase = 0x34C0
+Device_RingEnd = 0x34C4
 Device_RingSegment = 0x34C8
 Device_RingSegmentStart = 0x34D8
 # vertical blank (interrupt handler 825D3BA0): callback, count, count at the swap wait's end, swap wait, swaps

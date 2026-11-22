@@ -150,6 +150,9 @@ constexpr bool AllKnown(const LayoutKey (&keys)[N]) {
 #ifndef XDK_Device_RingBase
 #define XDK_Device_RingBase 0xFFFFFFFFu
 #endif
+#ifndef XDK_Device_RingEnd
+#define XDK_Device_RingEnd 0xFFFFFFFFu
+#endif
 #ifndef XDK_Device_RingSegment
 #define XDK_Device_RingSegment 0xFFFFFFFFu
 #endif

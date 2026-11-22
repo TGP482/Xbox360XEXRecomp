@@ -73,11 +73,12 @@ constexpr bool kShaderObjects = kPsContainer != xdk::kUnknown && kPsCode != xdk:
 constexpr uint32_t kDevBanks[] = {XDK_Device_Reg2000, XDK_Device_Reg2080, XDK_Device_Reg2100, XDK_Device_Reg2180,
                                   XDK_Device_Reg2200, XDK_Device_Reg2280, XDK_Device_Reg2300, XDK_Device_Reg2380};
 constexpr uint32_t kLastBankRegs = 8;
-// the command ring: write pointer, segment end, limit, base, segment size, segment start
+// the command ring: write pointer, segment end, limit, base, end, segment size, segment start
 constexpr uint32_t kDevRingWrite = XDK_Device_RingWrite;
 constexpr uint32_t kDevRingSegmentEnd = XDK_Device_RingSegmentEnd;
 constexpr uint32_t kDevRingLimit = XDK_Device_RingLimit;
 constexpr uint32_t kDevRingBase = XDK_Device_RingBase;
+constexpr uint32_t kDevRingEnd = XDK_Device_RingEnd;
 constexpr uint32_t kDevRingSegment = XDK_Device_RingSegment;
 constexpr uint32_t kDevRingSegmentStart = XDK_Device_RingSegmentStart;
 constexpr uint32_t kRingReserve = 0xA0;  // bytes the library keeps free at a segment's end
@@ -158,6 +159,10 @@ void RequireLayout() {
 #endif
 #ifdef SUB_D3DDevice_GpuLoadShaderConstantF4
     XDK_REQUIRE("d3d9", XDK_KEY(Device_ConstantsDirty));
+#endif
+#ifdef SUB_D3DDevice_QueryBufferSpace
+    XDK_REQUIRE("d3d9", XDK_KEY(Device_TilingFlags), XDK_KEY(Device_TilingOn), XDK_KEY(Device_RingBase),
+                XDK_KEY(Device_RingEnd));
 #endif
 }
 
@@ -1121,6 +1126,22 @@ HLE_FUNC(D3DDevice_EndTiling) {
     CallGuest(ctx, SYM(D3DDevice_SetPredication), {dev, 0});
     CallGuest(ctx, SYM(D3DDevice_SetViewport), {dev, WholeViewport()});
     return 0;
+}
+#endif
+
+#ifdef SUB_D3DDevice_QueryBufferSpace
+PPC_EXTERN_FUNC(GUEST_ORIG(D3DDevice_QueryBufferSpace));
+
+// (device, used out, remaining out): while tiling the console counts the ring the GPU has yet to read, and titles skip
+// draws when that is short (Saints Row's sky under 64 KB); nothing reads the host's ring, so all of it is free
+PPC_FUNC(GUEST(D3DDevice_QueryBufferSpace)) {
+    uint32_t dev = uint32_t(ctx.r[3]);
+    if (!(R8(dev + kDevTilingFlags) & kTilingOn)) {
+        GUEST_ORIG(D3DDevice_QueryBufferSpace)(ctx, base);
+        return;
+    }
+    W32(uint32_t(ctx.r[4]), 0);
+    W32(uint32_t(ctx.r[5]), R32(dev + kDevRingEnd) - R32(dev + kDevRingBase));
 }
 #endif
 

@@ -133,6 +133,7 @@ XAM_EXPORT(0x1F4, XMsgInProcessCall) {
 XAM_EXPORT(0x1F7, XMsgStartIORequest) {
     uint32_t result = kErrorSuccess;
     if (StatsMessage(a[1], a[3], result)) return Complete(a[2], result);
+    if (AchievementsMessage(a[1], a[3], result)) return Complete(a[2], result);
     ReportMessage(a[0], a[1]);
     if (a[3]) std::memset(HostPtr(a[3]), 0, a[4]);
     return Complete(a[2], kErrorSuccess);

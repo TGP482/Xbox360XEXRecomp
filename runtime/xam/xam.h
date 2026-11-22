@@ -65,4 +65,23 @@ bool StatsMessage(uint32_t message, uint32_t args, uint32_t& result);
 // the file the signed in player's stats are kept in, empty for stats.bin beside the profile; read on next use
 void UseStatsFile(const std::string& path);
 
+// the title's SPA achievements, unlocked when it writes them
+struct Achievement {
+    uint16_t id = 0;
+    uint16_t gamerscore = 0;
+    uint32_t image = 0;  // the SPA picture's id
+    std::string name;
+    std::string description;
+    std::string locked_description;
+    uint64_t unlocked = 0;  // seconds since 1970, 0 while locked
+};
+// the XUserWriteAchievements message of XMsgStartIORequest, false for any other message
+bool AchievementsMessage(uint32_t message, uint32_t args, uint32_t& result);
+std::vector<Achievement> Achievements();  // the SPA's order
+std::vector<uint8_t> AchievementImage(uint32_t image);  // the PNG, empty if the SPA has none
+std::vector<uint16_t> TakeUnlocked();  // ids unlocked since the last call
+void ResetAchievements();
+// the file the signed in player's achievements are kept in, empty for achievements.bin beside the profile
+void UseAchievementsFile(const std::string& path);
+
 }  // namespace xam

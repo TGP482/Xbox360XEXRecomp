@@ -48,7 +48,7 @@ XAM_EXPORT(0x213, XamUserAreUsersFriends) {
     return Complete(a[4], kErrorSuccess);
 }
 
-// achievements: none
+// lists none: achievements.cpp keeps them for the game's own UI
 // (title, user, XUID, flags, offset, count, buffer size out, handle out)
 XAM_EXPORT(0x2EE, XamUserCreateAchievementEnumerator) {
     constexpr uint32_t kAchievementDetails = 0x1C;

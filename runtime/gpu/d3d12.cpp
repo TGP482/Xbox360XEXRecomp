@@ -863,7 +863,7 @@ bool D3D12Backend::Init(uint32_t width, uint32_t height) {
 }
 
 bool D3D12Backend::CreateDevice() {
-    if (GetEnvironmentVariableW(L"XEX_D3D12_DEBUG", nullptr, 0)) {
+    if (diag::kDebug && GetEnvironmentVariableW(L"XEX_D3D12_DEBUG", nullptr, 0)) {
         ComPtr<ID3D12Debug> dbg;
         if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg)))) dbg->EnableDebugLayer();
     }

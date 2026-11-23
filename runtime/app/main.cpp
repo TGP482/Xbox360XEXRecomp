@@ -19,6 +19,7 @@
 #include <backends/imgui_impl_win32.h>
 
 #include "app/app.h"
+#include "core/diag.h"
 #include "core/input.h"
 #include "core/log.h"
 #include "gpu/backend.h"
@@ -127,7 +128,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (intptr_t result = 0; kGame.message && kGame.message(hwnd, msg, wp, lp, &result)) return result;
     switch (msg) {
         case WM_KEYDOWN:
-            if (wp == VK_F3) {
+            if (diag::kDebug && wp == VK_F3) {
                 DumpThreads();
                 WriteCrashDump(nullptr);  // host stacks too, for hangs
             }

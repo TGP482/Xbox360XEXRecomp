@@ -2,12 +2,19 @@
 #include <cstdlib>
 #include <filesystem>
 
-// diagnostics switched on by environment variables, read once
+// diagnostics switched on by environment variables, read once; debug builds only
 namespace diag {
+
+// F3, the switches below and a title's own debug features
+#ifdef NDEBUG
+inline constexpr bool kDebug = false;
+#else
+inline constexpr bool kDebug = true;
+#endif
 
 // XEX_PERF set: perf log lines once a second and the read-backs named
 inline bool Perf() {
-    static const bool on = std::getenv("XEX_PERF") != nullptr;
+    static const bool on = kDebug && std::getenv("XEX_PERF") != nullptr;
     return on;
 }
 

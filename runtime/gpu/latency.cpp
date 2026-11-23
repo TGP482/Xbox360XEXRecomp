@@ -36,7 +36,6 @@ constexpr double kSmoothing = 0.1;   // a frame's weight in the running averages
 constexpr double kEarly = 0.1;       // share of a GPU frame the next lands early by, so the GPU never idles
 constexpr Ms kMaxWait{50.0};
 constexpr Ms kStaleStart{100.0};     // no frame followed it, as on a loading screen
-constexpr Ms kReportEvery{10000.0};
 
 struct Frame {
     uint64_t value = 0;
@@ -58,9 +57,6 @@ struct Tracker {
     std::deque<Clock::time_point> starts;  // simulations whose frame has not gone yet
     double gpu_ms = 0.0;
     double cpu_ms = 0.0;  // simulation start to last commands
-    double waited_ms = 0.0;
-    uint64_t waits = 0;
-    Clock::time_point reported;
 };
 
 Tracker g;
@@ -115,17 +111,6 @@ void SleepUntil(Clock::time_point wake) {
     while (Clock::now() < wake) std::this_thread::yield();
 }
 
-void Report(Clock::time_point now) {
-    if (now - g.reported < kReportEvery) return;
-    if (g.waits) {
-        LOGR("anti latency: GPU %.2f ms a frame, simulation to GPU %.2f ms, waited %.2f ms a frame", g.gpu_ms,
-             g.cpu_ms, g.waited_ms / double(g.waits));
-    }
-    g.reported = now;
-    g.waited_ms = 0.0;
-    g.waits = 0;
-}
-
 }  // namespace
 
 void Enable(bool on) {
@@ -136,7 +121,6 @@ void Enable(bool on) {
     g.executed = false;
     g.gpu_ms = 0.0;
     g.cpu_ms = 0.0;
-    g.reported = Clock::now();
 }
 
 void Executed() {
@@ -182,9 +166,6 @@ void SimulationStart() {
     now = Clock::now();
     lock.lock();
     g.starts.push_back(now);
-    g.waited_ms += Ms(now - entered).count();
-    g.waits++;
-    Report(now);
 }
 
 }  // namespace gpu::latency

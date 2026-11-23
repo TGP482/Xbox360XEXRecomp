@@ -10,7 +10,6 @@
 
 #include "app/app.h"
 #include "audio/xaudio2.h"
-#include "core/log.h"
 #include "kernel/kernel.h"
 #include "xam/xam.h"
 
@@ -32,13 +31,11 @@ bool ShouldPause() {
 
 void WaitWhileUnfocused() {
     if (!ShouldPause()) return;
-    LOGR("focus lost: paused");
     audio::SetPaused(true);
     kernel::HoldGuestTime(true);
     while (ShouldPause()) Sleep(kPollMs);
     kernel::HoldGuestTime(false);
     audio::SetPaused(false);
-    LOGR("focus back: resumed");
 }
 
 }  // namespace app

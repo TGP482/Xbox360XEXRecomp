@@ -916,7 +916,6 @@ int Choose(const wchar_t* heading, const std::vector<std::wstring>& choices) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
-    LOGR("Launch choice: %d", g_page.picked);
     return g_page.picked;
 }
 

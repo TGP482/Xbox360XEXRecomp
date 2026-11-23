@@ -69,7 +69,6 @@ private:
     std::map<uint32_t, Sync> label_out_;  // the same, gathered in this pass
     std::string body_;
     std::set<uint32_t> jumps_;  // calls to the CRT's setjmp, each with a host buffer
-    int ret_hook_ = 0;
     bool unknown_calls_ = false;
     std::vector<uint32_t> callees_;
     uint32_t callee_ = 0;         // the direct call on the line being emitted, stored and reloaded by its summary

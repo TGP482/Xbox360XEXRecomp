@@ -3,6 +3,7 @@
 // UP DOWN LEFT RIGHT START BACK A B X Y LB RB LT RT LS RS LSU LSD LSL LSR (left stick up, down, left, right)
 // cmd in the run folder: "buttons [frames held]" pressed once from the frame it is read, then removed
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 

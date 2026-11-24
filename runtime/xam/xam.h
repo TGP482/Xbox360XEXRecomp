@@ -59,7 +59,8 @@ bool InNetSession();
 
 // a content type's packages kept in a host folder of the game's, for every user
 void MountContent(uint32_t type, const std::string& host);
-// those of its new packages whose file name starts with prefix kept in another; both are listed and opened
+// those of its new packages whose file name starts with prefix kept in another; both are listed and opened;
+// set again, that prefix moves to the new host
 void SplitContent(uint32_t type, const std::string& prefix, const std::string& host);
 
 // the stats messages of XMsgStartIORequest, false for any other message

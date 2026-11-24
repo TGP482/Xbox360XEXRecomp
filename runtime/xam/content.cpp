@@ -98,7 +98,7 @@ struct Split {
     std::string prefix;
     fs::path host;
 };
-std::vector<Split> g_splits;  // set before the title runs
+std::vector<Split> g_splits;  // set again to move a split, e.g. with the signed in player
 
 // the host folders a user's packages of a type are in: the type's own, then its split ones
 std::vector<fs::path> TypeHosts(uint32_t user, uint32_t type) {
@@ -280,7 +280,10 @@ void MountContent(uint32_t type, const std::string& host) {
 void SplitContent(uint32_t type, const std::string& prefix, const std::string& host) {
     std::error_code ec;
     fs::create_directories(host, ec);
-    kernel::g_splits.push_back({type, prefix, host});
+    auto same = [&](const kernel::Split& s) { return s.type == type && s.prefix == prefix; };
+    auto it = std::find_if(kernel::g_splits.begin(), kernel::g_splits.end(), same);
+    if (it != kernel::g_splits.end()) it->host = host;
+    else kernel::g_splits.push_back({type, prefix, host});
     LOGR("files: content %X starting %s is kept in %s", type, prefix.c_str(), host.c_str());
 }
 

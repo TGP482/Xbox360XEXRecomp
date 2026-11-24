@@ -6,8 +6,6 @@ For original Xbox games, see [Xbox XBE Recomp](https://github.com/TGP482/XboxXBE
 
 This tool was originally created for porting [Far Cry Instincts: Predator](https://github.com/TGP482/FCIP-CarverRecomp).
 
-For original Xbox games, see [Xbox XBE Recomp](https://github.com/TGP482/XboxXBE-Recomp).
-
 > [!NOTE]
 > This project does not include any game assets. You must provide the files from your own legally acquired copy of the game to install or build.
 

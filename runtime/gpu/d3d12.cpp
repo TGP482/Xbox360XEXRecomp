@@ -761,6 +761,7 @@ private:
     void ReadBackResolve(CpuRead& read, Resolved& from);
     void LandCpuReads();
     Resolved& EnsureResolved(uint64_t key, DXGI_FORMAT format, uint32_t w, uint32_t h, uint32_t faces = 1);
+    void DropSpare(std::unordered_multimap<uint64_t, Resolved>::iterator it);
     void DropResolved(uint32_t base);
     void CopyResolved(Resolved& from, Resolved& to, const Rect& src, const Rect& dst);
 
@@ -823,6 +824,7 @@ private:
     std::function<void(size_t)> hash_job_ = [this](size_t i) { TakeHash(*hash_ahead_[i]); };
     WorkPool pool_;  // after what its jobs use, so it stops first
     std::unordered_map<uint64_t, Resolved> resolved_;  // by ResolvedKey
+    std::unordered_multimap<uint64_t, Resolved> spare_resolved_;  // earlier formats or sizes of a key
     std::unordered_map<uint32_t, CpuRead> cpu_reads_;  // by address
     std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> pass_pipelines_;
     std::vector<std::unique_ptr<Shader>> shaders_;
@@ -2771,14 +2773,32 @@ void D3D12Backend::Resolve(const State& s, const ResolveArgs& r) {
     }
 }
 
-// the host texture read in place of guest memory, made again when the format or size changes
+bool Fits(const Resolved& r, DXGI_FORMAT format, uint32_t w, uint32_t h, uint32_t faces, float scale) {
+    return r.res && r.format == format && r.width == w && r.height == h && r.faces == faces && r.scale == scale;
+}
+
+// the host texture read in place of guest memory; an address taking turns between formats or sizes (a depth and a
+// colour resolve to one address each frame) keeps its other textures instead of making them every time
 Resolved& D3D12Backend::EnsureResolved(uint64_t key, DXGI_FORMAT format, uint32_t w, uint32_t h, uint32_t faces) {
+    constexpr size_t kSpares = 2;
     Resolved& dst = resolved_[key];
-    bool same = dst.format == format && dst.width == w && dst.height == h && dst.faces == faces;
-    if (dst.res && same && dst.scale == scale_) return dst;
+    if (Fits(dst, format, w, h, faces, scale_)) return dst;
+    for (auto it = spare_resolved_.find(key); it != spare_resolved_.end() && it->first == key;) {
+        auto next = std::next(it);
+        if (it->second.scale != scale_) {
+            DropSpare(it);
+        } else if (Fits(it->second, format, w, h, faces, scale_)) {
+            std::swap(dst, it->second);
+            return dst;
+        }
+        it = next;
+    }
     if (dst.res) {
-        Release(dst.res);
-    } else if (!free_rtv_.empty()) {
+        if (spare_resolved_.count(key) == kSpares) DropSpare(spare_resolved_.find(key));
+        spare_resolved_.emplace(key, std::move(dst));
+        dst = {};
+    }
+    if (!free_rtv_.empty()) {
         dst.view = free_rtv_.back();
         free_rtv_.pop_back();
     }
@@ -2798,6 +2818,12 @@ Resolved& D3D12Backend::EnsureResolved(uint64_t key, DXGI_FORMAT format, uint32_
     return dst;
 }
 
+void D3D12Backend::DropSpare(std::unordered_multimap<uint64_t, Resolved>::iterator it) {
+    Release(it->second.res);
+    free_rtv_.push_back(it->second.view);
+    spare_resolved_.erase(it);
+}
+
 // guest memory at base is read again
 void D3D12Backend::DropResolved(uint32_t base) {
     std::erase_if(resolved_, [&](auto& entry) {
@@ -2809,6 +2835,11 @@ void D3D12Backend::DropResolved(uint32_t base) {
         }
         return true;
     });
+    for (auto it = spare_resolved_.begin(); it != spare_resolved_.end();) {
+        auto next = std::next(it);
+        if (uint32_t(it->first) == base) DropSpare(it);
+        it = next;
+    }
     // a kept table may show the resolve
     Unbind();
 }

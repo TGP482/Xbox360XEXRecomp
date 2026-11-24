@@ -60,7 +60,9 @@ namespace {
 using Microsoft::WRL::ComPtr;
 
 constexpr int kFrames = 3;  // frames in flight, one more queued than the GPU runs
-constexpr uint64_t kUploadSize = 96ull << 20;  // per frame
+constexpr uint64_t kUploadSize = 96ull << 20;  // per frame, more chunks while a frame needs them
+constexpr uint64_t kDrawUploads = 16ull << 20;  // a draw's indices, vertices and constants, at most
+constexpr uint64_t kTexelChunk = 32ull << 20;  // texture data per frame, more chunks while a burst lasts
 constexpr uint32_t kViewsPerFrame = 1u << 18;
 constexpr uint32_t kSamplerCount = 2048;
 constexpr uint32_t kRtvCount = 1024;
@@ -298,11 +300,22 @@ struct BuiltPipeline {
 };
 
 
+struct UploadChunk {
+    ComPtr<ID3D12Resource> res;
+    uint8_t* map = nullptr;
+    uint64_t size = 0;
+    uint64_t used = 0;
+};
+
+struct UploadChunks {
+    std::vector<UploadChunk> list;
+    size_t at = 0;  // the chunk in use
+};
+
 struct Frame {
     ComPtr<ID3D12CommandAllocator> alloc;
-    ComPtr<ID3D12Resource> upload;
-    uint8_t* map = nullptr;
-    uint64_t used = 0;
+    UploadChunks ring;
+    UploadChunks texels;  // apart from the ring, as a draw's vertex view covers one ring chunk
     uint32_t views = 0;
     uint64_t fence = 0;
     std::vector<ComPtr<ID3D12Resource>> garbage;
@@ -320,6 +333,53 @@ struct Alloc {
     uint8_t* cpu;
     D3D12_GPU_VIRTUAL_ADDRESS gpu;
 };
+
+UploadChunk MakeChunk(ID3D12Device* dev, uint64_t size) {
+    UploadChunk c;
+    c.size = size;
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_UPLOAD};
+    D3D12_RESOURCE_DESC bd = BufferDesc(size);
+    dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                 IID_PPV_ARGS(&c.res));
+    c.res->Map(0, nullptr, reinterpret_cast<void**>(&c.map));
+    return c;
+}
+
+// where size bytes fit in the chunk in use, moving on to the next chunk or a new one
+uint64_t Room(ID3D12Device* dev, UploadChunks& chunks, uint64_t size, uint64_t align, uint64_t chunk_size) {
+    for (; chunks.at < chunks.list.size(); chunks.at++) {
+        const UploadChunk& c = chunks.list[chunks.at];
+        uint64_t o = (c.used + align - 1) & ~(align - 1);
+        if (o + size <= c.size) return o;
+    }
+    chunks.list.push_back(MakeChunk(dev, std::max(size, chunk_size)));
+    return 0;
+}
+
+Alloc Take(UploadChunks& chunks, uint64_t offset, uint64_t size) {
+    UploadChunk& c = chunks.list[chunks.at];
+    c.used = offset + size;
+    return {c.res.Get(), offset, c.map + offset, c.res->GetGPUVirtualAddress() + offset};
+}
+
+// once the frame's GPU work is done; chunks it did not reach last time go
+void Recycle(UploadChunks& chunks) {
+    if (chunks.list.empty()) return;
+    chunks.list.resize(chunks.at + 1);
+    for (UploadChunk& c : chunks.list) c.used = 0;
+    chunks.at = 0;
+}
+
+// the vertex bytes: a whole ring chunk, raw
+D3D12_SHADER_RESOURCE_VIEW_DESC RawView(const UploadChunk& c) {
+    D3D12_SHADER_RESOURCE_VIEW_DESC raw{};
+    raw.Format = DXGI_FORMAT_R32_TYPELESS;
+    raw.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    raw.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    raw.Buffer.NumElements = UINT(c.size / 4);
+    raw.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+    return raw;
+}
 
 // Fenced draws read guest memory the title leaves alone until a fence past them passes, so what a fenced draw
 // uploaded is used again by later ones until a fence passes or the upload ring starts over (an epoch)
@@ -609,7 +669,9 @@ private:
     void Begin();
     void Submit(bool wait);
     void WaitFence(uint64_t value);
+    uint64_t RingRoom(uint64_t size, uint64_t align);
     Alloc Upload(uint64_t size, uint64_t align);
+    Alloc UploadTexels(uint64_t size);
     D3D12_GPU_VIRTUAL_ADDRESS UploadConstants(const void* data, uint32_t size);
     uint32_t AllocViews(uint32_t n);
     D3D12_CPU_DESCRIPTOR_HANDLE ViewCpu(uint32_t i) const;
@@ -818,6 +880,7 @@ private:
     std::vector<KeptVertices> kept_vertices_ = std::vector<KeptVertices>(kKeptUploads);
     std::vector<KeptIndices> kept_indices_ = std::vector<KeptIndices>(kKeptUploads);
     uint64_t upload_epoch_ = 1;
+    ID3D12Resource* vertex_chunk_ = nullptr;  // the ring chunk the bound vertex view covers
     uint64_t draw_fences_ = 0;  // DrawArgs::fences of the last draw
 
     ComPtr<ID3D12QueryHeap> query_heap_;
@@ -996,23 +1059,12 @@ bool D3D12Backend::CreateRootSignature() {
 }
 
 void D3D12Backend::CreateFrames() {
-    D3D12_HEAP_PROPERTIES upload{D3D12_HEAP_TYPE_UPLOAD};
-    for (Frame& f : frames_) {
-        dev_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&f.alloc));
-        D3D12_RESOURCE_DESC bd = BufferDesc(kUploadSize);
-        dev_->CreateCommittedResource(&upload, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                                      IID_PPV_ARGS(&f.upload));
-        f.upload->Map(0, nullptr, reinterpret_cast<void**>(&f.map));
-    }
-    // the vertex bytes: the whole upload ring, raw
-    D3D12_SHADER_RESOURCE_VIEW_DESC raw{};
-    raw.Format = DXGI_FORMAT_R32_TYPELESS;
-    raw.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-    raw.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    raw.Buffer.NumElements = UINT(kUploadSize / 4);
-    raw.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
     for (int i = 0; i < kFrames; i++) {
-        dev_->CreateShaderResourceView(frames_[i].upload.Get(), &raw, CopyView(kPsTextures + i));
+        Frame& f = frames_[i];
+        dev_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&f.alloc));
+        f.ring.list.push_back(MakeChunk(dev_.Get(), kUploadSize));
+        D3D12_SHADER_RESOURCE_VIEW_DESC raw = RawView(f.ring.list[0]);
+        dev_->CreateShaderResourceView(f.ring.list[0].res.Get(), &raw, CopyView(kPsTextures + i));
     }
     dev_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_));
     event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -1133,7 +1185,8 @@ void D3D12Backend::Submit(bool wait) {
     WaitFence(fence_value_);
     f.alloc->Reset();
     f.garbage.clear();
-    f.used = 0;
+    Recycle(f.ring);
+    Recycle(f.texels);
     upload_epoch_++;
     f.views = 0;
     cl_->Reset(f.alloc.Get(), nullptr);
@@ -1146,25 +1199,27 @@ void D3D12Backend::WaitFence(uint64_t value) {
     WaitForSingleObject(event_, INFINITE);
 }
 
+// where size bytes fit in the ring; a new chunk gets new vertex views and kept uploads
+uint64_t D3D12Backend::RingRoom(uint64_t size, uint64_t align) {
+    UploadChunks& ring = CurrentFrame().ring;
+    size_t at = ring.at;
+    uint64_t o = Room(dev_.Get(), ring, size, align, kUploadSize);
+    if (ring.at == at) return o;
+    upload_epoch_++;
+    Unbind();
+    return o;
+}
+
 Alloc D3D12Backend::Upload(uint64_t size, uint64_t align) {
-    Frame& f = CurrentFrame();
-    uint64_t o = (f.used + align - 1) & ~(align - 1);
-    if (o + size <= kUploadSize) {
-        f.used = o + size;
-        return {f.upload.Get(), o, f.map + o, f.upload->GetGPUVirtualAddress() + o};
-    }
-    // too big for the ring: a buffer of its own, released with the frame
-    static bool logged = false;
-    if (!std::exchange(logged, true)) LOGR("D3D12: upload ring full, %llu bytes on their own", static_cast<unsigned long long>(size));
-    ComPtr<ID3D12Resource> r;
-    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_UPLOAD};
-    D3D12_RESOURCE_DESC bd = BufferDesc(size);
-    dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                                  IID_PPV_ARGS(&r));
-    uint8_t* p = nullptr;
-    r->Map(0, nullptr, reinterpret_cast<void**>(&p));
-    f.garbage.push_back(r);
-    return {r.Get(), 0, p, r->GetGPUVirtualAddress()};
+    uint64_t o = RingRoom(size, align);
+    return Take(CurrentFrame().ring, o, size);
+}
+
+Alloc D3D12Backend::UploadTexels(uint64_t size) {
+    constexpr uint64_t kAlign = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+    UploadChunks& texels = CurrentFrame().texels;
+    uint64_t o = Room(dev_.Get(), texels, size, kAlign, kTexelChunk);
+    return Take(texels, o, size);
 }
 
 D3D12_GPU_VIRTUAL_ADDRESS D3D12Backend::UploadConstants(const void* data, uint32_t size) {
@@ -1865,7 +1920,7 @@ void D3D12Backend::UploadTexture(Texture& tex, const xenos::TextureFetch& t) {
             UINT64 row_size;
             UINT64 total;
             dev_->GetCopyableFootprints(&desc, sub, 1, 0, &fp, &row_count, &row_size, &total);
-            Alloc a = Upload(total, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+            Alloc a = UploadTexels(total);
             g_perf.tex_bytes += total;
             uint32_t planes = volume ? fp.Footprint.Depth : 1;
             const uint8_t* memory = Guest(0);
@@ -1893,7 +1948,7 @@ void D3D12Backend::UploadRows(ID3D12Resource* res, uint32_t sub, const std::vect
     UINT64 row_size;
     UINT64 total;
     dev_->GetCopyableFootprints(&desc, sub, 1, 0, &fp, &row_count, &row_size, &total);
-    Alloc a = Upload(total, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+    Alloc a = UploadTexels(total);
     CopyRows(rows, pitch, fp, row_count, row_size, 0, a.cpu);
     fp.Offset = a.offset;
     D3D12_TEXTURE_COPY_LOCATION dst{res, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
@@ -2385,7 +2440,6 @@ D3D12_GPU_VIRTUAL_ADDRESS D3D12Backend::UploadStreams(const DrawArgs& a, const S
     fetch.assign(std::max<size_t>(vs.fetches.size(), 1), {});
     auto& copied = stream_copies_;  // stream and stride to ring offset of vertex 0
     copied.clear();
-    Frame& f = CurrentFrame();
     for (size_t k = 0; k < vs.fetches.size(); k++) {
         const StreamFetch& sf = a.streams[k];
         VertexFetchConstant c = sf.fetch;
@@ -2404,9 +2458,9 @@ D3D12_GPU_VIRTUAL_ADDRESS D3D12Backend::UploadStreams(const DrawArgs& a, const S
             bool same = kept.epoch == upload_epoch_ && kept.data == sf.data && kept.first == first && kept.end == end;
             if (!a.fenced || !same) {
                 Alloc v = Upload(std::max<uint64_t>(bytes, 16), 16);
-                if (v.res != f.upload.Get()) {
+                if (v.res != vertex_chunk_) {
                     static bool logged = false;
-                    if (!std::exchange(logged, true)) LOGR("D3D12: vertex data past the upload ring reads as zero");
+                    if (!std::exchange(logged, true)) LOGR("D3D12: vertex data past its upload chunk reads as zero");
                 } else if (a.fenced) {
                     kept = {sf.data, first, end, upload_epoch_, v.offset};
                 }
@@ -2506,8 +2560,16 @@ void D3D12Backend::BindViews(const State& s, const ShaderInfo& vs, const ShaderI
     D3D12_GPU_DESCRIPTOR_HANDLE ps_samplers;
     uint32_t vs_views = BindTextures(s, vs, ShaderStage::Vertex, 1, kVsTextures, vs_samplers);
     uint32_t ps_views = BindTextures(s, ps, ShaderStage::Pixel, 0, kPsTextures, ps_samplers);
-    uint32_t raw = kPsTextures + uint32_t(frame_ % kFrames);
-    dev_->CopyDescriptorsSimple(1, ViewCpu(vs_views), CopyView(raw), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const UploadChunks& ring = CurrentFrame().ring;
+    const UploadChunk& chunk = ring.list[ring.at];
+    vertex_chunk_ = chunk.res.Get();
+    if (ring.at == 0) {
+        uint32_t raw = kPsTextures + uint32_t(frame_ % kFrames);
+        dev_->CopyDescriptorsSimple(1, ViewCpu(vs_views), CopyView(raw), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    } else {
+        D3D12_SHADER_RESOURCE_VIEW_DESC raw = RawView(chunk);
+        dev_->CreateShaderResourceView(vertex_chunk_, &raw, ViewCpu(vs_views));
+    }
     if (Latch(binds_.roots[kRootVsViews], ViewGuest(vs_views).ptr)) {
         cl_->SetGraphicsRootDescriptorTable(kRootVsViews, ViewGuest(vs_views));
     }
@@ -2559,6 +2621,8 @@ void D3D12Backend::Draw(const State& s, const DrawArgs& a) {
     if (!vs || (s.ps && !ps) || (!vs->info.fetches.empty() && !a.streams)) return;
     static const ShaderInfo kNoPixelShader;
     const ShaderInfo& ps_info = ps ? ps->info : kNoPixelShader;
+    // the draw's vertices land in the chunk its vertex view covers
+    RingRoom(kDrawUploads, 16);
     BindViews(s, vs->info, ps_info);
 
     PipelineKey k;
@@ -3026,7 +3090,7 @@ void D3D12Backend::Present(const uint32_t front[6]) {
     ShowFrame(t);
     latency::Submitted(fence_.Get(), CurrentFrame().fence);
 
-    g_perf.upload_bytes += CurrentFrame().used;
+    for (const UploadChunk& c : CurrentFrame().ring.list) g_perf.upload_bytes += c.used;
     presents_++;
     frame_++;
     HashAhead();
@@ -3036,7 +3100,8 @@ void D3D12Backend::Present(const uint32_t front[6]) {
     LandCpuReads();
     next.alloc->Reset();
     next.garbage.clear();
-    next.used = 0;
+    Recycle(next.ring);
+    Recycle(next.texels);
     if (texturedumper::Update()) ReleasePackTextures();
     upload_epoch_++;
     next.views = 0;

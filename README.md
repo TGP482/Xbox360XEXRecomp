@@ -79,5 +79,5 @@ A new XDK build needs `xdk/<build>/layout.toml` and signatures made from titles 
 
 ## Credits
 
+- [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) for the overridable function layout and instruction hooks this follows.
 - [toml++](https://github.com/marzer/tomlplusplus) for the configs, [Dear ImGui](https://github.com/ocornut/imgui) for the settings overlay, [SDL](https://github.com/libsdl-org/SDL) for the window, input and controllers and [FFmpeg](https://ffmpeg.org)'s libavcodec for decoding XMA.
-- The public a2xx documentation of [Mesa](https://gitlab.freedesktop.org/mesa/mesa)'s freedreno driver as a reference for the Xenos GPU's instruction formats. This project does not use emulation or any emulator code.

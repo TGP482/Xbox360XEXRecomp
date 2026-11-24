@@ -114,12 +114,8 @@ void Save() {
     std::fclose(f);
 }
 
-// the bytes a setting takes after the settings array
-uint32_t ExtraSize(uint32_t id) {
-    if (!Pointed(id)) return 0;
-    auto it = g_settings.find(id);
-    return it != g_settings.end() ? uint32_t(it->second.size()) : 0;
-}
+// the bytes a setting takes after the settings array: its largest size, stored value or not, as titles check it
+uint32_t ExtraSize(uint32_t id) { return Pointed(id) ? MaxSize(id) : 0; }
 
 void PutSetting(uint32_t at, uint32_t user, uint32_t id, uint32_t& extra) {
     std::memset(HostPtr(at), 0, kSettingSize);

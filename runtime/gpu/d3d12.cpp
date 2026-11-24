@@ -781,6 +781,7 @@ private:
     void CapFetch(const uint32_t fetch[6], const xenos::TextureFetch& t);
     void CapShader(const Shader* sh, const ShaderOptions& opt, uint64_t key);
     void CapConstants(const char* stage, const uint8_t* be, const ShaderInfo& info);
+    void CapStreams(const DrawArgs& a, const ShaderInfo& vs, uint32_t min, uint32_t max);
     FILE* cap_ = nullptr;
     std::unordered_set<uint64_t> cap_shaders_;  // variant keys whose HLSL this capture wrote
     std::filesystem::path cap_dir_;
@@ -2686,6 +2687,7 @@ void D3D12Backend::Draw(const State& s, const DrawArgs& a) {
         if (s.ps) CapShader(s.ps, ps_opt, k.ps);
         CapConstants("vs", s.consts, vs->info);
         CapConstants("ps", s.consts + kConstBytes, ps_info);
+        CapStreams(a, vs->info, min, max);
         // what each pixel shader fetch reads: a resolve, or guest memory
         for (uint32_t i = 0; i < ps_info.textures.size(); i++) {
             uint32_t fetch[6];
@@ -3352,18 +3354,35 @@ void D3D12Backend::CapFetch(const uint32_t fetch[6], const xenos::TextureFetch& 
 
 // the float constants a shader reads, as the draw has them
 void D3D12Backend::CapConstants(const char* stage, const uint8_t* be, const ShaderInfo& info) {
-    if (info.constants[0] == ~0ull && info.constants[1] == ~0ull) {
-        std::fprintf(cap_, "     %s constants read relative\n", stage);
-        return;
-    }
+    bool relative = info.constants[0] == ~0ull && info.constants[1] == ~0ull;
+    if (relative) std::fprintf(cap_, "     %s constants read relative\n", stage);
     for (uint32_t i = 0; i < 256; i++) {
-        if (!(info.constants[i / 128] >> (i / 2 % 64) & 1)) continue;
+        if (!relative && !(info.constants[i / 128] >> (i / 2 % 64) & 1)) continue;
         float v[4];
         for (uint32_t k = 0; k < 4; k++) {
             uint32_t bits = Be32(be + i * 16 + k * 4);
             std::memcpy(&v[k], &bits, 4);
         }
         std::fprintf(cap_, "     %s c%u %g %g %g %g\n", stage, i, v[0], v[1], v[2], v[3]);
+    }
+}
+
+// each vertex fetch as the draw reads it, with the raw bytes of its element in the draw's first vertex
+void D3D12Backend::CapStreams(const DrawArgs& a, const ShaderInfo& vs, uint32_t min, uint32_t max) {
+    constexpr uint32_t kShownBytes = 16;
+    std::fprintf(cap_, "     vertices %u to %u base %d\n", min, max, a.base_vertex);
+    for (size_t k = 0; k < vs.fetches.size(); k++) {
+        const StreamFetch& sf = a.streams[k];
+        const VertexFetchConstant& f = sf.fetch;
+        std::fprintf(cap_, "     vfetch %zu offset %u stride %u format %X swizzle %03X endian %u size %u", k, f.address,
+                     f.stride, f.format, f.swizzle, sf.endian, sf.size);
+        int64_t at = (int64_t(min) + a.base_vertex) * f.stride + f.address;
+        if (sf.data && at >= sf.first && at + kShownBytes <= sf.size) {
+            const uint8_t* p = sf.data + (at - sf.first);
+            std::fprintf(cap_, " bytes");
+            for (uint32_t i = 0; i < kShownBytes; i++) std::fprintf(cap_, " %02X", p[i]);
+        }
+        std::fputc('\n', cap_);
     }
 }
 

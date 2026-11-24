@@ -100,11 +100,11 @@ struct Split {
 };
 std::vector<Split> g_splits;  // set again to move a split, e.g. with the signed in player
 
-// the host folders a user's packages of a type are in: the type's own, then its split ones
+// the host folders a user's packages of a type are in: the type's own, then its split ones, each once
 std::vector<fs::path> TypeHosts(uint32_t user, uint32_t type) {
     std::vector<fs::path> hosts{ResolvePath(TypeFolder(user, type), 0)};
     for (const Split& s : g_splits)
-        if (s.type == type) hosts.push_back(s.host);
+        if (s.type == type && std::find(hosts.begin(), hosts.end(), s.host) == hosts.end()) hosts.push_back(s.host);
     return hosts;
 }
 

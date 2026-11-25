@@ -21,6 +21,8 @@ Device_Writeback = 0x2A10
 Device_Fence = 0x2A1C
 Device_GpuFlags = 0x2A39
 Device_GpuFlagCpuFences = 2
+# the kick in MakeSpace writes the next fence (825D3660 to 825D3580, outside tiling and recording)
+Device_KickFences = 1
 # SetFVF 825D14A0 points it at the device's own declaration; SetStreamSource 825CFF98 writes the fetch constants
 Device_VertexDeclaration = 0x2D20
 Device_IndexBuffer = 0x2F94

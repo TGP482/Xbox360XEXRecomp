@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -789,6 +790,8 @@ void Draw(uint32_t dev, gpu::DrawArgs& a, uint32_t up_data = 0, uint32_t up_byte
 // the library writes its own fences once the device is in the mode that does not wait on a GPU
 void UseCpuFences(uint32_t dev) { W8(dev + kDevGpuFlags, R8(dev + kDevGpuFlags) | kGpuFlagCpuFences); }
 
+std::atomic<uint32_t> g_signals = 0;  // fences queued by PassFence
+
 // the GPU writes a fence once it ran the commands before it; here the render thread does, in their order
 void PassFence(uint32_t writeback, uint32_t fence) {
     if (!kFencesFollowDraws || !g_backend) {
@@ -797,6 +800,7 @@ void PassFence(uint32_t writeback, uint32_t fence) {
     }
     std::lock_guard lock(g_lock);
     g_backend->Signal(static_cast<uint32_t*>(HostPtr(writeback)), __builtin_bswap32(fence));
+    g_signals.fetch_add(1, std::memory_order_release);
 }
 
 // D3DCLEAR flags on the bound targets, within rect or the scissor; colour is a guest float4, 0 for black
@@ -1313,11 +1317,16 @@ HLE_FUNC(D3DDevice_BeginIndexedVertices) {
 #endif
 
 #ifdef SUB_D3D_WaitForGpu
-// (wait state): a turn of the library's wait on a fence, which gives up once the GPU looks hung; the fence passes
-// now, so the wait goes on to see it. Under g_lock as every other call that records.
+// (wait state): a turn of the library's wait on a fence, which gives up once the GPU looks hung; the fences queued
+// pass now, so the wait goes on to see them. A fence not queued yet waits for the thread that kicks it, which a turn
+// holding g_lock again and again would starve.
 HLE_FUNC(D3D_WaitForGpu) {
+    thread_local uint32_t passed = UINT32_MAX;
+    uint32_t signals = g_signals.load(std::memory_order_acquire);
+    if (signals == passed) return 1;
     std::lock_guard lock(g_lock);
     if (g_backend) g_backend->PassSignals();
+    passed = signals;
     return 1;
 }
 #endif

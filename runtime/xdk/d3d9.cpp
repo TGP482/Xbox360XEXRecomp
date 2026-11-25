@@ -354,8 +354,8 @@ gpu::Rect SelectedTiles() {
 }
 
 // raw is s's registers as the guest held them when last read here, guest order; blocks still the same are not read
-// again. Null reads every one
-void ReadRegisters(uint32_t dev, gpu::State& s, uint32_t* raw = nullptr) {
+// again. Null reads every one. Tiling is g_lock's; a recorded draw takes it when it runs
+void ReadRegisters(uint32_t dev, gpu::State& s, uint32_t* raw = nullptr, bool tiling = true) {
     constexpr uint32_t kBankRegs = 0x80;
     constexpr uint32_t kBanks = std::size(kDevBanks);
     constexpr uint32_t kBlockRegs = 8;  // a bit of State::kept_regs
@@ -379,6 +379,7 @@ void ReadRegisters(uint32_t dev, gpu::State& s, uint32_t* raw = nullptr) {
             for (uint32_t k = 0; k < regs; k++) s.regs[at + k] = R32(dev + kDevBanks[b] + (i + k) * 4);
         }
     }
+    if (!tiling) return;
     s.tiled_width = g_tiling.on ? uint32_t(g_tiling.extent.x2) : 0;
     s.tiled_height = g_tiling.on ? uint32_t(g_tiling.extent.y2) : 0;
     s.predicated = g_tiling.on ? SelectedTiles() : gpu::Rect{};
@@ -548,14 +549,19 @@ struct GpuLoad {
 };
 std::unordered_map<uint32_t, std::vector<GpuLoad>> g_loads;  // by device, under g_lock
 
-// the device's loads cut to the registers still clean, in load order
-void LoadsFor(uint32_t dev, std::vector<GpuLoad>& out) {
+// the device's loads, null for none; only the device's thread changes them
+const std::vector<GpuLoad>* DeviceLoads(uint32_t dev) {
+    auto it = g_loads.find(dev);
+    return it != g_loads.end() ? &it->second : nullptr;
+}
+
+// the loads cut to the registers the device still has clean, in load order
+void CleanLoads(uint32_t dev, const std::vector<GpuLoad>* loads, std::vector<GpuLoad>& out) {
     constexpr uint32_t kGroup = 4;
     out.clear();
-    auto it = g_loads.find(dev);
-    if (it == g_loads.end()) return;
+    if (!loads) return;
     const uint64_t dirty[2] = {R64(dev + kDevConstDirty), R64(dev + kDevConstDirty + 8)};
-    for (const GpuLoad& l : it->second) {
+    for (const GpuLoad& l : *loads) {
         uint32_t end = l.first + l.count;
         for (uint32_t r = l.first; r < end;) {
             uint32_t next = std::min((r / kGroup + 1) * kGroup, end);
@@ -571,16 +577,26 @@ void LoadsFor(uint32_t dev, std::vector<GpuLoad>& out) {
     }
 }
 
+void LoadsFor(uint32_t dev, std::vector<GpuLoad>& out) { CleanLoads(dev, DeviceLoads(dev), out); }
+
 void ApplyLoads(const std::vector<GpuLoad>& loads, uint8_t* consts) {
     for (const GpuLoad& l : loads) std::memcpy(consts + l.first * kRegBytes, HostPtr(l.address), l.count * kRegBytes);
 }
 
-// the state of a draw from the device; false when its shaders are not known
-bool ReadState(uint32_t dev, gpu::State& s, uint32_t* raw, ShaderEntry*& vs) {
+// a draw's shaders and their link, under g_lock; false when the vertex shader is not known
+bool ReadShaders(uint32_t dev, gpu::State& s, ShaderEntry*& vs) {
     vs = FindShader(R32(dev + kDevVertexShader), true);
     if (!vs) return false;
     const ShaderEntry* ps = FindShader(R32(dev + kDevPixelShader), false);
-    ReadRegisters(dev, s, raw);
+    s.vs = vs->shader;
+    s.ps = ps ? ps->shader : nullptr;
+    LinkPair(*vs, ps, s.link);
+    return true;
+}
+
+// the rest of a draw's state, read from the device alone
+void ReadDevice(uint32_t dev, gpu::State& s, uint32_t* raw, bool tiling) {
+    ReadRegisters(dev, s, raw, tiling);
     if constexpr (kLiterals) {
         LoadLiterals(dev, R32(dev + kDevVertexShader), kVsLiterals, kVsLiteralBase);
         LoadLiterals(dev, R32(dev + kDevPixelShader), kPsLiterals, kPsLiteralBase);
@@ -589,9 +605,12 @@ bool ReadState(uint32_t dev, gpu::State& s, uint32_t* raw, ShaderEntry*& vs) {
     s.bools = static_cast<const uint8_t*>(HostPtr(dev + kDevBools));
     s.loops = static_cast<const uint8_t*>(HostPtr(dev + kDevLoops));
     s.fetch = static_cast<const uint8_t*>(HostPtr(dev + kDevFetch));
-    s.vs = vs->shader;
-    s.ps = ps ? ps->shader : nullptr;
-    LinkPair(*vs, ps, s.link);
+}
+
+// the state of a draw from the device; false when its shaders are not known
+bool ReadState(uint32_t dev, gpu::State& s, uint32_t* raw, ShaderEntry*& vs) {
+    if (!ReadShaders(dev, s, vs)) return false;
+    ReadDevice(dev, s, raw, true);
     return true;
 }
 
@@ -649,27 +668,41 @@ void PointBanks(Recorded& r) {
     r.state.fetch = from + kConstBytes + kBoolBytes + kLoopBytes;
 }
 
-// a draw's state read whole as the device has it now; false when its shaders are not known
+// a draw's state read whole as the device has it now; false when its shaders are not known. Only what other threads
+// share is read under g_lock, so the title's recording threads draw side by side as on the console
 bool Snapshot(uint32_t dev, const gpu::DrawArgs& a, uint32_t up_data, uint32_t up_bytes, uint32_t up_stride,
               Recorded& r) {
-    Backend();
-    ShaderEntry* vs = nullptr;
-    if (!ReadState(dev, r.state, nullptr, vs)) return false;
+    const std::vector<GpuLoad>* loads = nullptr;
+    {
+        std::lock_guard lock(g_lock);
+        Backend();
+        ShaderEntry* vs = nullptr;
+        if (!ReadShaders(dev, r.state, vs)) return false;
+        Streams(dev, *vs, up_data, up_bytes, up_stride, r.streams);
+        loads = DeviceLoads(dev);
+    }
+    ReadDevice(dev, r.state, nullptr, false);
     CopyBanks(r.state, r);
-    LoadsFor(dev, r.loads);
-    Streams(dev, *vs, up_data, up_bytes, up_stride, r.streams);
+    CleanLoads(dev, loads, r.loads);
     r.draw = a;
     // read where the title keeps it until a fence passes the run, as the GPU reads it; user pointer data is copied
     r.draw.fenced = kFencesFollowDraws && !up_stride;
     return true;
 }
 
+void FlushVertices(uint32_t dev);
+
 // a draw on a recording device; the buffers it reads stay the title's until the command buffer ran, as on the console.
-// Built in its list, as a Recorded is 14 KB.
+// Built in its list, as a Recorded is 14 KB; the list is the recording thread's until the buffer runs.
 void RecordDraw(uint32_t dev, uint32_t buffer, const gpu::DrawArgs& a, uint32_t up_data, uint32_t up_bytes,
                 uint32_t up_stride) {
-    std::vector<Recorded>& list = g_buffers[buffer];
-    if (!Snapshot(dev, a, up_data, up_bytes, up_stride, list.emplace_back())) list.pop_back();
+    std::vector<Recorded>* list = nullptr;
+    {
+        std::lock_guard lock(g_lock);
+        FlushVertices(dev);
+        list = &g_buffers[buffer];
+    }
+    if (!Snapshot(dev, a, up_data, up_bytes, up_stride, list->emplace_back())) list->pop_back();
 }
 
 // a recorded command on the renderer, tiled as the title's device is now
@@ -768,12 +801,12 @@ void Replay(uint32_t dev, uint32_t buffer) {
 }
 
 void Draw(uint32_t dev, gpu::DrawArgs& a, uint32_t up_data = 0, uint32_t up_bytes = 0, uint32_t up_stride = 0) {
-    std::lock_guard lock(g_lock);
-    FlushVertices(dev);
     if (uint32_t buffer = RecordingTo(dev)) {
         RecordDraw(dev, buffer, a, up_data, up_bytes, up_stride);
         return;
     }
+    std::lock_guard lock(g_lock);
+    FlushVertices(dev);
     gpu::Backend* backend = Backend();
     static gpu::State s;  // kept from draw to draw, under g_lock: its 4 KB of registers are cleared once
     static uint32_t raw[gpu::kRegCount];  // s's registers in guest order

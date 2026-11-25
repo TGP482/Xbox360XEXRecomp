@@ -199,6 +199,12 @@ D3D12_TEXTURE_ADDRESS_MODE AddressMode(uint32_t clamp) {
     }
 }
 
+// a resource a texture view shows, read in the shader resource state
+struct Shown {
+    ID3D12Resource* res;
+    D3D12_RESOURCE_STATES* state;
+};
+
 // what a texture fetch constant points at, uploaded once per change of its guest bytes
 struct Texture {
     ComPtr<ID3D12Resource> res;
@@ -712,8 +718,8 @@ private:
     // textures
     Resolved* FindResolved(const xenos::TextureFetch& t, const TextureBinding& b, ShaderStage stage, uint32_t slot);
     void TexFlags(const State& s, const ShaderInfo& info, ShaderStage stage, uint8_t flags[32]);
-    void FillTextureView(const TextureBinding& b, const uint32_t fetch[6], D3D12_CPU_DESCRIPTOR_HANDLE at,
-                         ShaderStage stage, uint32_t slot);
+    Shown FillTextureView(const TextureBinding& b, const uint32_t fetch[6], D3D12_CPU_DESCRIPTOR_HANDLE at,
+                          ShaderStage stage, uint32_t slot);
     Texture* EnsureTexture(const xenos::TextureFetch& t);
     Texture* FrameTexture(const uint32_t fetch[6], const xenos::TextureFetch& t);
     void HashAhead();
@@ -731,7 +737,7 @@ private:
     D3D12_GPU_DESCRIPTOR_HANDLE SamplerTable(uint32_t first) const;
     D3D12_GPU_DESCRIPTOR_HANDLE LinearSamplers();
     uint32_t BindTextures(const State& s, const ShaderInfo& info, ShaderStage stage, uint32_t first, uint32_t slots,
-                          uint32_t* samplers);
+                          uint32_t* samplers, bool& made);
     void NullViews(uint32_t first, uint32_t count);
     void BindViews(const State& s, const ShaderInfo& vs, const ShaderInfo& ps);
 
@@ -885,12 +891,16 @@ private:
             uint32_t table = 0;
             uint32_t samplers[kPsTextures] = {};
         } stages[2];
-        // the view table the raw vertex view was last written into, and its chunk
-        struct RawView {
-            uint64_t table = 0;
-            ID3D12Resource* chunk = nullptr;
-        } raw;
     } binds_;
+    // a stage's texture tables made since Unbind, by shader and fetch constants; the upload chunk stays the same
+    struct Table {
+        const ShaderInfo* info;
+        uint32_t aniso;
+        uint32_t fetch[kPsTextures][6];
+        uint32_t table;
+        uint32_t samplers[kPsTextures];
+        Shown shown[kPsTextures];
+    };
     // true where now differs from what the last draw set, which keeps it
     template <class T>
     bool Latch(T& last, const T& now) {
@@ -899,6 +909,7 @@ private:
         return !same;
     }
 
+    std::unordered_map<uint64_t, Table> tables_[2];  // vertex then pixel
     uint32_t draw_samplers_[2][kPsTextures] = {};  // BindViews' sampler slots, vertex then pixel
 
     // per draw scratch, kept to save allocations
@@ -2086,8 +2097,8 @@ void D3D12Backend::TexFlags(const State& s, const ShaderInfo& info, ShaderStage 
     }
 }
 
-void D3D12Backend::FillTextureView(const TextureBinding& b, const uint32_t fetch[6], D3D12_CPU_DESCRIPTOR_HANDLE at,
-                                   ShaderStage stage, uint32_t slot) {
+Shown D3D12Backend::FillTextureView(const TextureBinding& b, const uint32_t fetch[6], D3D12_CPU_DESCRIPTOR_HANDLE at,
+                                    ShaderStage stage, uint32_t slot) {
     xenos::TextureFetch t = xenos::DecodeTextureFetch(fetch);
     D3D12_SHADER_RESOURCE_VIEW_DESC v{};
     v.Shader4ComponentMapping = ComponentMapping(t);
@@ -2102,7 +2113,7 @@ void D3D12Backend::FillTextureView(const TextureBinding& b, const uint32_t fetch
             v.Texture2D.MipLevels = 1;
         }
         dev_->CreateShaderResourceView(r.res.Get(), &v, at);
-        return;
+        return {r.res.Get(), &r.state};
     }
     Texture* tex = FrameTexture(fetch, t);
     if (tex && tex->swap) tex = tex->swap;
@@ -2136,6 +2147,8 @@ void D3D12Backend::FillTextureView(const TextureBinding& b, const uint32_t fetch
     auto [view, added] = texture_views_.try_emplace(key, uint32_t(texture_views_.size()));
     if (added) dev_->CreateShaderResourceView(fits ? tex->res.Get() : nullptr, &v, TextureView(view->second));
     dev_->CopyDescriptorsSimple(1, at, TextureView(view->second), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    if (!fits) return {};
+    return {tex->res.Get(), &tex->state};
 }
 
 // the fetch constant's filters, overridden by the instruction's where it sets them
@@ -2209,32 +2222,53 @@ void D3D12Backend::NullViews(uint32_t first, uint32_t count) {
 
 // a table with texture views from slot first on and their samplers; slots past the shader's hold null views
 uint32_t D3D12Backend::BindTextures(const State& s, const ShaderInfo& info, ShaderStage stage, uint32_t first,
-                                    uint32_t slots, uint32_t* samplers) {
+                                    uint32_t slots, uint32_t* samplers, bool& made) {
     uint32_t used = std::min<uint32_t>(uint32_t(info.textures.size()), slots);
-    uint32_t fetch[kPsTextures][6];
-    for (uint32_t i = 0; i < used; i++) ReadFetch(s, info.textures[i].fetch, fetch[i]);
-    size_t fetch_bytes = used * sizeof(fetch[0]);
+    Table t;
+    t.info = &info;
+    t.aniso = app::Get().aniso;
+    for (uint32_t i = 0; i < used; i++) ReadFetch(s, info.textures[i].fetch, t.fetch[i]);
+    size_t fetch_bytes = used * sizeof(t.fetch[0]);
+    made = false;
     // the shader and fetch constants of the stage's last draw: its tables again. An extension may pick by pass.
-    Binds::Stage& kept = binds_.stages[stage == ShaderStage::Vertex ? 0 : 1];
-    bool same = !ext_ && kept.info == &info && kept.aniso == app::Get().aniso;
-    if (same && std::memcmp(kept.fetch, fetch, fetch_bytes) == 0) {
+    uint32_t side = stage == ShaderStage::Vertex ? 0 : 1;
+    Binds::Stage& kept = binds_.stages[side];
+    bool same = !ext_ && kept.info == &info && kept.aniso == t.aniso;
+    if (same && std::memcmp(kept.fetch, t.fetch, fetch_bytes) == 0) {
         std::copy_n(kept.samplers, used, samplers);
         return kept.table;
     }
-    uint32_t table = AllocViews(first + slots);
-    for (uint32_t i = 0; i < used; i++) {
-        const TextureBinding& b = info.textures[i];
-        FillTextureView(b, fetch[i], ViewCpu(table + first + i), stage, i);
-        D3D12_SAMPLER_DESC d = SamplerDesc(b, fetch[i]);
-        samplers[i] = SamplerRun(&d, 1);
+    // or the tables an earlier draw made for them
+    uint64_t key = Hash64(t.fetch, fetch_bytes, uint64_t(uintptr_t(&info)) + t.aniso);
+    auto found = tables_[side].find(key);
+    bool hit = !ext_ && found != tables_[side].end() && found->second.info == &info &&
+               found->second.aniso == t.aniso && std::memcmp(found->second.fetch, t.fetch, fetch_bytes) == 0;
+    if (hit) {
+        for (uint32_t i = 0; i < used; i++) {
+            const Shown& shown = found->second.shown[i];
+            if (shown.res) Transition(shown.res, *shown.state, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+        }
+        t.table = found->second.table;
+        std::copy_n(found->second.samplers, used, t.samplers);
+    } else {
+        made = true;
+        t.table = AllocViews(first + slots);
+        for (uint32_t i = 0; i < used; i++) {
+            const TextureBinding& b = info.textures[i];
+            t.shown[i] = FillTextureView(b, t.fetch[i], ViewCpu(t.table + first + i), stage, i);
+            D3D12_SAMPLER_DESC d = SamplerDesc(b, t.fetch[i]);
+            t.samplers[i] = SamplerRun(&d, 1);
+        }
+        NullViews(t.table + first + used, slots - used);
+        if (!ext_) tables_[side][key] = t;
     }
-    NullViews(table + first + used, slots - used);
     kept.info = &info;
-    kept.aniso = app::Get().aniso;
-    std::memcpy(kept.fetch, fetch, fetch_bytes);
-    kept.table = table;
-    std::copy_n(samplers, used, kept.samplers);
-    return table;
+    kept.aniso = t.aniso;
+    std::memcpy(kept.fetch, t.fetch, fetch_bytes);
+    kept.table = t.table;
+    std::copy_n(t.samplers, used, kept.samplers);
+    std::copy_n(t.samplers, used, samplers);
+    return t.table;
 }
 
 // Draws
@@ -2650,17 +2684,19 @@ void D3D12Backend::BindFloats(uint32_t root, const uint8_t* be, const uint64_t (
 void D3D12Backend::BindViews(const State& s, const ShaderInfo& vs, const ShaderInfo& ps) {
     uint32_t* vs_samplers = draw_samplers_[0];
     uint32_t* ps_samplers = draw_samplers_[1];
+    bool fresh = false;
+    bool ps_made = false;
     uint32_t heap = sampler_switches_;
-    uint32_t vs_views = BindTextures(s, vs, ShaderStage::Vertex, 1, kVsTextures, vs_samplers);
-    uint32_t ps_views = BindTextures(s, ps, ShaderStage::Pixel, 0, kPsTextures, ps_samplers);
+    uint32_t vs_views = BindTextures(s, vs, ShaderStage::Vertex, 1, kVsTextures, vs_samplers, fresh);
+    uint32_t ps_views = BindTextures(s, ps, ShaderStage::Pixel, 0, kPsTextures, ps_samplers, ps_made);
     // the pixel samplers went to a new heap: the vertex ones follow
-    if (sampler_switches_ != heap) vs_views = BindTextures(s, vs, ShaderStage::Vertex, 1, kVsTextures, vs_samplers);
+    if (sampler_switches_ != heap) {
+        vs_views = BindTextures(s, vs, ShaderStage::Vertex, 1, kVsTextures, vs_samplers, fresh);
+    }
     const UploadChunks& ring = CurrentFrame().ring;
     const UploadChunk& chunk = ring.list[ring.at];
     vertex_chunk_ = chunk.res.Get();
-    // a kept vertex table already holds the view
-    Binds::RawView raw_at{vs_views, vertex_chunk_};
-    bool fresh = Latch(binds_.raw, raw_at);
+    // a vertex table made before holds the view: a new chunk unbinds
     if (fresh && ring.at == 0) {
         uint32_t raw = kPsTextures + uint32_t(frame_ % kFrames);
         dev_->CopyDescriptorsSimple(1, ViewCpu(vs_views), CopyView(raw), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -3271,6 +3307,8 @@ void D3D12Backend::Present(const uint32_t front[6]) {
 void D3D12Backend::Unbind() {
     std::fill(std::begin(const_gpu_), std::end(const_gpu_), 0);
     binds_ = {};
+    tables_[0].clear();
+    tables_[1].clear();
 }
 
 // a copy of the target to read while drawing to it; a multisampled one is resolved into it

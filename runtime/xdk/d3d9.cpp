@@ -605,10 +605,11 @@ constexpr size_t kFetchBytes = 32 * 6 * 4;
 enum class RecordedOp { Draw, Clear, Resolve };
 
 struct Recorded {
+    Recorded() {}  // bank_bytes left unset, only CopyBanks fills what is read
     RecordedOp op = RecordedOp::Draw;
     gpu::State state;
     bool banks = false;  // the draw's constants copied below, clears and resolves read none
-    std::array<uint8_t, kConstBytes + kBoolBytes + kLoopBytes + kFetchBytes> bank_bytes{};
+    std::array<uint8_t, kConstBytes + kBoolBytes + kLoopBytes + kFetchBytes> bank_bytes;
     gpu::DrawArgs draw;
     std::vector<gpu::StreamFetch> streams;
     uint32_t flags = 0;
@@ -661,11 +662,12 @@ bool Snapshot(uint32_t dev, const gpu::DrawArgs& a, uint32_t up_data, uint32_t u
     return true;
 }
 
-// a draw on a recording device; the buffers it reads stay the title's until the command buffer ran, as on the console
+// a draw on a recording device; the buffers it reads stay the title's until the command buffer ran, as on the console.
+// Built in its list, as a Recorded is 14 KB.
 void RecordDraw(uint32_t dev, uint32_t buffer, const gpu::DrawArgs& a, uint32_t up_data, uint32_t up_bytes,
                 uint32_t up_stride) {
-    Recorded r;
-    if (Snapshot(dev, a, up_data, up_bytes, up_stride, r)) g_buffers[buffer].push_back(std::move(r));
+    std::vector<Recorded>& list = g_buffers[buffer];
+    if (!Snapshot(dev, a, up_data, up_bytes, up_stride, list.emplace_back())) list.pop_back();
 }
 
 // a recorded command on the renderer, tiled as the title's device is now
@@ -815,7 +817,7 @@ void PassFence(uint32_t writeback, uint32_t fence) {
         for (uint32_t i = 0; i < 4; i++) rgba[i] = GF(color + i * 4);
     }
     if (uint32_t buffer = RecordingTo(dev)) {
-        Recorded r;
+        Recorded& r = g_buffers[buffer].emplace_back();
         r.op = RecordedOp::Clear;
         r.state = s;
         r.flags = flags;
@@ -824,7 +826,6 @@ void PassFence(uint32_t writeback, uint32_t fence) {
         r.stencil = stencil;
         r.has_rect = rect != nullptr;
         if (rect) r.rect = *rect;
-        g_buffers[buffer].push_back(std::move(r));
         return;
     }
     Backend()->Clear(s, flags, rgba, z, stencil, rect);
@@ -881,11 +882,10 @@ void ResolveTo(uint32_t dev, const ResolveCall& c) {
     r.clear_z = c.z;
     r.clear_stencil = c.stencil;
     if (uint32_t buffer = RecordingTo(dev)) {
-        Recorded rec;
+        Recorded& rec = g_buffers[buffer].emplace_back();
         rec.op = RecordedOp::Resolve;
         rec.state = s;
         rec.resolve = r;
-        g_buffers[buffer].push_back(std::move(rec));
         return;
     }
     Backend()->Resolve(s, r);

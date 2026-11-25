@@ -289,6 +289,8 @@ cbuffer Draw : register(b2) {
 )";
 const char* kPreludeEnd = R"(    float4 g_clip[6];
     int g_base_vertex;
+    uint4 g_vs_samplers[8];
+    uint4 g_ps_samplers[8];
 };
 
 static float4 r[64];
@@ -760,24 +762,29 @@ void Translator::EmitTextureFetch(const Fetch& f) {
                         : F("uv += float2(%d, %d) * 0.5 / size;", ox, oy));
         }
         std::string at = cube ? "CubeDir(tc)" : "uv";
+        std::string smp = F("s%u", t);
+        if (opt_.sampler_heap) {
+            smp = F("g_samplers[g_%s_samplers[%u].%c]", Pixel() ? "ps" : "vs", (t & 31) / 4, "xyzw"[t % 4]);
+        }
         std::string fetch;
         if (op == kGetWeights) {
             fetch = cube ? "float4(frac((tc.xy - 1) * size - 0.5), 0, 0)"
                          : (volume ? "float4(frac(uv * size - 0.5), 0)" : "float4(frac(uv * size - 0.5), 0, 0)");
         } else if (op == kGetCompTexLod) {
-            fetch = Pixel() ? F("float4(t%u.CalculateLevelOfDetail(s%u, %s), 0, 0, 0)", t, t, at.c_str())
+            fetch = Pixel() ? F("float4(t%u.CalculateLevelOfDetail(%s, %s), 0, 0, 0)", t, smp.c_str(), at.c_str())
                             : "(float4)0";
         } else if (op == kGetGradients) {
             fetch = Pixel() ? "float4(ddx(tc.xy), ddy(tc.xy))" : "(float4)0";
         } else if (f.RegisterGradients()) {
             const char* g = cube || volume ? "xyz" : "xy";
-            fetch = F("t%u.SampleGrad(s%u, %s, grad_h.%s, grad_v.%s)", t, t, at.c_str(), g, g);
+            fetch = F("t%u.SampleGrad(%s, %s, grad_h.%s, grad_v.%s)", t, smp.c_str(), at.c_str(), g, g);
         } else if (f.RegisterLod() || !Pixel()) {
-            fetch = F("t%u.SampleLevel(s%u, %s, %s%g)", t, t, at.c_str(), f.RegisterLod() ? "lod + " : "", f.LodBias());
+            const char* lod = f.RegisterLod() ? "lod + " : "";
+            fetch = F("t%u.SampleLevel(%s, %s, %s%g)", t, smp.c_str(), at.c_str(), lod, f.LodBias());
         } else if (f.LodBias() != 0) {
-            fetch = F("t%u.SampleBias(s%u, %s, %g)", t, t, at.c_str(), f.LodBias());
+            fetch = F("t%u.SampleBias(%s, %s, %g)", t, smp.c_str(), at.c_str(), f.LodBias());
         } else {
-            fetch = F("t%u.Sample(s%u, %s)", t, t, at.c_str());
+            fetch = F("t%u.Sample(%s, %s)", t, smp.c_str(), at.c_str());
         }
         Line("float4 ft = " + fetch + ";");
         std::string fetched = op == kTextureFetch ? Hooks().Fetched(t, opt_.tex_flags[t & 31]) : std::string();
@@ -955,10 +962,12 @@ void CommitAlu() {
 )";
     s += Pixel() ? "float Kill(bool c) { if (c) discard; return c ? 1 : 0; }\n"
                  : "float Kill(bool c) { return c ? 1 : 0; }\n";
+    if (opt_.sampler_heap) s += F("SamplerState g_samplers[%u] : register(s0, space1);\n", kSamplerHeapSlots);
     for (uint32_t i = 0; i < info_.textures.size(); i++) {
         static const char* kTypes[4] = {"Texture2D", "Texture2D", "Texture3D", "TextureCube"};
         uint32_t dim = opt_.flat[i & 31] ? kDim2D : info_.textures[i].dimension & 3;
-        s += F("%s<float4> t%u : register(t%u);\nSamplerState s%u : register(s%u);\n", kTypes[dim], i, i, i, i);
+        s += F("%s<float4> t%u : register(t%u);\n", kTypes[dim], i, i);
+        if (!opt_.sampler_heap) s += F("SamplerState s%u : register(s%u);\n", i, i);
     }
     return s;
 }

@@ -51,7 +51,9 @@ struct ShaderOptions {
     uint8_t tex_flags[32] = {};  // per ShaderInfo::textures entry, an extension's (Extension::Sampled)
     bool flat[32] = {};  // per ShaderInfo::textures entry: a 3D or stacked fetch whose texture is 2D, sampled as 2D
     bool motion = false;  // also the previous position and a motion vector into colour target kMotionTarget
+    bool sampler_heap = false;  // samplers picked from the whole heap by DrawConstants' slots
 };
+constexpr uint32_t kSamplerHeapSlots = 2048;  // D3D12's most shader visible samplers
 constexpr uint32_t kMotionTarget = 4;  // past the title's four
 
 
@@ -89,6 +91,9 @@ struct DrawConstants {
     float ext[4];      // a renderer extension's, declared by ShaderHooks::Constants
     float clip[6][4];  // the user clip planes PA_CL_CLIP_CNTL enables, 0 for the others
     int32_t base_vertex;  // added to each index before the shader sees it, as on the console
+    int32_t unused[3];  // cbuffer arrays start on 16 bytes
+    uint32_t vs_samplers[32];  // each texture's sampler in the heap, with ShaderOptions::sampler_heap
+    uint32_t ps_samplers[32];
 };
 
 // b3, per fetch instruction

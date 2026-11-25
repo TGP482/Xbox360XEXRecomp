@@ -547,10 +547,13 @@ struct GpuLoad {
     uint32_t count = 0;
     uint32_t address = 0;
 };
-std::unordered_map<uint32_t, std::vector<GpuLoad>> g_loads;  // by device, under g_lock
+// by device; the map under g_loads_lock, a device's list only its own thread touches, so loads never wait on g_lock
+std::unordered_map<uint32_t, std::vector<GpuLoad>> g_loads;
+std::mutex g_loads_lock;
 
 // the device's loads, null for none; only the device's thread changes them
 const std::vector<GpuLoad>* DeviceLoads(uint32_t dev) {
+    std::lock_guard lock(g_loads_lock);
     auto it = g_loads.find(dev);
     return it != g_loads.end() ? &it->second : nullptr;
 }
@@ -1257,7 +1260,8 @@ PPC_FUNC(GUEST(D3DDevice_BeginCommandBuffer)) {
         std::lock_guard lock(g_lock);
         FlushVertices(dev);
         // a recording starts with every constant dirty
-        g_loads.erase(dev);
+        std::lock_guard loads_lock(g_loads_lock);
+        g_loads[dev].clear();
     }
     GUEST_ORIG(D3DDevice_BeginCommandBuffer)(ctx, base);
     std::lock_guard lock(g_lock);
@@ -1279,8 +1283,12 @@ HLE_FUNC(D3DDevice_RunCommandBuffer) {
 HLE_FUNC(D3DDevice_GpuLoadShaderConstantF4) {
     uint32_t first = std::min(a[1] * kStageRegs + a[2], 2 * kStageRegs);
     uint32_t count = std::min(a[4], 2 * kStageRegs - first);
-    std::lock_guard lock(g_lock);
-    std::vector<GpuLoad>& loads = g_loads[a[0]];
+    std::vector<GpuLoad>* list = nullptr;
+    {
+        std::lock_guard lock(g_loads_lock);
+        list = &g_loads[a[0]];
+    }
+    std::vector<GpuLoad>& loads = *list;
     std::erase_if(loads, [&](const GpuLoad& l) { return l.first >= first && l.first + l.count <= first + count; });
     loads.push_back({first, count, a[3]});
     return 0;

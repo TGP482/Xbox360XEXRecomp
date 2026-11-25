@@ -76,6 +76,7 @@ inline PPCVec ppc_lvlx(uint8_t* base, uint32_t ea) {
 
 // lvrx: the bytes from the block start to ea, right aligned, zeros before; t - 16 wraps to bit 7 for those
 inline PPCVec ppc_lvrx(uint8_t* base, uint32_t ea) {
+    if (!(ea & 15)) return PPCVec{};  // no bytes: the block at ea is never read, and may be unmapped
     PPCVec idx = ppc_down_from(ea & 15) - uint8_t(16);
     return ppc_pshufb(ppc_load_raw(base + (ea & ~15u)), idx);
 }

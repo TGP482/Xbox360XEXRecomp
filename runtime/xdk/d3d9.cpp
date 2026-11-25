@@ -10,6 +10,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <bit>
 #include <array>
 #include <atomic>
 #include <cstring>
@@ -709,9 +710,19 @@ uint32_t RecordingTo(uint32_t dev) {
     return R32(dev + kDevCommandBuffer);
 }
 
-void CopyBanks(const gpu::State& s, Recorded& r) {
+// the float constants the draw's shaders read, a bit per two, then every bool, loop and fetch constant
+void CopyBanks(const gpu::State& s, const uint64_t (&read)[4], Recorded& r) {
+    constexpr uint32_t kBlockBytes = 32;
     uint8_t* to = r.bank_bytes.data();
-    std::memcpy(to, s.consts, kConstBytes);
+    for (uint32_t w = 0; w < 4; w++) {
+        for (uint64_t m = read[w]; m;) {
+            uint32_t first = uint32_t(std::countr_zero(m));
+            uint32_t run = uint32_t(std::countr_one(m >> first));
+            uint32_t at = (w * 64 + first) * kBlockBytes;
+            std::memcpy(to + at, s.consts + at, run * kBlockBytes);
+            m = run + first < 64 ? m & (~0ull << (first + run)) : 0;
+        }
+    }
     std::memcpy(to + kConstBytes, s.bools, kBoolBytes);
     std::memcpy(to + kConstBytes + kBoolBytes, s.loops, kLoopBytes);
     std::memcpy(to + kConstBytes + kBoolBytes + kLoopBytes, s.fetch, kFetchBytes);
@@ -731,16 +742,25 @@ void PointBanks(Recorded& r) {
 bool Snapshot(uint32_t dev, const gpu::DrawArgs& a, uint32_t up_data, uint32_t up_bytes, uint32_t up_stride,
               Recorded& r) {
     const std::vector<GpuLoad>* loads = nullptr;
+    uint64_t read[4] = {};  // vertex then pixel, as ShaderInfo::constants
     {
         std::lock_guard lock(g_lock);
-        Backend();
+        gpu::Backend* backend = Backend();
         ShaderEntry* vs = nullptr;
         if (!ReadShaders(dev, r.state, vs)) return false;
+        const gpu::ShaderInfo& vs_info = backend->Info(r.state.vs);
+        read[0] = vs_info.constants[0];
+        read[1] = vs_info.constants[1];
+        if (r.state.ps) {
+            const gpu::ShaderInfo& ps_info = backend->Info(r.state.ps);
+            read[2] = ps_info.constants[0];
+            read[3] = ps_info.constants[1];
+        }
         Streams(dev, *vs, up_data, up_bytes, up_stride, r.streams);
         loads = DeviceLoads(dev);
     }
     ReadDevice(dev, r.state, nullptr, false);
-    CopyBanks(r.state, r);
+    CopyBanks(r.state, read, r);
     CleanLoads(dev, loads, r.loads);
     r.draw = a;
     // read where the title keeps it until a fence passes the run, as the GPU reads it; user pointer data is copied

@@ -122,6 +122,8 @@ Pad Poll(int port) {
             p.ry = int16_t(-1 - axis(SDL_GAMEPAD_AXIS_RIGHTY));
         }
     }
+    // the keyboard and mouse stand in for a controller on their port, so the title never sees it unplugged
+    if (port == KeyboardPort()) p.connected = true;
     if (app::kGame.pad) app::kGame.pad(port, p);
     return p;
 }

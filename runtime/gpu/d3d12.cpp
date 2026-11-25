@@ -51,8 +51,6 @@ struct Shader {
     uint64_t hash = 0;  // of code
     ShaderInfo info;  // default options: what the title's Direct3D links and fetches by
     std::unordered_map<uint64_t, std::unique_ptr<Variant>> variants;
-    ShaderOptions last_opt;  // the last variant asked for, found again without a hash
-    Variant* last = nullptr;
 };
 
 namespace {
@@ -64,6 +62,10 @@ constexpr uint64_t kUploadSize = 96ull << 20;  // per frame, more chunks while a
 constexpr uint64_t kDrawUploads = 16ull << 20;  // a draw's indices, vertices and constants, at most
 constexpr uint64_t kTexelChunk = 32ull << 20;  // texture data per frame, more chunks while a burst lasts
 constexpr uint32_t kViewsPerFrame = 1u << 18;
+constexpr uint32_t kLanes = 4;  // the render thread's and three that record batches of draws (DrawBatch)
+constexpr uint32_t kLaneViews = kViewsPerFrame / kLanes;  // each lane's slice of a frame's descriptors
+constexpr uint64_t kLaneChunk = kUploadSize / 2;          // a batch lane's upload ring chunks
+constexpr size_t kLaneDraws = 128;  // fewest draws a lane takes; smaller batches stay on the render thread
 constexpr uint32_t kSamplerCount = kSamplerHeapSlots;
 constexpr uint32_t kSamplerHeaps = 8;  // a full heap is used again once the GPU is past its draws
 constexpr uint32_t kRtvCount = 1024;
@@ -322,9 +324,7 @@ struct UploadChunks {
 
 struct Frame {
     ComPtr<ID3D12CommandAllocator> alloc;
-    UploadChunks ring;
-    UploadChunks texels;  // apart from the ring, as a draw's vertex view covers one ring chunk
-    uint32_t views = 0;
+    UploadChunks texels;  // apart from the lanes' rings, as a draw's vertex view covers one ring chunk
     uint64_t fence = 0;
     std::vector<ComPtr<ID3D12Resource>> garbage;
 };
@@ -633,6 +633,7 @@ public:
     Shader* CreateShader(ShaderStage stage, const uint32_t* code, size_t dwords) override;
     const ShaderInfo& Info(const Shader* s) const override { return s->info; }
     void Draw(const State& s, const DrawArgs& a) override;
+    void DrawBatch(size_t count, const DrawSource& get) override;
     void Clear(const State& s, uint32_t flags, const float color[4], float z, uint32_t stencil,
                const Rect* rect) override;
     void Resolve(const State& s, const ResolveArgs& r) override;
@@ -644,7 +645,7 @@ public:
 
     // Context
     ID3D12Device* Device() override { return dev_.Get(); }
-    ID3D12GraphicsCommandList* List() override { return cl_.Get(); }
+    ID3D12GraphicsCommandList* List() override { return L().cl.Get(); }
     void Transition(ID3D12Resource* r, D3D12_RESOURCE_STATES& cur, D3D12_RESOURCE_STATES want) override;
     void Release(ComPtr<ID3D12Resource> r) override { CurrentFrame().garbage.push_back(std::move(r)); }
     D3D12_CPU_DESCRIPTOR_HANDLE View(const Target& t) override { return Rtv(t.view); }
@@ -813,7 +814,6 @@ private:
     std::unordered_map<ViewKey, uint32_t, ViewKeyHash> texture_views_;  // to their slot in texture_view_heap_
     std::vector<uint32_t> free_rtv_, free_dsv_;
     ComPtr<ID3D12RootSignature> root_;
-    ComPtr<ID3D12GraphicsCommandList> cl_;
     ComPtr<ID3D12Fence> fence_;
     HANDLE event_ = nullptr;
     uint64_t fence_value_ = 0;
@@ -849,8 +849,6 @@ private:
     std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> pass_pipelines_;
     std::vector<std::unique_ptr<Shader>> shaders_;
     std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> pipelines_;
-    PipelineKey last_key_;  // the last draw's, found again without a hash
-    ID3D12PipelineState* last_pso_ = nullptr;
     std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> resolve_pipelines_;
     std::unordered_map<uint64_t, uint32_t> sampler_sets_;
     uint32_t samplers_used_ = 0;
@@ -865,12 +863,6 @@ private:
     std::vector<BuiltPipeline> built_;
     std::mutex built_lock_;
     std::atomic<bool> built_ready_{false};
-
-    // the last constant blocks bound, skipped when unchanged; no address means upload again
-    uint8_t const_last_[kRootCount][kConstBytes] = {};
-    D3D12_GPU_VIRTUAL_ADDRESS const_gpu_[kRootCount] = {};
-    uint32_t const_size_[kRootCount] = {};  // HeldConstants: bytes of the upload
-    uint64_t const_held_[kRootCount][2] = {};  // the float constant blocks const_gpu_ holds, as ShaderInfo::constants
 
     // what the last draw set on the command list, set again only where a draw differs; Unbind forgets it
     struct Binds {
@@ -891,7 +883,7 @@ private:
             uint32_t table = 0;
             uint32_t samplers[kPsTextures] = {};
         } stages[2];
-    } binds_;
+    };
     // a stage's texture tables made since Unbind, by shader and fetch constants; the upload chunk stays the same
     struct Table {
         const ShaderInfo* info;
@@ -904,28 +896,69 @@ private:
     // true where now differs from what the last draw set, which keeps it
     template <class T>
     bool Latch(T& last, const T& now) {
-        bool same = binds_.valid && std::memcmp(&last, &now, sizeof(T)) == 0;
+        bool same = L().binds.valid && std::memcmp(&last, &now, sizeof(T)) == 0;
         std::memcpy(&last, &now, sizeof(T));
         return !same;
     }
 
-    std::unordered_map<uint64_t, Table> tables_[2];  // vertex then pixel
-    uint32_t draw_samplers_[2][kPsTextures] = {};  // BindViews' sampler slots, vertex then pixel
+    // a thread recording draws: its command list, upload ring and descriptors per frame, and what its last draws set.
+    // lanes_[0] is the render thread's; the others record a batch's draws side by side (DrawBatch)
+    struct Lane {
+        ComPtr<ID3D12GraphicsCommandList> cl;
+        ComPtr<ID3D12CommandAllocator> allocs[kFrames];  // lanes_[0] records with Frame::alloc
+        UploadChunks rings[kFrames];
+        uint32_t views[kFrames] = {};  // used of its slice of each frame's descriptors
+        uint32_t view_base = 0;
+        uint64_t chunk_size = kUploadSize;
+        uint64_t unbinds = 0;  // unbinds_ as of its last batch
+        Binds binds;
+        std::unordered_map<uint64_t, Table> tables[2];  // vertex then pixel
+        // the last constant blocks bound, skipped when unchanged; no address means upload again
+        uint8_t const_last[kRootCount][kConstBytes] = {};
+        D3D12_GPU_VIRTUAL_ADDRESS const_gpu[kRootCount] = {};
+        uint32_t const_size[kRootCount] = {};  // HeldConstants: bytes of the upload
+        uint64_t const_held[kRootCount][2] = {};  // the float constant blocks const_gpu holds, as ShaderInfo::constants
+        PipelineKey last_key;  // the last draw's, found again without a hash
+        ID3D12PipelineState* last_pso = nullptr;
+        // each stage's last variant, found again without a hash, vertex then pixel
+        struct LastVariant {
+            Shader* shader = nullptr;
+            ShaderOptions opt;
+            Variant* variant = nullptr;
+        } variants[2];
+        uint32_t draw_samplers[2][kPsTextures] = {};  // BindViews' sampler slots, vertex then pixel
+        // per draw scratch, kept to save allocations
+        std::vector<uint32_t> index_src;
+        std::vector<uint32_t> index_out;
+        std::vector<VertexFetchConstant> stream_consts;
+        std::vector<std::pair<std::pair<const uint8_t*, uint32_t>, uint32_t>> stream_copies;
+        std::vector<KeptVertices> kept_vertices = std::vector<KeptVertices>(kKeptUploads);
+        std::vector<KeptIndices> kept_indices = std::vector<KeptIndices>(kKeptUploads);
+        uint64_t upload_epoch = 1;
+        ID3D12Resource* vertex_chunk = nullptr;  // the ring chunk the bound vertex view covers
+        uint64_t draw_fences = 0;  // DrawArgs::fences of the last draw
+    };
+    static thread_local Lane* t_lane_;  // a batch lane's, null on the render thread
+    static std::vector<std::unique_ptr<Lane>> MakeLanes();
+    std::vector<std::unique_ptr<Lane>> lanes_ = MakeLanes();
+    uint64_t unbinds_ = 0;  // the render thread's Unbinds, which lanes follow at their next batch
+    std::vector<std::pair<const State*, const DrawArgs*>> batch_;
+    std::mutex shared_lock_;  // variants, pipelines, samplers and texture views, which lanes find or make
+    WorkPool lane_pool_;  // after what its jobs use, so it stops first
+    Lane& L() const { return t_lane_ ? *t_lane_ : *lanes_[0]; }
+    bool OnRenderThread() const { return !t_lane_; }
+    UploadChunks& LaneRing() const { return L().rings[frame_ % kFrames]; }
+    void Rebind();
+    void RecycleLanes();
+    void Prepare(const State& s);
+    void PrepareTextures(const State& s, const ShaderInfo& info, ShaderStage stage, uint32_t slots);
+    void RecordLane(Lane& lane, size_t first, size_t end);
 
-    // per draw scratch, kept to save allocations
-    std::vector<uint32_t> index_src_;
-    std::vector<uint32_t> index_out_;
-    std::vector<VertexFetchConstant> stream_consts_;
-    std::vector<std::pair<std::pair<const uint8_t*, uint32_t>, uint32_t>> stream_copies_;
-    std::vector<KeptVertices> kept_vertices_ = std::vector<KeptVertices>(kKeptUploads);
-    std::vector<KeptIndices> kept_indices_ = std::vector<KeptIndices>(kKeptUploads);
-    uint64_t upload_epoch_ = 1;
-    ID3D12Resource* vertex_chunk_ = nullptr;  // the ring chunk the bound vertex view covers
-    uint64_t draw_fences_ = 0;  // DrawArgs::fences of the last draw
 
     ComPtr<ID3D12QueryHeap> query_heap_;
     ComPtr<ID3D12Resource> query_read_;
     Query queries_[kQueryCount];
+    uint32_t open_queries_ = 0;  // a query begun and ended in one command list keeps batches whole
 
     std::chrono::steady_clock::time_point fps_start_ = std::chrono::steady_clock::now();
     uint32_t fps_frames_ = 0;
@@ -1116,13 +1149,23 @@ void D3D12Backend::CreateFrames() {
     for (int i = 0; i < kFrames; i++) {
         Frame& f = frames_[i];
         dev_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&f.alloc));
-        f.ring.list.push_back(MakeChunk(dev_.Get(), kUploadSize));
-        D3D12_SHADER_RESOURCE_VIEW_DESC raw = RawView(f.ring.list[0]);
-        dev_->CreateShaderResourceView(f.ring.list[0].res.Get(), &raw, CopyView(kPsTextures + i));
+        UploadChunks& ring = lanes_[0]->rings[i];
+        ring.list.push_back(MakeChunk(dev_.Get(), kUploadSize));
+        D3D12_SHADER_RESOURCE_VIEW_DESC raw = RawView(ring.list[0]);
+        dev_->CreateShaderResourceView(ring.list[0].res.Get(), &raw, CopyView(kPsTextures + i));
     }
     dev_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_));
     event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    dev_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, frames_[0].alloc.Get(), nullptr, IID_PPV_ARGS(&cl_));
+    dev_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, frames_[0].alloc.Get(), nullptr, IID_PPV_ARGS(&L().cl));
+    for (size_t l = 1; l < lanes_.size(); l++) {
+        Lane& lane = *lanes_[l];
+        for (auto& alloc : lane.allocs) {
+            dev_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc));
+        }
+        ID3D12CommandAllocator* first = lane.allocs[0].Get();
+        dev_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, first, nullptr, IID_PPV_ARGS(&lane.cl));
+        lane.cl->Close();
+    }
 
     D3D12_QUERY_HEAP_DESC qd{D3D12_QUERY_HEAP_TYPE_OCCLUSION, kQueryCount, 0};
     dev_->CreateQueryHeap(&qd, IID_PPV_ARGS(&query_heap_));
@@ -1221,16 +1264,22 @@ void D3D12Backend::StorePipeline(const PipelineKey& k, D3D12_SHADER_BYTECODE vs,
 }
 
 void D3D12Backend::Begin() {
-    ID3D12DescriptorHeap* heaps[] = {view_heap_.Get(), sampler_heap_.Get()};
-    cl_->SetDescriptorHeaps(2, heaps);
-    cl_->SetGraphicsRootSignature(root_.Get());
-    cl_->SetGraphicsRootDescriptorTable(kRootSamplerHeap, sampler_heap_->GetGPUDescriptorHandleForHeapStart());
+    Rebind();
     Unbind();
 }
 
+// a command list just reset: its heaps, root signature and sampler table, and draw state set again from scratch
+void D3D12Backend::Rebind() {
+    ID3D12DescriptorHeap* heaps[] = {view_heap_.Get(), sampler_heap_.Get()};
+    L().cl->SetDescriptorHeaps(2, heaps);
+    L().cl->SetGraphicsRootSignature(root_.Get());
+    L().cl->SetGraphicsRootDescriptorTable(kRootSamplerHeap, sampler_heap_->GetGPUDescriptorHandleForHeapStart());
+    L().binds = {};
+}
+
 void D3D12Backend::Submit(bool wait) {
-    cl_->Close();
-    ID3D12CommandList* lists[] = {cl_.Get()};
+    L().cl->Close();
+    ID3D12CommandList* lists[] = {L().cl.Get()};
     latency::Executed();
     queue_->ExecuteCommandLists(1, lists);
     queue_->Signal(fence_.Get(), ++fence_value_);
@@ -1240,11 +1289,9 @@ void D3D12Backend::Submit(bool wait) {
     WaitFence(fence_value_);
     f.alloc->Reset();
     f.garbage.clear();
-    Recycle(f.ring);
+    RecycleLanes();
     Recycle(f.texels);
-    upload_epoch_++;
-    f.views = 0;
-    cl_->Reset(f.alloc.Get(), nullptr);
+    L().cl->Reset(f.alloc.Get(), nullptr);
     Begin();
 }
 
@@ -1256,18 +1303,18 @@ void D3D12Backend::WaitFence(uint64_t value) {
 
 // where size bytes fit in the ring; a new chunk gets new vertex views and kept uploads
 uint64_t D3D12Backend::RingRoom(uint64_t size, uint64_t align) {
-    UploadChunks& ring = CurrentFrame().ring;
+    UploadChunks& ring = LaneRing();
     size_t at = ring.at;
-    uint64_t o = Room(dev_.Get(), ring, size, align, kUploadSize);
+    uint64_t o = Room(dev_.Get(), ring, size, align, L().chunk_size);
     if (ring.at == at) return o;
-    upload_epoch_++;
+    L().upload_epoch++;
     Unbind();
     return o;
 }
 
 Alloc D3D12Backend::Upload(uint64_t size, uint64_t align) {
     uint64_t o = RingRoom(size, align);
-    return Take(CurrentFrame().ring, o, size);
+    return Take(LaneRing(), o, size);
 }
 
 Alloc D3D12Backend::UploadTexels(uint64_t size) {
@@ -1285,23 +1332,29 @@ D3D12_GPU_VIRTUAL_ADDRESS D3D12Backend::UploadConstants(const void* data, uint32
 
 // host order constants for root: the last draw's upload again while the bytes are the same
 D3D12_GPU_VIRTUAL_ADDRESS D3D12Backend::HeldConstants(uint32_t root, const void* data, uint32_t size) {
-    bool same = const_gpu_[root] && const_size_[root] == size && std::memcmp(const_last_[root], data, size) == 0;
-    if (same) return const_gpu_[root];
-    std::memcpy(const_last_[root], data, size);
-    const_size_[root] = size;
-    const_gpu_[root] = UploadConstants(data, size);
-    return const_gpu_[root];
+    Lane& lane = L();
+    bool same = lane.const_gpu[root] && lane.const_size[root] == size;
+    if (same && std::memcmp(lane.const_last[root], data, size) == 0) return lane.const_gpu[root];
+    std::memcpy(lane.const_last[root], data, size);
+    lane.const_size[root] = size;
+    lane.const_gpu[root] = UploadConstants(data, size);
+    return lane.const_gpu[root];
 }
 
 uint32_t D3D12Backend::AllocViews(uint32_t n) {
-    Frame& f = CurrentFrame();
-    if (f.views + n > kViewsPerFrame) {
+    uint32_t& used = L().views[frame_ % kFrames];
+    if (used + n > kLaneViews && OnRenderThread()) {
         static bool logged = false;
         if (!std::exchange(logged, true)) LOGR("D3D12: descriptor ring full within a frame, waiting for the GPU");
         Submit(true);
+    } else if (used + n > kLaneViews) {
+        // a lane starts its slice over; tables it made early in the frame may still be read
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true)) LOGR("D3D12: a draw batch ran out of descriptors");
+        used = 0;
     }
-    uint32_t i = uint32_t(frame_ % kFrames) * kViewsPerFrame + CurrentFrame().views;
-    CurrentFrame().views += n;
+    uint32_t i = uint32_t(frame_ % kFrames) * kViewsPerFrame + L().view_base + used;
+    used += n;
     return i;
 }
 
@@ -1326,13 +1379,19 @@ D3D12_CPU_DESCRIPTOR_HANDLE D3D12Backend::Dsv(uint32_t i) const {
 
 void D3D12Backend::Transition(ID3D12Resource* r, D3D12_RESOURCE_STATES& cur, D3D12_RESOURCE_STATES want) {
     if (cur == want) return;
+    if (!OnRenderThread()) {
+        // Prepare moved a batch's resources to their states before it
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true)) LOGR("D3D12: a draw batch met a resource in another state");
+        return;
+    }
     D3D12_RESOURCE_BARRIER b{};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     b.Transition.pResource = r;
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     b.Transition.StateBefore = cur;
     b.Transition.StateAfter = want;
-    cl_->ResourceBarrier(1, &b);
+    L().cl->ResourceBarrier(1, &b);
     cur = want;
 }
 
@@ -1360,6 +1419,11 @@ Target* D3D12Backend::EnsureTarget(const Surface& sf, bool depth, uint32_t width
     uint64_t key = 0;
     if (ext_ && !ext_->TargetKey(sf, depth, key)) return nullptr;
     uint64_t map_key = TargetMapKey(sf, depth, width, key);
+    if (!OnRenderThread()) {
+        auto made = targets_.find(map_key);
+        bool fits = made != targets_.end() && made->second.res && made->second.height >= height;
+        return fits ? &made->second : nullptr;
+    }
     Target& t = targets_[map_key];
     if (t.res && t.height >= height) return &t;
     Target old = std::move(t);
@@ -1405,14 +1469,14 @@ Target* D3D12Backend::EnsureTarget(const Surface& sf, bool depth, uint32_t width
         dv.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
         dv.ViewDimension = t.samples > 1 ? D3D12_DSV_DIMENSION_TEXTURE2DMS : D3D12_DSV_DIMENSION_TEXTURE2D;
         dev_->CreateDepthStencilView(t.res.Get(), &dv, Dsv(t.view));
-        cl_->ClearDepthStencilView(Dsv(t.view), D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0, 0, 0, nullptr);
+        L().cl->ClearDepthStencilView(Dsv(t.view), D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0, 0, 0, nullptr);
     } else {
         D3D12_RENDER_TARGET_VIEW_DESC rv{};
         rv.Format = t.fmt;
         rv.ViewDimension = t.samples > 1 ? D3D12_RTV_DIMENSION_TEXTURE2DMS : D3D12_RTV_DIMENSION_TEXTURE2D;
         dev_->CreateRenderTargetView(t.res.Get(), &rv, Rtv(t.view));
         float black[4] = {};
-        cl_->ClearRenderTargetView(Rtv(t.view), black, 0, nullptr);
+        L().cl->ClearRenderTargetView(Rtv(t.view), black, 0, nullptr);
     }
     // a grown target keeps what was drawn
     if (old.res && t.samples == 1 && old.fmt == t.fmt && old.scale == t.scale) {
@@ -1420,7 +1484,7 @@ Target* D3D12Backend::EnsureTarget(const Surface& sf, bool depth, uint32_t width
         Transition(t.res.Get(), t.state, D3D12_RESOURCE_STATE_COPY_DEST);
         D3D12_TEXTURE_COPY_LOCATION dst{t.res.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
         D3D12_TEXTURE_COPY_LOCATION src{old.res.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
-        cl_->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        L().cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     }
     return &t;
 }
@@ -1509,10 +1573,10 @@ void D3D12Backend::ClearTarget(Target& t, uint32_t flags, const float color[4], 
         if (!f) return;
         Transition(t.res.Get(), t.state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
         // depth is held reversed
-        cl_->ClearDepthStencilView(Dsv(t.view), f, 1 - z, stencil, count, rects);
+        L().cl->ClearDepthStencilView(Dsv(t.view), f, 1 - z, stencil, count, rects);
     } else if (flags & kClearColors) {
         Transition(t.res.Get(), t.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
-        cl_->ClearRenderTargetView(Rtv(t.view), color, count, rects);
+        L().cl->ClearRenderTargetView(Rtv(t.view), color, count, rects);
     }
 }
 
@@ -1532,6 +1596,7 @@ void D3D12Backend::ClearSpan(const Target& cleared, uint32_t flags, const float 
 }
 
 void D3D12Backend::ApplySpanClear(Target& t) {
+    if (!OnRenderThread()) return;  // Prepare cleared a batch's targets
     auto held = span_clears_.find(&t);
     if (held == span_clears_.end()) return;
     SpanClear c = held->second;
@@ -1554,12 +1619,17 @@ Shader* D3D12Backend::CreateShader(ShaderStage stage, const uint32_t* code, size
 }
 
 Variant* D3D12Backend::EnsureVariant(Shader* s, const ShaderOptions& opt) {
-    if (!s->last || std::memcmp(&s->last_opt, &opt, sizeof(opt)) != 0) {
-        s->last = FindVariant(s, opt);
-        s->last_opt = opt;
+    Lane::LastVariant& last = L().variants[s->stage == ShaderStage::Vertex ? 0 : 1];
+    if (last.shader != s || std::memcmp(&last.opt, &opt, sizeof(opt)) != 0) {
+        std::lock_guard lock(shared_lock_);
+        last.variant = FindVariant(s, opt);
+        last.shader = s;
+        last.opt = opt;
     }
-    if (s->last->building.load(std::memory_order_acquire)) return nullptr;
-    return s->last->dxil.empty() ? nullptr : s->last;
+    if (last.variant->building.load(std::memory_order_acquire)) {
+        return nullptr;
+    }
+    return last.variant->dxil.empty() ? nullptr : last.variant;
 }
 
 // on a build thread when async
@@ -1660,10 +1730,11 @@ void D3D12Backend::FillPipelineDesc(const PipelineKey& k, D3D12_GRAPHICS_PIPELIN
 }
 
 ID3D12PipelineState* D3D12Backend::EnsurePipeline(const PipelineKey& k, const Variant& vs, const Variant* ps) {
-    if (last_pso_ && std::memcmp(&k, &last_key_, sizeof(k)) == 0) return last_pso_;
-    last_key_ = k;
-    last_pso_ = FindPipeline(k, vs, ps);
-    return last_pso_;
+    if (L().last_pso && std::memcmp(&k, &L().last_key, sizeof(k)) == 0) return L().last_pso;
+    L().last_key = k;
+    std::lock_guard lock(shared_lock_);
+    L().last_pso = FindPipeline(k, vs, ps);
+    return L().last_pso;
 }
 
 ID3D12PipelineState* D3D12Backend::FindPipeline(const PipelineKey& k, const Variant& vs, const Variant* ps) {
@@ -1976,6 +2047,10 @@ void D3D12Backend::HashAhead() {
 Texture* D3D12Backend::FrameTexture(const uint32_t fetch[6], const xenos::TextureFetch& t) {
     std::array<uint32_t, 6> key;
     std::copy(fetch, fetch + 6, key.begin());
+    if (!OnRenderThread()) {
+        auto made = frame_textures_.find(key);
+        return made != frame_textures_.end() ? made->second : nullptr;
+    }
     auto [it, added] = frame_textures_.try_emplace(key, nullptr);
     if (added) it->second = EnsureTexture(t);
     return it->second;
@@ -2024,7 +2099,7 @@ void D3D12Backend::UploadTexture(Texture& tex, const xenos::TextureFetch& t) {
             dst.SubresourceIndex = sub;
             D3D12_TEXTURE_COPY_LOCATION src{a.res, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
             src.PlacedFootprint = fp;
-            cl_->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            L().cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
         }
     }
 }
@@ -2044,7 +2119,7 @@ void D3D12Backend::UploadRows(ID3D12Resource* res, uint32_t sub, const std::vect
     dst.SubresourceIndex = sub;
     D3D12_TEXTURE_COPY_LOCATION src{a.res, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
     src.PlacedFootprint = fp;
-    cl_->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    L().cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
 }
 
 // the fetch constant's swizzle numbers components as D3D12's component mapping does: 0 to 3, 4 zero, 5 one
@@ -2138,6 +2213,7 @@ Shown D3D12Backend::FillTextureView(const TextureBinding& b, const uint32_t fetc
                 (b.dimension != 2 || t.dimension == xenos::Dimension::D3 || flat);
     if (fits) Transition(tex->res.Get(), tex->state, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
     // made once, copied after
+    std::lock_guard lock(shared_lock_);
     if (texture_views_.size() >= kTextureViews) {
         static bool logged = false;
         if (!std::exchange(logged, true)) LOGR("D3D12: %u texture views made, starting over", kTextureViews);
@@ -2199,9 +2275,14 @@ void D3D12Backend::NextSamplerHeap() {
 // the first of n samplers made for descs in a row, found again for the same descs
 uint32_t D3D12Backend::SamplerRun(const D3D12_SAMPLER_DESC* descs, uint32_t n) {
     uint64_t key = Hash64(descs, n * sizeof(D3D12_SAMPLER_DESC), n);
+    std::lock_guard lock(shared_lock_);
     auto it = sampler_sets_.find(key);
     if (it != sampler_sets_.end()) return it->second;
-    if (samplers_used_ + n > kSamplerCount) NextSamplerHeap();
+    if (samplers_used_ + n > kSamplerCount) {
+        // a batch draws with the heap bound before it, which Prepare filled
+        if (!OnRenderThread()) return 0;
+        NextSamplerHeap();
+    }
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = sampler_heap_->GetCPUDescriptorHandleForHeapStart();
     for (uint32_t i = 0; i < n; i++) {
         dev_->CreateSampler(&descs[i], {cpu.ptr + SIZE_T(samplers_used_ + i) * sampler_inc_});
@@ -2232,7 +2313,7 @@ uint32_t D3D12Backend::BindTextures(const State& s, const ShaderInfo& info, Shad
     made = false;
     // the shader and fetch constants of the stage's last draw: its tables again. An extension may pick by pass.
     uint32_t side = stage == ShaderStage::Vertex ? 0 : 1;
-    Binds::Stage& kept = binds_.stages[side];
+    Binds::Stage& kept = L().binds.stages[side];
     bool same = !ext_ && kept.info == &info && kept.aniso == t.aniso;
     if (same && std::memcmp(kept.fetch, t.fetch, fetch_bytes) == 0) {
         std::copy_n(kept.samplers, used, samplers);
@@ -2240,8 +2321,8 @@ uint32_t D3D12Backend::BindTextures(const State& s, const ShaderInfo& info, Shad
     }
     // or the tables an earlier draw made for them
     uint64_t key = Hash64(t.fetch, fetch_bytes, uint64_t(uintptr_t(&info)) + t.aniso);
-    auto found = tables_[side].find(key);
-    bool hit = !ext_ && found != tables_[side].end() && found->second.info == &info &&
+    auto found = L().tables[side].find(key);
+    bool hit = !ext_ && found != L().tables[side].end() && found->second.info == &info &&
                found->second.aniso == t.aniso && std::memcmp(found->second.fetch, t.fetch, fetch_bytes) == 0;
     if (hit) {
         for (uint32_t i = 0; i < used; i++) {
@@ -2260,7 +2341,7 @@ uint32_t D3D12Backend::BindTextures(const State& s, const ShaderInfo& info, Shad
             t.samplers[i] = SamplerRun(&d, 1);
         }
         NullViews(t.table + first + used, slots - used);
-        if (!ext_) tables_[side][key] = t;
+        if (!ext_) L().tables[side][key] = t;
     }
     kept.info = &info;
     kept.aniso = t.aniso;
@@ -2325,7 +2406,9 @@ bool D3D12Backend::BindTargets(const State& s, const ShaderInfo& ps, PipelineKey
     TargetViews views;
     for (uint32_t i = 0; i < count; i++) views.rtv[i] = rtv[i].ptr;
     views.dsv = dsv.ptr;
-    if (Latch(binds_.targets, views)) cl_->OMSetRenderTargets(count, count ? rtv : nullptr, FALSE, ds ? &dsv : nullptr);
+    if (Latch(L().binds.targets, views)) {
+        L().cl->OMSetRenderTargets(count, count ? rtv : nullptr, FALSE, ds ? &dsv : nullptr);
+    }
     return true;
 }
 
@@ -2467,13 +2550,14 @@ IndexRange CopyIndices32(const uint8_t* in, uint32_t count, xenos::Endian e, uin
 // the title's indices straight into the upload ring, byte order fixed
 bool D3D12Backend::UploadDirectIndices(const DrawArgs& a, uint32_t& min, uint32_t& max) {
     uint32_t format = uint32_t(a.index32) | a.index_endian << 1;
-    KeptIndices& kept = kept_indices_[KeptSlot(a.indices, a.count, format)];
-    bool same = kept.epoch == upload_epoch_ && kept.data == a.indices && kept.count == a.count && kept.format == format;
+    KeptIndices& kept = L().kept_indices[KeptSlot(a.indices, a.count, format)];
+    bool same = kept.epoch == L().upload_epoch && kept.data == a.indices && kept.count == a.count &&
+                kept.format == format;
     if (a.fenced && same) {
         min = kept.min;
         max = kept.max;
         D3D12_INDEX_BUFFER_VIEW v{kept.gpu, UINT(a.count) * 4, DXGI_FORMAT_R32_UINT};
-        cl_->IASetIndexBuffer(&v);
+        L().cl->IASetIndexBuffer(&v);
         return true;
     }
     Alloc ib = Upload(size_t(a.count) * 4, 4);
@@ -2485,9 +2569,9 @@ bool D3D12Backend::UploadDirectIndices(const DrawArgs& a, uint32_t& min, uint32_
     if (r.min > r.max) return false;
     min = r.min;
     max = r.max;
-    if (a.fenced) kept = {a.indices, a.count, format, upload_epoch_, ib.gpu, min, max};
+    if (a.fenced) kept = {a.indices, a.count, format, L().upload_epoch, ib.gpu, min, max};
     D3D12_INDEX_BUFFER_VIEW v{ib.gpu, UINT(a.count) * 4, DXGI_FORMAT_R32_UINT};
-    cl_->IASetIndexBuffer(&v);
+    L().cl->IASetIndexBuffer(&v);
     return true;
 }
 
@@ -2496,7 +2580,7 @@ bool D3D12Backend::UploadIndices(const DrawArgs& a, D3D12_PRIMITIVE_TOPOLOGY& to
                                  uint32_t& max) {
     count = a.count;
     if (a.indices && DirectTopology(a.prim, topo)) return count && UploadDirectIndices(a, min, max);
-    std::vector<uint32_t>& src = index_src_;
+    std::vector<uint32_t>& src = L().index_src;
     src.resize(a.count);
     if (a.indices && a.index32) {
         std::memcpy(src.data(), a.indices, size_t(a.count) * 4);
@@ -2513,7 +2597,7 @@ bool D3D12Backend::UploadIndices(const DrawArgs& a, D3D12_PRIMITIVE_TOPOLOGY& to
     } else {
         for (uint32_t i = 0; i < a.count; i++) src[i] = a.start + i;
     }
-    std::vector<uint32_t>& out = index_out_;
+    std::vector<uint32_t>& out = L().index_out;
     out.clear();
     switch (a.prim) {
         case kPrimPointList: topo = D3D_PRIMITIVE_TOPOLOGY_POINTLIST; break;
@@ -2554,16 +2638,16 @@ bool D3D12Backend::UploadIndices(const DrawArgs& a, D3D12_PRIMITIVE_TOPOLOGY& to
     Alloc ib = Upload(list.size() * 4, 4);
     std::memcpy(ib.cpu, list.data(), list.size() * 4);
     D3D12_INDEX_BUFFER_VIEW v{ib.gpu, UINT(list.size() * 4), DXGI_FORMAT_R32_UINT};
-    cl_->IASetIndexBuffer(&v);
+    L().cl->IASetIndexBuffer(&v);
     return true;
 }
 
 // the vertices the draw reads, copied raw into the upload ring; the vertex shader decodes them
 D3D12_GPU_VIRTUAL_ADDRESS D3D12Backend::UploadStreams(const DrawArgs& a, const ShaderInfo& vs, uint32_t min,
                                                       uint32_t max) {
-    std::vector<VertexFetchConstant>& fetch = stream_consts_;
+    std::vector<VertexFetchConstant>& fetch = L().stream_consts;
     fetch.assign(std::max<size_t>(vs.fetches.size(), 1), {});
-    auto& copied = stream_copies_;  // stream and stride to ring offset of vertex 0
+    auto& copied = L().stream_copies;  // stream and stride to ring offset of vertex 0
     copied.clear();
     for (size_t k = 0; k < vs.fetches.size(); k++) {
         const StreamFetch& sf = a.streams[k];
@@ -2579,20 +2663,21 @@ D3D12_GPU_VIRTUAL_ADDRESS D3D12Backend::UploadStreams(const DrawArgs& a, const S
             uint64_t first = std::max<uint64_t>(uint64_t(low) * stride, sf.first);
             uint64_t end = std::min<uint64_t>(uint64_t(high) * stride, sf.size);
             uint64_t bytes = end > first ? end - first : 0;
-            KeptVertices& kept = kept_vertices_[KeptSlot(sf.data, first, end)];
-            bool same = kept.epoch == upload_epoch_ && kept.data == sf.data && kept.first == first && kept.end == end;
-            if (!a.fenced || !same) {
+            KeptVertices& kept = L().kept_vertices[KeptSlot(sf.data, first, end)];
+            bool same = kept.epoch == L().upload_epoch && kept.data == sf.data && kept.first == first &&
+                        kept.end == end;
+            if (a.fenced && same) {
+                copied.emplace_back(key, uint32_t(kept.offset - first));
+            } else {
                 Alloc v = Upload(std::max<uint64_t>(bytes, 16), 16);
-                if (v.res != vertex_chunk_) {
+                if (v.res != L().vertex_chunk) {
                     static bool logged = false;
                     if (!std::exchange(logged, true)) LOGR("D3D12: vertex data past its upload chunk reads as zero");
                 } else if (a.fenced) {
-                    kept = {sf.data, first, end, upload_epoch_, v.offset};
+                    kept = {sf.data, first, end, L().upload_epoch, v.offset};
                 }
                 if (bytes) std::memcpy(v.cpu, sf.data + (first - sf.first), size_t(bytes));
                 copied.emplace_back(key, uint32_t(v.offset - first));
-            } else {
-                copied.emplace_back(key, uint32_t(kept.offset - first));
             }
             it = copied.end() - 1;
         }
@@ -2606,17 +2691,18 @@ D3D12_GPU_VIRTUAL_ADDRESS D3D12Backend::UploadStreams(const DrawArgs& a, const S
 void D3D12Backend::BindConstants(const State& s, D3D12_GPU_VIRTUAL_ADDRESS fetch, DrawConstants& c, const Target* rt,
                                  uint32_t src_blend) {
     auto bind = [&](uint32_t root, const uint8_t* be, uint32_t bytes) {
-        if (!const_gpu_[root] || std::memcmp(const_last_[root], be, bytes) != 0) {
+        if (!L().const_gpu[root] || std::memcmp(L().const_last[root], be, bytes) != 0) {
             Alloc a = Upload(bytes, kCbAlign);
             for (uint32_t i = 0; i < bytes; i += 4) {
                 uint32_t v = Be32(be + i);
                 std::memcpy(a.cpu + i, &v, 4);
             }
-            std::memcpy(const_last_[root], be, bytes);
-            const_gpu_[root] = a.gpu;
-            const_held_[root][0] = const_held_[root][1] = ~0ull;
+            std::memcpy(L().const_last[root], be, bytes);
+            L().const_gpu[root] = a.gpu;
+            L().const_held[root][0] = L().const_held[root][1] = ~0ull;
         }
-        if (Latch(binds_.roots[root], const_gpu_[root])) cl_->SetGraphicsRootConstantBufferView(root, const_gpu_[root]);
+        D3D12_GPU_VIRTUAL_ADDRESS gpu = L().const_gpu[root];
+        if (Latch(L().binds.roots[root], gpu)) L().cl->SetGraphicsRootConstantBufferView(root, gpu);
     };
     if (ext_) {
         float vsc[256][4];
@@ -2645,20 +2731,20 @@ void D3D12Backend::BindConstants(const State& s, D3D12_GPU_VIRTUAL_ADDRESS fetch
     std::memcpy(flow + 32, s.loops, 128);
     bind(kRootFlow, flow, sizeof(flow));
     D3D12_GPU_VIRTUAL_ADDRESS draw = HeldConstants(kRootDraw, &c, sizeof(c));
-    if (Latch(binds_.roots[kRootDraw], draw)) cl_->SetGraphicsRootConstantBufferView(kRootDraw, draw);
-    if (Latch(binds_.roots[kRootFetch], fetch)) cl_->SetGraphicsRootConstantBufferView(kRootFetch, fetch);
+    if (Latch(L().binds.roots[kRootDraw], draw)) L().cl->SetGraphicsRootConstantBufferView(kRootDraw, draw);
+    if (Latch(L().binds.roots[kRootFetch], fetch)) L().cl->SetGraphicsRootConstantBufferView(kRootFetch, fetch);
 }
 
 // a stage's float constants: only the blocks its shader reads are compared and swapped into the ring; an upload is
 // kept while it holds every block a draw reads
 void D3D12Backend::BindFloats(uint32_t root, const uint8_t* be, const uint64_t (&read)[2]) {
     constexpr uint32_t kBlock = 32;  // two constants, a bit of read
-    uint64_t(&held)[2] = const_held_[root];
-    bool same = const_gpu_[root] && !(read[0] & ~held[0]) && !(read[1] & ~held[1]);
+    uint64_t(&held)[2] = L().const_held[root];
+    bool same = L().const_gpu[root] && !(read[0] & ~held[0]) && !(read[1] & ~held[1]);
     for (uint32_t w = 0; w < 2 && same; w++) {
         for (uint64_t m = read[w]; m && same; m &= m - 1) {
             uint32_t at = (w * 64 + uint32_t(std::countr_zero(m))) * kBlock;
-            same = std::memcmp(const_last_[root] + at, be + at, kBlock) == 0;
+            same = std::memcmp(L().const_last[root] + at, be + at, kBlock) == 0;
         }
     }
     if (!same) {
@@ -2679,20 +2765,21 @@ void D3D12Backend::BindFloats(uint32_t root, const uint8_t* be, const uint64_t (
                     uint32_t v = Be32(be + at + i);
                     std::memcpy(a.cpu + at - start + i, &v, 4);
                 }
-                std::memcpy(const_last_[root] + at, be + at, kBlock);
+                std::memcpy(L().const_last[root] + at, be + at, kBlock);
             }
         }
         held[0] = read[0];
         held[1] = read[1];
-        const_gpu_[root] = a.gpu - start;
+        L().const_gpu[root] = a.gpu - start;
     }
-    if (Latch(binds_.roots[root], const_gpu_[root])) cl_->SetGraphicsRootConstantBufferView(root, const_gpu_[root]);
+    D3D12_GPU_VIRTUAL_ADDRESS gpu = L().const_gpu[root];
+    if (Latch(L().binds.roots[root], gpu)) L().cl->SetGraphicsRootConstantBufferView(root, gpu);
 }
 
 // the texture tables of both stages and the vertex bytes; first, as running out of descriptors submits the list
 void D3D12Backend::BindViews(const State& s, const ShaderInfo& vs, const ShaderInfo& ps) {
-    uint32_t* vs_samplers = draw_samplers_[0];
-    uint32_t* ps_samplers = draw_samplers_[1];
+    uint32_t* vs_samplers = L().draw_samplers[0];
+    uint32_t* ps_samplers = L().draw_samplers[1];
     bool fresh = false;
     bool ps_made = false;
     uint32_t heap = sampler_switches_;
@@ -2702,22 +2789,22 @@ void D3D12Backend::BindViews(const State& s, const ShaderInfo& vs, const ShaderI
     if (sampler_switches_ != heap) {
         vs_views = BindTextures(s, vs, ShaderStage::Vertex, 1, kVsTextures, vs_samplers, fresh);
     }
-    const UploadChunks& ring = CurrentFrame().ring;
+    const UploadChunks& ring = LaneRing();
     const UploadChunk& chunk = ring.list[ring.at];
-    vertex_chunk_ = chunk.res.Get();
+    L().vertex_chunk = chunk.res.Get();
     // a vertex table made before holds the view: a new chunk unbinds
-    if (fresh && ring.at == 0) {
+    if (fresh && ring.at == 0 && OnRenderThread()) {
         uint32_t raw = kPsTextures + uint32_t(frame_ % kFrames);
         dev_->CopyDescriptorsSimple(1, ViewCpu(vs_views), CopyView(raw), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     } else if (fresh) {
         D3D12_SHADER_RESOURCE_VIEW_DESC raw = RawView(chunk);
-        dev_->CreateShaderResourceView(vertex_chunk_, &raw, ViewCpu(vs_views));
+        dev_->CreateShaderResourceView(L().vertex_chunk, &raw, ViewCpu(vs_views));
     }
-    if (Latch(binds_.roots[kRootVsViews], ViewGuest(vs_views).ptr)) {
-        cl_->SetGraphicsRootDescriptorTable(kRootVsViews, ViewGuest(vs_views));
+    if (Latch(L().binds.roots[kRootVsViews], ViewGuest(vs_views).ptr)) {
+        L().cl->SetGraphicsRootDescriptorTable(kRootVsViews, ViewGuest(vs_views));
     }
-    if (Latch(binds_.roots[kRootPsViews], ViewGuest(ps_views).ptr)) {
-        cl_->SetGraphicsRootDescriptorTable(kRootPsViews, ViewGuest(ps_views));
+    if (Latch(L().binds.roots[kRootPsViews], ViewGuest(ps_views).ptr)) {
+        L().cl->SetGraphicsRootDescriptorTable(kRootPsViews, ViewGuest(ps_views));
     }
 }
 
@@ -2727,6 +2814,95 @@ D3D12_PRIMITIVE_TOPOLOGY_TYPE TopologyType(D3D12_PRIMITIVE_TOPOLOGY topo) {
         return D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
     }
     return D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+}
+
+// Batches: the draws of a run of recorded commands split over the lanes, each recording its share into its own
+// command list. Prepare first does on the render thread's list everything they would change in what they share
+
+std::vector<std::unique_ptr<D3D12Backend::Lane>> D3D12Backend::MakeLanes() {
+    std::vector<std::unique_ptr<Lane>> lanes;
+    for (uint32_t i = 0; i < kLanes; i++) {
+        lanes.push_back(std::make_unique<Lane>());
+        lanes.back()->view_base = i * kLaneViews;
+        lanes.back()->chunk_size = i ? kLaneChunk : kUploadSize;
+    }
+    return lanes;
+}
+
+thread_local D3D12Backend::Lane* D3D12Backend::t_lane_ = nullptr;
+
+// a frame's lane rings, descriptors and allocators, once the GPU is past them
+void D3D12Backend::RecycleLanes() {
+    uint32_t f = uint32_t(frame_ % kFrames);
+    for (auto& lane : lanes_) {
+        Recycle(lane->rings[f]);
+        lane->views[f] = 0;
+        lane->upload_epoch++;
+        if (lane->allocs[f]) lane->allocs[f]->Reset();
+    }
+}
+
+// a batch draw's targets made, cleared and drawable, its textures uploaded and readable, its samplers made
+void D3D12Backend::Prepare(const State& s) {
+    if (!s.vs || !s.consts || !s.fetch) return;
+    static const ShaderInfo kNoPixelShader;
+    PipelineKey k;
+    Bound b;
+    BindTargets(s, s.ps ? s.ps->info : kNoPixelShader, k, b);
+    PrepareTextures(s, s.vs->info, ShaderStage::Vertex, kVsTextures);
+    if (s.ps) PrepareTextures(s, s.ps->info, ShaderStage::Pixel, kPsTextures);
+}
+
+void D3D12Backend::PrepareTextures(const State& s, const ShaderInfo& info, ShaderStage stage, uint32_t slots) {
+    uint32_t used = std::min<uint32_t>(uint32_t(info.textures.size()), slots);
+    for (uint32_t i = 0; i < used; i++) {
+        const TextureBinding& b = info.textures[i];
+        uint32_t fetch[6];
+        ReadFetch(s, b.fetch, fetch);
+        xenos::TextureFetch t = xenos::DecodeTextureFetch(fetch);
+        if (Resolved* r = FindResolved(t, b, stage, i)) {
+            Transition(r->res.Get(), r->state, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+        } else if (Texture* tex = FrameTexture(fetch, t)) {
+            if (tex->swap) tex = tex->swap;
+            if (tex->res) Transition(tex->res.Get(), tex->state, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+        }
+        D3D12_SAMPLER_DESC d = SamplerDesc(b, fetch);
+        SamplerRun(&d, 1);
+    }
+}
+
+// on a pool thread: draws first to end of batch_ into the lane's own list
+void D3D12Backend::RecordLane(Lane& lane, size_t first, size_t end) {
+    t_lane_ = &lane;
+    lane.cl->Reset(lane.allocs[frame_ % kFrames].Get(), nullptr);
+    Rebind();
+    if (lane.unbinds != unbinds_) Unbind();
+    lane.unbinds = unbinds_;
+    for (size_t i = first; i < end; i++) Draw(*batch_[i].first, *batch_[i].second);
+    lane.cl->Close();
+    t_lane_ = nullptr;
+}
+
+void D3D12Backend::DrawBatch(size_t count, const DrawSource& get) {
+    size_t lanes = std::min<size_t>(kLanes - 1, count / kLaneDraws);
+    if (lanes < 2 || ext_ || cap_ || open_queries_) {
+        Backend::DrawBatch(count, get);
+        return;
+    }
+    batch_.resize(count);
+    for (size_t i = 0; i < count; i++) {
+        get(i, batch_[i].first, batch_[i].second);
+        Prepare(*batch_[i].first);
+    }
+    lane_pool_.Run(lanes, [&](size_t i) { RecordLane(*lanes_[i + 1], i * count / lanes, (i + 1) * count / lanes); });
+    // the render thread's list so far runs first, then each lane's share in draw order
+    ID3D12CommandList* lists[kLanes] = {};
+    L().cl->Close();
+    lists[0] = L().cl.Get();
+    for (size_t i = 0; i < lanes; i++) lists[i + 1] = lanes_[i + 1]->cl.Get();
+    queue_->ExecuteCommandLists(UINT(lanes + 1), lists);
+    L().cl->Reset(CurrentFrame().alloc.Get(), nullptr);
+    Rebind();
 }
 
 void D3D12Backend::Draw(const State& s, const DrawArgs& a) {
@@ -2781,9 +2957,9 @@ void D3D12Backend::Draw(const State& s, const DrawArgs& a) {
     uint32_t count = 0;
     uint32_t min = 0;
     uint32_t max = 0;
-    if (a.fences != draw_fences_) {
-        draw_fences_ = a.fences;
-        upload_epoch_++;
+    if (a.fences != L().draw_fences) {
+        L().draw_fences = a.fences;
+        L().upload_epoch++;
     }
     if (!UploadIndices(a, topo, count, min, max)) return;
     k.topology = TopologyType(topo);
@@ -2797,25 +2973,25 @@ void D3D12Backend::Draw(const State& s, const DrawArgs& a) {
     DrawConstants c{};
     FillDrawConstants(s, bound, c);
     c.base_vertex = a.base_vertex;
-    std::copy(std::begin(draw_samplers_[0]), std::end(draw_samplers_[0]), c.vs_samplers);
-    std::copy(std::begin(draw_samplers_[1]), std::end(draw_samplers_[1]), c.ps_samplers);
+    std::copy(std::begin(L().draw_samplers[0]), std::end(L().draw_samplers[0]), c.vs_samplers);
+    std::copy(std::begin(L().draw_samplers[1]), std::end(L().draw_samplers[1]), c.ps_samplers);
     // the source factor of colour 0, 1 without blending
     uint32_t b0 = k.blend[0];
     uint32_t src_blend = (b0 & 0x1FFF1FFF) != 0x00010001 ? Bits(b0, 0, 5) : 1;
     BindConstants(s, UploadStreams(a, vs->info, min, max), c, bound.rt, src_blend);
     D3D12_VIEWPORT vp{0, 0, std::ceil(bound.w * bound.scale), std::ceil(bound.h * bound.scale), 0, 1};
     D3D12_RECT sc = HostRect(GuestScissor(s, bound.w, bound.h), bound.scale);
-    if (Latch(binds_.viewport, vp)) cl_->RSSetViewports(1, &vp);
-    if (Latch(binds_.scissor, sc)) cl_->RSSetScissorRects(1, &sc);
+    if (Latch(L().binds.viewport, vp)) L().cl->RSSetViewports(1, &vp);
+    if (Latch(L().binds.scissor, sc)) L().cl->RSSetScissorRects(1, &sc);
     float blend[4];
     for (uint32_t i = 0; i < 4; i++) blend[i] = s.RegF(kRbBlendRed + i);
-    if (Latch(binds_.blend, blend)) cl_->OMSetBlendFactor(blend);
+    if (Latch(L().binds.blend, blend)) L().cl->OMSetBlendFactor(blend);
     uint32_t stencil_ref = Bits(s.Reg(kRbStencilRefMask), 0, 8);
-    if (Latch(binds_.stencil_ref, stencil_ref)) cl_->OMSetStencilRef(stencil_ref);
-    if (Latch(binds_.pso, pso)) cl_->SetPipelineState(pso);
-    if (Latch(binds_.topology, topo)) cl_->IASetPrimitiveTopology(topo);
-    cl_->DrawIndexedInstanced(count, 1, 0, 0, 0);
-    binds_.valid = true;
+    if (Latch(L().binds.stencil_ref, stencil_ref)) L().cl->OMSetStencilRef(stencil_ref);
+    if (Latch(L().binds.pso, pso)) L().cl->SetPipelineState(pso);
+    if (Latch(L().binds.topology, topo)) L().cl->IASetPrimitiveTopology(topo);
+    L().cl->DrawIndexedInstanced(count, 1, 0, 0, 0);
+    L().binds.valid = true;
     if (cap_) {
         uint32_t rt = bound.rt ? bound.rt->surface.base : 0;
         uint32_t ds = bound.ds ? bound.ds->surface.base : 0;
@@ -3020,13 +3196,13 @@ void D3D12Backend::CopyResolved(Resolved& from, Resolved& to, const Rect& src, c
     Transition(from.res.Get(), from.state, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
     Transition(to.res.Get(), to.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = Rtv(to.view);
-    cl_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    L().cl->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
     float dw = (dst.x2 - dst.x1) * scale_;
     float dh = (dst.y2 - dst.y1) * scale_;
     D3D12_VIEWPORT vp{dst.x1 * scale_, dst.y1 * scale_, dw, dh, 0, 1};
     D3D12_RECT sc{0, 0, LONG(std::ceil(to.width * scale_)), LONG(std::ceil(to.height * scale_))};
-    cl_->RSSetViewports(1, &vp);
-    cl_->RSSetScissorRects(1, &sc);
+    L().cl->RSSetViewports(1, &vp);
+    L().cl->RSSetScissorRects(1, &sc);
     float w = float(from.width);
     float h = float(from.height);
     float uv[4] = {src.x1 / w, src.y1 / h, (src.x2 - src.x1) / w, (src.y2 - src.y1) / h};
@@ -3065,7 +3241,7 @@ void D3D12Backend::ReadBackResolve(CpuRead& read, Resolved& from) {
     D3D12_TEXTURE_COPY_LOCATION to{buffer.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
     to.PlacedFootprint = fp;
     D3D12_TEXTURE_COPY_LOCATION texels{from.res.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
-    cl_->CopyTextureRegion(&to, 0, 0, 0, &texels, nullptr);
+    L().cl->CopyTextureRegion(&to, 0, 0, 0, &texels, nullptr);
     read.fence[slot] = fence_value_ + 1;
     read.row_pitch[slot] = fp.Footprint.RowPitch;
     read.scale[slot] = from.scale;
@@ -3140,19 +3316,19 @@ void D3D12Backend::CopyResolve(Target& src, Resolved& dst, const ResolveArgs& r)
         face.Texture2DArray.ArraySize = 1;
         dev_->CreateRenderTargetView(dst.res.Get(), &face, rtv);
     }
-    cl_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    L().cl->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
     float dw = (r.rect.x2 - r.rect.x1) * scale_;
     float dh = (r.rect.y2 - r.rect.y1) * scale_;
     D3D12_VIEWPORT vp{r.dst_x * scale_, r.dst_y * scale_, dw, dh, 0, 1};
     D3D12_RECT sc{0, 0, LONG(std::ceil(dst.width * scale_)), LONG(std::ceil(dst.height * scale_))};
-    cl_->RSSetViewports(1, &vp);
-    cl_->RSSetScissorRects(1, &sc);
-    cl_->SetPipelineState(pso);
-    cl_->SetGraphicsRootConstantBufferView(kRootVsConsts, addr);
-    cl_->SetGraphicsRootConstantBufferView(kRootPsConsts, addr);
-    cl_->SetGraphicsRootDescriptorTable(kRootPsViews, ViewGuest(views));
-    cl_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-    cl_->DrawInstanced(4, 1, 0, 0);
+    L().cl->RSSetViewports(1, &vp);
+    L().cl->RSSetScissorRects(1, &sc);
+    L().cl->SetPipelineState(pso);
+    L().cl->SetGraphicsRootConstantBufferView(kRootVsConsts, addr);
+    L().cl->SetGraphicsRootConstantBufferView(kRootPsConsts, addr);
+    L().cl->SetGraphicsRootDescriptorTable(kRootPsViews, ViewGuest(views));
+    L().cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    L().cl->DrawInstanced(4, 1, 0, 0);
     Unbind();
 }
 
@@ -3197,15 +3373,15 @@ void D3D12Backend::BlitToSwap(ID3D12Resource* src, D3D12_RESOURCE_STATES& state,
     D3D12_GPU_VIRTUAL_ADDRESS addr = UploadConstants(cb, sizeof(cb));
     D3D12_VIEWPORT vp{(swap_w_ - vw) / 2, (swap_h_ - vh) / 2, vw, vh, 0, 1};
     D3D12_RECT sc{0, 0, LONG(swap_w_), LONG(swap_h_)};
-    cl_->RSSetViewports(1, &vp);
-    cl_->RSSetScissorRects(1, &sc);
-    cl_->SetPipelineState(pso);
-    cl_->SetGraphicsRootConstantBufferView(kRootVsConsts, addr);
-    cl_->SetGraphicsRootConstantBufferView(kRootPsConsts, addr);
-    cl_->SetGraphicsRootDescriptorTable(kRootPsViews, ViewGuest(views));
-    cl_->SetGraphicsRootDescriptorTable(kRootPsSamplers, LinearSamplers());
-    cl_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-    cl_->DrawInstanced(4, 1, 0, 0);
+    L().cl->RSSetViewports(1, &vp);
+    L().cl->RSSetScissorRects(1, &sc);
+    L().cl->SetPipelineState(pso);
+    L().cl->SetGraphicsRootConstantBufferView(kRootVsConsts, addr);
+    L().cl->SetGraphicsRootConstantBufferView(kRootPsConsts, addr);
+    L().cl->SetGraphicsRootDescriptorTable(kRootPsViews, ViewGuest(views));
+    L().cl->SetGraphicsRootDescriptorTable(kRootPsSamplers, LinearSamplers());
+    L().cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    L().cl->DrawInstanced(4, 1, 0, 0);
     Unbind();
 }
 
@@ -3217,8 +3393,8 @@ void D3D12Backend::RenderUi() {
     if (app::kGame.ui) app::kGame.ui(fps_);
     ImGui::Render();
     ID3D12DescriptorHeap* uh[] = {ui_heap_.Get()};
-    cl_->SetDescriptorHeaps(1, uh);
-    ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), cl_.Get());
+    L().cl->SetDescriptorHeaps(1, uh);
+    ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), L().cl.Get());
 }
 
 // the frame and the UI into the back buffer, then shown
@@ -3228,8 +3404,8 @@ void D3D12Backend::ShowFrame(const xenos::TextureFetch& t) {
     Transition(bb_[bi].Get(), bs, D3D12_RESOURCE_STATE_RENDER_TARGET);
     D3D12_CPU_DESCRIPTOR_HANDLE rh = Rtv(kRtvCount + bi);
     float black[4] = {0, 0, 0, 1};
-    cl_->ClearRenderTargetView(rh, black, 0, nullptr);
-    cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
+    L().cl->ClearRenderTargetView(rh, black, 0, nullptr);
+    L().cl->OMSetRenderTargets(1, &rh, FALSE, nullptr);
     auto resolved = resolved_.find(ResolvedKey(t.base, 0));
     if (resolved != resolved_.end()) {
         Resolved& r = resolved->second;
@@ -3262,7 +3438,7 @@ void D3D12Backend::Present(const uint32_t front[6]) {
     ShowFrame(t);
     latency::Submitted(fence_.Get(), CurrentFrame().fence);
 
-    for (const UploadChunk& c : CurrentFrame().ring.list) g_perf.upload_bytes += c.used;
+    for (const UploadChunk& c : LaneRing().list) g_perf.upload_bytes += c.used;
     presents_++;
     frame_++;
     HashAhead();
@@ -3272,12 +3448,10 @@ void D3D12Backend::Present(const uint32_t front[6]) {
     LandCpuReads();
     next.alloc->Reset();
     next.garbage.clear();
-    Recycle(next.ring);
+    RecycleLanes();
     Recycle(next.texels);
     if (texturedumper::Update()) ReleasePackTextures();
-    upload_epoch_++;
-    next.views = 0;
-    cl_->Reset(next.alloc.Get(), nullptr);
+    L().cl->Reset(next.alloc.Get(), nullptr);
     Begin();
 
     fps_frames_++;
@@ -3314,10 +3488,12 @@ void D3D12Backend::Present(const uint32_t front[6]) {
 
 // the draw state set since is set again by the next draw
 void D3D12Backend::Unbind() {
-    std::fill(std::begin(const_gpu_), std::end(const_gpu_), 0);
-    binds_ = {};
-    tables_[0].clear();
-    tables_[1].clear();
+    Lane& lane = L();
+    std::fill(std::begin(lane.const_gpu), std::end(lane.const_gpu), 0);
+    lane.binds = {};
+    lane.tables[0].clear();
+    lane.tables[1].clear();
+    if (OnRenderThread()) unbinds_++;
 }
 
 // a copy of the target to read while drawing to it; a multisampled one is resolved into it
@@ -3341,9 +3517,9 @@ ID3D12Resource* D3D12Backend::Feedback(Target& t) {
     Transition(t.res.Get(), t.state, read);
     Transition(t.fb.Get(), t.fb_state, write);
     if (ms)
-        cl_->ResolveSubresource(t.fb.Get(), 0, t.res.Get(), 0, t.fmt);
+        L().cl->ResolveSubresource(t.fb.Get(), 0, t.res.Get(), 0, t.fmt);
     else
-        cl_->CopyResource(t.fb.Get(), t.res.Get());
+        L().cl->CopyResource(t.fb.Get(), t.res.Get());
     Transition(t.fb.Get(), t.fb_state, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
     return t.fb.Get();
 }
@@ -3406,12 +3582,12 @@ D3D12_GPU_DESCRIPTOR_HANDLE D3D12Backend::LinearSamplers() {
 
 void D3D12Backend::FullScreen(ID3D12PipelineState* pso, uint32_t views, const float p[8]) {
     D3D12_GPU_DESCRIPTOR_HANDLE samplers = LinearSamplers();
-    cl_->SetPipelineState(pso);
-    cl_->SetGraphicsRootConstantBufferView(kRootFlow, UploadConstants(p, 8 * sizeof(float)));
-    cl_->SetGraphicsRootDescriptorTable(kRootPsViews, ViewGuest(views));
-    cl_->SetGraphicsRootDescriptorTable(kRootPsSamplers, samplers);
-    cl_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    cl_->DrawInstanced(3, 1, 0, 0);
+    L().cl->SetPipelineState(pso);
+    L().cl->SetGraphicsRootConstantBufferView(kRootFlow, UploadConstants(p, 8 * sizeof(float)));
+    L().cl->SetGraphicsRootDescriptorTable(kRootPsViews, ViewGuest(views));
+    L().cl->SetGraphicsRootDescriptorTable(kRootPsSamplers, samplers);
+    L().cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    L().cl->DrawInstanced(3, 1, 0, 0);
     Unbind();
 }
 
@@ -3435,14 +3611,14 @@ void D3D12Backend::Pass(const char* hlsl, const char* entry, DXGI_FORMAT rtv, D3
     uint32_t views = AllocViews(kPsTextures);
     for (uint32_t i = 0; i < 3; i++) ShaderView(src[i], fmt[i], views + i);
     NullViews(views + 3, kPsTextures - 3);
-    cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
+    L().cl->OMSetRenderTargets(1, &rh, FALSE, nullptr);
     D3D12_VIEWPORT vp{0, 0, float(w), float(h), 0, 1};
     D3D12_RECT sc{0, 0, LONG(w), LONG(h)};
-    cl_->RSSetViewports(1, &vp);
-    cl_->RSSetScissorRects(1, &sc);
+    L().cl->RSSetViewports(1, &vp);
+    L().cl->RSSetScissorRects(1, &sc);
     if (blend >= 0) {
         float f[4] = {blend, blend, blend, blend};
-        cl_->OMSetBlendFactor(f);
+        L().cl->OMSetBlendFactor(f);
     }
     FullScreen(pso, views, p);
 }
@@ -3608,22 +3784,22 @@ void D3D12Backend::CapSave(ID3D12Resource* res, D3D12_RESOURCE_STATES& state, DX
     float cb[8] = {0, 0, float(w), float(h), float(samples), depth ? 1.0f : 0.0f, mul, 0};
     D3D12_GPU_VIRTUAL_ADDRESS addr = UploadConstants(cb, sizeof(cb));
     D3D12_CPU_DESCRIPTOR_HANDLE rh = Rtv(rtv);
-    cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
+    L().cl->OMSetRenderTargets(1, &rh, FALSE, nullptr);
     D3D12_VIEWPORT vp{0, 0, float(w), float(h), 0, 1};
     D3D12_RECT sc{0, 0, LONG(w), LONG(h)};
-    cl_->RSSetViewports(1, &vp);
-    cl_->RSSetScissorRects(1, &sc);
-    cl_->SetPipelineState(pso);
-    cl_->SetGraphicsRootConstantBufferView(kRootVsConsts, addr);
-    cl_->SetGraphicsRootConstantBufferView(kRootPsConsts, addr);
-    cl_->SetGraphicsRootDescriptorTable(kRootPsViews, ViewGuest(views));
-    cl_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-    cl_->DrawInstanced(4, 1, 0, 0);
+    L().cl->RSSetViewports(1, &vp);
+    L().cl->RSSetScissorRects(1, &sc);
+    L().cl->SetPipelineState(pso);
+    L().cl->SetGraphicsRootConstantBufferView(kRootVsConsts, addr);
+    L().cl->SetGraphicsRootConstantBufferView(kRootPsConsts, addr);
+    L().cl->SetGraphicsRootDescriptorTable(kRootPsViews, ViewGuest(views));
+    L().cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    L().cl->DrawInstanced(4, 1, 0, 0);
     Transition(copy.Get(), copy_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
     D3D12_TEXTURE_COPY_LOCATION dst{readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
     dst.PlacedFootprint = fp;
     D3D12_TEXTURE_COPY_LOCATION src{copy.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
-    cl_->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    L().cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     Submit(true);
     uint8_t* p = nullptr;
     if (FAILED(readback->Map(0, nullptr, reinterpret_cast<void**>(&p)))) return;
@@ -3637,16 +3813,18 @@ void D3D12Backend::CapSave(ID3D12Resource* res, D3D12_RESOURCE_STATES& state, DX
 
 void D3D12Backend::BeginQuery(uint32_t q) {
     q %= kQueryCount;
+    if (!queries_[q].open) open_queries_++;
     queries_[q] = {0, true};
-    cl_->BeginQuery(query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION, q);
+    L().cl->BeginQuery(query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION, q);
 }
 
 void D3D12Backend::EndQuery(uint32_t q) {
     q %= kQueryCount;
     if (!queries_[q].open) return;
     queries_[q].open = false;
-    cl_->EndQuery(query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION, q);
-    cl_->ResolveQueryData(query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION, q, 1, query_read_.Get(), q * 8ull);
+    open_queries_--;
+    L().cl->EndQuery(query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION, q);
+    L().cl->ResolveQueryData(query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION, q, 1, query_read_.Get(), q * 8ull);
     // resolved in the next submission
     queries_[q].fence = fence_value_ + 1;
 }

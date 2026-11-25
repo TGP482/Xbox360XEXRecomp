@@ -787,10 +787,11 @@ private:
     // saved as the frame leaves it
     void StartCapture();
     void FinishCapture(const xenos::TextureFetch& front);
-    void CapStep(Target* rt);
+    bool CapStep(Target* rt);
     void CapSave(ID3D12Resource* res, D3D12_RESOURCE_STATES& state, DXGI_FORMAT view, uint32_t samples, bool depth,
                  uint32_t w, uint32_t h, float mul, const std::string& name);
     void CapSave(Target& t, const std::string& name, float mul);
+    void CapRaw(Resolved& r, const std::string& name);
     void CapState(const State& s);
     void CapFetch(const uint32_t fetch[6], const xenos::TextureFetch& t);
     void CapShader(const Shader* sh, const ShaderOptions& opt, uint64_t key);
@@ -2258,6 +2259,10 @@ D3D12_SAMPLER_DESC D3D12Backend::SamplerDesc(const TextureBinding& b, const uint
     d.AddressU = AddressMode(t.clamp[0]);
     d.AddressV = AddressMode(t.clamp[1]);
     d.AddressW = AddressMode(t.clamp[2]);
+    // fetch dword 5 bits 0 and 1: black, white, then the two YCbCr blacks
+    static constexpr float kBorders[4][4] = {{0, 0, 0, 0}, {1, 1, 1, 1}, {0.5f, 0, 0.5f, 0}, {0, 0.5f, 0.5f, 0}};
+    const float(&border)[4] = kBorders[fetch[5] & 3];
+    std::copy(std::begin(border), std::end(border), d.BorderColor);
     d.MipLODBias = t.lod_bias / 32.0f;
     d.MinLOD = float(t.mip_min);
     // the base map filter samples level mip_min alone
@@ -2977,7 +2982,11 @@ void D3D12Backend::Draw(const State& s, const DrawArgs& a) {
         k = unbound;
         if (!BindTargets(s, ps_info, k, bound)) return;
     }
-    if (cap_ && bound.rt) CapStep(bound.rt);
+    // saving the last target submitted the list this draw's views and targets were set on
+    if (cap_ && bound.rt && CapStep(bound.rt)) {
+        BindViews(s, vs->info, ps_info);
+        BindTargets(s, ps_info, k, bound);
+    }
     FillKeyStates(s, bound.scale, k);
     if (!k.ds_format) k.depth_control = 0;
     D3D12_PRIMITIVE_TOPOLOGY topo;
@@ -3063,6 +3072,7 @@ void D3D12Backend::Clear(const State& s, uint32_t flags, const float color[4], f
     }
     auto clear = [&](Target* t, uint32_t which) {
         if (!t) return;
+        if (cap_ && !t->depth) CapStep(t);
         D3D12_RECT host = HostRect(r, t->scale);
         ClearTarget(*t, which, color, z, uint8_t(stencil), whole ? nullptr : &host, whole ? 0 : 1);
         if (whole) ClearSpan(*t, which, color, z, uint8_t(stencil));
@@ -3098,6 +3108,7 @@ void D3D12Backend::Resolve(const State& s, const ResolveArgs& r) {
         Resolved& dst = EnsureResolved(ResolvedKey(r.dst_base, src->key), fi.host, w, h, r.dst_faces);
         dst.copied = -1;
         if (dst.res) CopyResolve(*src, dst, r);
+        if (cap_ && dst.res) CapRaw(dst, std::to_string(cap_i_ - 1) + "_raw_" + std::to_string(r.dst_base));
         auto read = cpu_reads_.find(r.dst_base);
         if (read != cpu_reads_.end()) ReadBackResolve(read->second, dst);
     } else if (src) {
@@ -3682,15 +3693,47 @@ void D3D12Backend::FinishCapture(const xenos::TextureFetch& front) {
 }
 
 // the frame moves to another colour target: save the one it leaves
-void D3D12Backend::CapStep(Target* rt) {
-    if (rt == cap_rt_) return;
-    if (cap_rt_) {
+bool D3D12Backend::CapStep(Target* rt) {
+    if (rt == cap_rt_) return false;
+    Target* last = std::exchange(cap_rt_, rt);
+    if (last) {
         char name[48];
-        std::snprintf(name, sizeof(name), "%04u_%u_%ux%u", cap_i_, cap_rt_->surface.base, cap_rt_->width,
-                      cap_rt_->height);
-        CapSave(*cap_rt_, name, cap_rt_->range);
+        std::snprintf(name, sizeof(name), "%04u_%u_%ux%u", cap_i_, last->surface.base, last->width, last->height);
+        CapSave(*last, name, last->range);
     }
-    cap_rt_ = rt;
+    return last != nullptr;
+}
+
+// a float resolve's host texels as they are, which an 8 bit picture clips; rows packed, size in the name
+void D3D12Backend::CapRaw(Resolved& r, const std::string& name) {
+    static constexpr DXGI_FORMAT kFloats[] = {DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R32G32_FLOAT,
+                                              DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT};
+    if (std::find(std::begin(kFloats), std::end(kFloats), r.format) == std::end(kFloats)) return;
+    D3D12_RESOURCE_DESC d = r.res->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp;
+    UINT rows = 0;
+    UINT64 row_bytes = 0;
+    UINT64 total = 0;
+    dev_->GetCopyableFootprints(&d, 0, 1, 0, &fp, &rows, &row_bytes, &total);
+    ComPtr<ID3D12Resource> readback;
+    D3D12_HEAP_PROPERTIES rp{D3D12_HEAP_TYPE_READBACK};
+    D3D12_RESOURCE_DESC bd = BufferDesc(total);
+    if (FAILED(dev_->CreateCommittedResource(&rp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                             IID_PPV_ARGS(&readback))))
+        return;
+    Transition(r.res.Get(), r.state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION dst{readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+    dst.PlacedFootprint = fp;
+    D3D12_TEXTURE_COPY_LOCATION src{r.res.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+    L().cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    Submit(true);
+    uint8_t* p = nullptr;
+    if (FAILED(readback->Map(0, nullptr, reinterpret_cast<void**>(&p)))) return;
+    std::string file = name + "_" + std::to_string(d.Width) + "x" + std::to_string(rows) + "_" +
+                       std::to_string(uint32_t(r.format)) + ".raw";
+    std::ofstream out(cap_dir_ / file, std::ios::binary);
+    for (UINT y = 0; y < rows; y++) out.write(reinterpret_cast<const char*>(p + y * fp.Footprint.RowPitch), row_bytes);
+    readback->Unmap(0, nullptr);
 }
 
 void D3D12Backend::CapSave(Target& t, const std::string& name, float mul) {
@@ -3711,6 +3754,16 @@ void D3D12Backend::CapState(const State& s) {
                  ColorInfo(s, 0), ColorInfo(s, 1), ColorInfo(s, 2), ColorInfo(s, 3), s.Reg(kRbColorMask),
                  s.Reg(kRbSurfaceInfo), s.Reg(kRbDepthInfo), s.Reg(kRbDepthControl), s.Reg(kRbBlendControl0),
                  s.Reg(kRbStencilRefMask));
+    uint32_t tl = s.Reg(kPaScWindowScissorTl);
+    uint32_t br = s.Reg(kPaScWindowScissorBr);
+    uint32_t wo = s.Reg(kPaScWindowOffset);
+    std::fprintf(cap_, "     scissor %u %u %u %u%s offset %d %d viewport %g %g %g %g vte %08X tiled %u\n",
+                 Bits(tl, 0, 15), Bits(tl, 16, 15), Bits(br, 0, 15), Bits(br, 16, 15),
+                 Bits(tl, 31, 1) ? " no offset" : "", SignedBits(wo, 0, 15), SignedBits(wo, 16, 15),
+                 s.RegF(kPaClVportXScale), s.RegF(kPaClVportXScale + 1), s.RegF(kPaClVportXScale + 2),
+                 s.RegF(kPaClVportXScale + 3), s.Reg(kPaClVteCntl), s.tiled_height);
+    std::fprintf(cap_, "     colour control %08X alpha ref %g mode %08X clip %08X\n", s.Reg(kRbColorControl),
+                 s.RegF(kRbAlphaRef), s.Reg(kPaSuScModeCntl), s.Reg(kPaClClipCntl));
 }
 
 // a fetch constant as the guest wrote it, and the first bytes of a small texture as the host decodes them

@@ -60,6 +60,7 @@ struct Mode {
 };
 Mode Desktop();
 Mode Output();
+Mode CachedOutput();  // Output for every frame: looked up again only when the setting or the window's monitor changes
 float RenderScale(uint32_t guest_height);
 // the Language a language setting gives: one GameInfo::languages has, else English
 uint32_t ResolveLanguage(uint32_t setting);

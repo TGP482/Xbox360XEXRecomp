@@ -64,7 +64,8 @@ constexpr uint64_t kUploadSize = 96ull << 20;  // per frame, more chunks while a
 constexpr uint64_t kDrawUploads = 16ull << 20;  // a draw's indices, vertices and constants, at most
 constexpr uint64_t kTexelChunk = 32ull << 20;  // texture data per frame, more chunks while a burst lasts
 constexpr uint32_t kViewsPerFrame = 1u << 18;
-constexpr uint32_t kSamplerCount = 2048;
+constexpr uint32_t kSamplerCount = kSamplerHeapSlots;
+constexpr uint32_t kSamplerHeaps = 8;  // a full heap is used again once the GPU is past its draws
 constexpr uint32_t kRtvCount = 1024;
 constexpr uint32_t kDsvCount = 256;
 constexpr uint32_t kQueryCount = kQuerySlots;
@@ -89,6 +90,7 @@ enum : uint32_t {
     kRootPsViews,
     kRootVsSamplers,
     kRootPsSamplers,
+    kRootSamplerHeap,  // the whole sampler heap, for translated shaders
     kRootCount,
 };
 
@@ -724,10 +726,12 @@ private:
     void CreatePackTexture(Texture& r, const texturedumper::Image& img);
     void ReleasePackTextures();
     D3D12_SAMPLER_DESC SamplerDesc(const TextureBinding& b, const uint32_t fetch[6]) const;
-    D3D12_GPU_DESCRIPTOR_HANDLE EnsureSamplers(const std::vector<D3D12_SAMPLER_DESC>& descs);
+    void NextSamplerHeap();
+    uint32_t SamplerRun(const D3D12_SAMPLER_DESC* descs, uint32_t n);
+    D3D12_GPU_DESCRIPTOR_HANDLE SamplerTable(uint32_t first) const;
     D3D12_GPU_DESCRIPTOR_HANDLE LinearSamplers();
     uint32_t BindTextures(const State& s, const ShaderInfo& info, ShaderStage stage, uint32_t first, uint32_t slots,
-                          D3D12_GPU_DESCRIPTOR_HANDLE& samplers);
+                          uint32_t* samplers);
     void NullViews(uint32_t first, uint32_t count);
     void BindViews(const State& s, const ShaderInfo& vs, const ShaderInfo& ps);
 
@@ -844,6 +848,11 @@ private:
     std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> resolve_pipelines_;
     std::unordered_map<uint64_t, uint32_t> sampler_sets_;
     uint32_t samplers_used_ = 0;
+    // sampler_heap_ is sampler_heaps_[sampler_at_]; each one's fence is past its last draws
+    ComPtr<ID3D12DescriptorHeap> sampler_heaps_[kSamplerHeaps];
+    uint64_t sampler_fences_[kSamplerHeaps] = {};
+    uint32_t sampler_at_ = 0;
+    uint32_t sampler_switches_ = 0;
     std::ofstream pipeline_cache_;  // each pipeline appended as it is made
     // async shaders: pipelines on the build threads and those they made
     std::unordered_set<uint64_t> building_;
@@ -874,7 +883,7 @@ private:
             uint32_t aniso = 0;
             uint32_t fetch[kPsTextures][6] = {};
             uint32_t table = 0;
-            D3D12_GPU_DESCRIPTOR_HANDLE samplers{};
+            uint32_t samplers[kPsTextures] = {};
         } stages[2];
         // the view table the raw vertex view was last written into, and its chunk
         struct RawView {
@@ -890,12 +899,13 @@ private:
         return !same;
     }
 
+    uint32_t draw_samplers_[2][kPsTextures] = {};  // BindViews' sampler slots, vertex then pixel
+
     // per draw scratch, kept to save allocations
     std::vector<uint32_t> index_src_;
     std::vector<uint32_t> index_out_;
     std::vector<VertexFetchConstant> stream_consts_;
     std::vector<std::pair<std::pair<const uint8_t*, uint32_t>, uint32_t>> stream_copies_;
-    std::vector<D3D12_SAMPLER_DESC> sampler_descs_;
     std::vector<KeptVertices> kept_vertices_ = std::vector<KeptVertices>(kKeptUploads);
     std::vector<KeptIndices> kept_indices_ = std::vector<KeptIndices>(kKeptUploads);
     uint64_t upload_epoch_ = 1;
@@ -1008,7 +1018,19 @@ void D3D12Backend::CreateHeaps() {
         return dev_->GetDescriptorHandleIncrementSize(t);
     };
     view_inc_ = make(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kViewsPerFrame * kFrames, true, view_heap_);
-    sampler_inc_ = make(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, kSamplerCount, true, sampler_heap_);
+    for (auto& heap : sampler_heaps_) {
+        sampler_inc_ = make(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, kSamplerCount, true, heap);
+    }
+    sampler_heap_ = sampler_heaps_[0];
+    // every slot holds a sampler, as draws index the whole heap
+    D3D12_SAMPLER_DESC fill{};
+    fill.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+    fill.AddressU = fill.AddressV = fill.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    fill.MaxLOD = D3D12_FLOAT32_MAX;
+    for (auto& heap : sampler_heaps_) {
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap->GetCPUDescriptorHandleForHeapStart();
+        for (uint32_t i = 0; i < kSamplerCount; i++) dev_->CreateSampler(&fill, {cpu.ptr + SIZE_T(i) * sampler_inc_});
+    }
     rtv_inc_ = make(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kNullRtv + 1, false, rtv_heap_);
     dsv_inc_ = make(D3D12_DESCRIPTOR_HEAP_TYPE_DSV, kDsvCount, false, dsv_heap_);
     make(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, true, ui_heap_);
@@ -1041,6 +1063,7 @@ bool D3D12Backend::CreateRootSignature() {
     D3D12_DESCRIPTOR_RANGE ps_views{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, kPsTextures, 0, 0, 0};
     D3D12_DESCRIPTOR_RANGE vs_samplers{D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, kVsTextures, 0, 0, 0};
     D3D12_DESCRIPTOR_RANGE ps_samplers{D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, kPsTextures, 0, 0, 0};
+    D3D12_DESCRIPTOR_RANGE heap_samplers{D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, kSamplerCount, 0, 1, 0};
 
     D3D12_ROOT_PARAMETER p[kRootCount] = {};
     auto cbv = [&](uint32_t i, uint32_t reg, D3D12_SHADER_VISIBILITY vis) {
@@ -1063,6 +1086,7 @@ bool D3D12Backend::CreateRootSignature() {
     table(kRootPsViews, &ps_views, 1, D3D12_SHADER_VISIBILITY_PIXEL);
     table(kRootVsSamplers, &vs_samplers, 1, D3D12_SHADER_VISIBILITY_VERTEX);
     table(kRootPsSamplers, &ps_samplers, 1, D3D12_SHADER_VISIBILITY_PIXEL);
+    table(kRootSamplerHeap, &heap_samplers, 1, D3D12_SHADER_VISIBILITY_ALL);
 
     D3D12_ROOT_SIGNATURE_DESC rsd{};
     rsd.NumParameters = kRootCount;
@@ -1189,6 +1213,7 @@ void D3D12Backend::Begin() {
     ID3D12DescriptorHeap* heaps[] = {view_heap_.Get(), sampler_heap_.Get()};
     cl_->SetDescriptorHeaps(2, heaps);
     cl_->SetGraphicsRootSignature(root_.Get());
+    cl_->SetGraphicsRootDescriptorTable(kRootSamplerHeap, sampler_heap_->GetGPUDescriptorHandleForHeapStart());
     Unbind();
 }
 
@@ -2142,26 +2167,39 @@ D3D12_SAMPLER_DESC D3D12Backend::SamplerDesc(const TextureBinding& b, const uint
     return d;
 }
 
-D3D12_GPU_DESCRIPTOR_HANDLE D3D12Backend::EnsureSamplers(const std::vector<D3D12_SAMPLER_DESC>& descs) {
-    uint64_t key = Hash64(descs.data(), descs.size() * sizeof(D3D12_SAMPLER_DESC), descs.size());
-    auto it = sampler_sets_.find(key);
-    if (it == sampler_sets_.end()) {
-        uint32_t n = uint32_t(std::max<size_t>(descs.size(), 1));
-        if (samplers_used_ + n > kSamplerCount) {
-            static bool logged = false;
-            if (!std::exchange(logged, true)) LOGR("D3D12: sampler heap full, starting over");
-            Submit(true);
-            sampler_sets_.clear();
-            samplers_used_ = 0;
-        }
-        it = sampler_sets_.emplace(key, samplers_used_).first;
-        D3D12_CPU_DESCRIPTOR_HANDLE cpu = sampler_heap_->GetCPUDescriptorHandleForHeapStart();
-        for (uint32_t i = 0; i < descs.size(); i++) {
-            dev_->CreateSampler(&descs[i], {cpu.ptr + SIZE_T(samplers_used_ + i) * sampler_inc_});
-        }
-        samplers_used_ += n;
+// a full sampler heap waits for the GPU only while the next one is still in use
+void D3D12Backend::NextSamplerHeap() {
+    sampler_fences_[sampler_at_] = fence_value_ + 1;  // the next Submit's fence
+    sampler_at_ = (sampler_at_ + 1) % kSamplerHeaps;
+    if (sampler_fences_[sampler_at_] > fence_value_) {
+        Submit(true);
+    } else {
+        WaitFence(sampler_fences_[sampler_at_]);
     }
-    return {sampler_heap_->GetGPUDescriptorHandleForHeapStart().ptr + UINT64(it->second) * sampler_inc_};
+    sampler_heap_ = sampler_heaps_[sampler_at_];
+    sampler_sets_.clear();
+    samplers_used_ = 0;
+    sampler_switches_++;
+    Begin();  // binds the new heap, dropping tables made with the old one
+}
+
+// the first of n samplers made for descs in a row, found again for the same descs
+uint32_t D3D12Backend::SamplerRun(const D3D12_SAMPLER_DESC* descs, uint32_t n) {
+    uint64_t key = Hash64(descs, n * sizeof(D3D12_SAMPLER_DESC), n);
+    auto it = sampler_sets_.find(key);
+    if (it != sampler_sets_.end()) return it->second;
+    if (samplers_used_ + n > kSamplerCount) NextSamplerHeap();
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = sampler_heap_->GetCPUDescriptorHandleForHeapStart();
+    for (uint32_t i = 0; i < n; i++) {
+        dev_->CreateSampler(&descs[i], {cpu.ptr + SIZE_T(samplers_used_ + i) * sampler_inc_});
+    }
+    sampler_sets_.emplace(key, samplers_used_);
+    samplers_used_ += n;
+    return samplers_used_ - n;
+}
+
+D3D12_GPU_DESCRIPTOR_HANDLE D3D12Backend::SamplerTable(uint32_t first) const {
+    return {sampler_heap_->GetGPUDescriptorHandleForHeapStart().ptr + UINT64(first) * sampler_inc_};
 }
 
 // copied from the ready made ones, count at most kPsTextures
@@ -2171,7 +2209,7 @@ void D3D12Backend::NullViews(uint32_t first, uint32_t count) {
 
 // a table with texture views from slot first on and their samplers; slots past the shader's hold null views
 uint32_t D3D12Backend::BindTextures(const State& s, const ShaderInfo& info, ShaderStage stage, uint32_t first,
-                                    uint32_t slots, D3D12_GPU_DESCRIPTOR_HANDLE& samplers) {
+                                    uint32_t slots, uint32_t* samplers) {
     uint32_t used = std::min<uint32_t>(uint32_t(info.textures.size()), slots);
     uint32_t fetch[kPsTextures][6];
     for (uint32_t i = 0; i < used; i++) ReadFetch(s, info.textures[i].fetch, fetch[i]);
@@ -2180,24 +2218,22 @@ uint32_t D3D12Backend::BindTextures(const State& s, const ShaderInfo& info, Shad
     Binds::Stage& kept = binds_.stages[stage == ShaderStage::Vertex ? 0 : 1];
     bool same = !ext_ && kept.info == &info && kept.aniso == app::Get().aniso;
     if (same && std::memcmp(kept.fetch, fetch, fetch_bytes) == 0) {
-        samplers = kept.samplers;
+        std::copy_n(kept.samplers, used, samplers);
         return kept.table;
     }
     uint32_t table = AllocViews(first + slots);
-    std::vector<D3D12_SAMPLER_DESC>& descs = sampler_descs_;
-    descs.clear();
     for (uint32_t i = 0; i < used; i++) {
         const TextureBinding& b = info.textures[i];
         FillTextureView(b, fetch[i], ViewCpu(table + first + i), stage, i);
-        descs.push_back(SamplerDesc(b, fetch[i]));
+        D3D12_SAMPLER_DESC d = SamplerDesc(b, fetch[i]);
+        samplers[i] = SamplerRun(&d, 1);
     }
     NullViews(table + first + used, slots - used);
-    samplers = EnsureSamplers(descs);
     kept.info = &info;
     kept.aniso = app::Get().aniso;
     std::memcpy(kept.fetch, fetch, fetch_bytes);
     kept.table = table;
-    kept.samplers = samplers;
+    std::copy_n(samplers, used, kept.samplers);
     return table;
 }
 
@@ -2612,10 +2648,13 @@ void D3D12Backend::BindFloats(uint32_t root, const uint8_t* be, const uint64_t (
 
 // the texture tables of both stages and the vertex bytes; first, as running out of descriptors submits the list
 void D3D12Backend::BindViews(const State& s, const ShaderInfo& vs, const ShaderInfo& ps) {
-    D3D12_GPU_DESCRIPTOR_HANDLE vs_samplers;
-    D3D12_GPU_DESCRIPTOR_HANDLE ps_samplers;
+    uint32_t* vs_samplers = draw_samplers_[0];
+    uint32_t* ps_samplers = draw_samplers_[1];
+    uint32_t heap = sampler_switches_;
     uint32_t vs_views = BindTextures(s, vs, ShaderStage::Vertex, 1, kVsTextures, vs_samplers);
     uint32_t ps_views = BindTextures(s, ps, ShaderStage::Pixel, 0, kPsTextures, ps_samplers);
+    // the pixel samplers went to a new heap: the vertex ones follow
+    if (sampler_switches_ != heap) vs_views = BindTextures(s, vs, ShaderStage::Vertex, 1, kVsTextures, vs_samplers);
     const UploadChunks& ring = CurrentFrame().ring;
     const UploadChunk& chunk = ring.list[ring.at];
     vertex_chunk_ = chunk.res.Get();
@@ -2634,12 +2673,6 @@ void D3D12Backend::BindViews(const State& s, const ShaderInfo& vs, const ShaderI
     }
     if (Latch(binds_.roots[kRootPsViews], ViewGuest(ps_views).ptr)) {
         cl_->SetGraphicsRootDescriptorTable(kRootPsViews, ViewGuest(ps_views));
-    }
-    if (Latch(binds_.roots[kRootVsSamplers], vs_samplers.ptr)) {
-        cl_->SetGraphicsRootDescriptorTable(kRootVsSamplers, vs_samplers);
-    }
-    if (Latch(binds_.roots[kRootPsSamplers], ps_samplers.ptr)) {
-        cl_->SetGraphicsRootDescriptorTable(kRootPsSamplers, ps_samplers);
     }
 }
 
@@ -2665,7 +2698,9 @@ void D3D12Backend::Draw(const State& s, const DrawArgs& a) {
     if (ext_) ext_->BeginDraw(s);
     ShaderOptions vs_opt;
     std::copy(std::begin(s.link.export_map), std::end(s.link.export_map), vs_opt.export_map);
+    vs_opt.sampler_heap = true;
     ShaderOptions ps_opt;
+    ps_opt.sampler_heap = true;
     ps_opt.vpos_reg = s.link.vpos_reg;
     ps_opt.alpha_test = Bits(s.Reg(kRbColorControl), 3, 1) && Bits(s.Reg(kRbColorControl), 0, 3) != 7;
     FlatFetches(s, s.vs->info, vs_opt.flat);
@@ -2717,6 +2752,8 @@ void D3D12Backend::Draw(const State& s, const DrawArgs& a) {
     DrawConstants c{};
     FillDrawConstants(s, bound, c);
     c.base_vertex = a.base_vertex;
+    std::copy(std::begin(draw_samplers_[0]), std::end(draw_samplers_[0]), c.vs_samplers);
+    std::copy(std::begin(draw_samplers_[1]), std::end(draw_samplers_[1]), c.ps_samplers);
     // the source factor of colour 0, 1 without blending
     uint32_t b0 = k.blend[0];
     uint32_t src_blend = (b0 & 0x1FFF1FFF) != 0x00010001 ? Bits(b0, 0, 5) : 1;
@@ -3316,7 +3353,8 @@ D3D12_GPU_DESCRIPTOR_HANDLE D3D12Backend::LinearSamplers() {
     linear.MaxLOD = D3D12_FLOAT32_MAX;
     D3D12_SAMPLER_DESC point = linear;
     point.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
-    return EnsureSamplers({linear, point});
+    D3D12_SAMPLER_DESC pair[2] = {linear, point};
+    return SamplerTable(SamplerRun(pair, 2));
 }
 
 void D3D12Backend::FullScreen(ID3D12PipelineState* pso, uint32_t views, const float p[8]) {

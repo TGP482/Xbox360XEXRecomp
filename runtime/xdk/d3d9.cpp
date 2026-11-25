@@ -659,7 +659,8 @@ bool Snapshot(uint32_t dev, const gpu::DrawArgs& a, uint32_t up_data, uint32_t u
     LoadsFor(dev, r.loads);
     Streams(dev, *vs, up_data, up_bytes, up_stride, r.streams);
     r.draw = a;
-    r.draw.fenced = false;
+    // read where the title keeps it until a fence passes the run, as the GPU reads it; user pointer data is copied
+    r.draw.fenced = kFencesFollowDraws && !up_stride;
     return true;
 }
 
@@ -729,6 +730,7 @@ void FlushVertices(uint32_t dev) {
     g_pending.erase(it);
     const uint8_t* from = static_cast<const uint8_t*>(HostPtr(p.data));
     p.draw.vertices.assign(from, from + p.bytes);
+    p.draw.draw.fenced = false;  // reads the copy, which goes with the draw
     if (p.index_bytes) {
         const uint8_t* indices = static_cast<const uint8_t*>(HostPtr(p.index_data));
         p.draw.indices.assign(indices, indices + p.index_bytes);

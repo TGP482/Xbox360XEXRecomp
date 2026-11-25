@@ -2662,20 +2662,29 @@ void D3D12Backend::BindFloats(uint32_t root, const uint8_t* be, const uint64_t (
         }
     }
     if (!same) {
-        Alloc a = Upload(kConstBytes, kCbAlign);
+        // only the span the shaders read goes up; the view's base sits where constant 0 would be
+        uint32_t lo = 0;
+        uint32_t hi = 0;
+        if (read[0] | read[1]) {
+            lo = read[0] ? std::countr_zero(read[0]) : 64 + std::countr_zero(read[1]);
+            hi = read[1] ? 128 - std::countl_zero(read[1]) : 64 - std::countl_zero(read[0]);
+        }
+        uint32_t start = lo * kBlock / kCbAlign * kCbAlign;
+        uint32_t end = std::max(hi * kBlock, start + kBlock);
+        Alloc a = Upload(end - start, kCbAlign);
         for (uint32_t w = 0; w < 2; w++) {
             for (uint64_t m = read[w]; m; m &= m - 1) {
                 uint32_t at = (w * 64 + uint32_t(std::countr_zero(m))) * kBlock;
                 for (uint32_t i = 0; i < kBlock; i += 4) {
                     uint32_t v = Be32(be + at + i);
-                    std::memcpy(a.cpu + at + i, &v, 4);
+                    std::memcpy(a.cpu + at - start + i, &v, 4);
                 }
                 std::memcpy(const_last_[root] + at, be + at, kBlock);
             }
         }
         held[0] = read[0];
         held[1] = read[1];
-        const_gpu_[root] = a.gpu;
+        const_gpu_[root] = a.gpu - start;
     }
     if (Latch(binds_.roots[root], const_gpu_[root])) cl_->SetGraphicsRootConstantBufferView(root, const_gpu_[root]);
 }

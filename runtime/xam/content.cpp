@@ -28,8 +28,10 @@ constexpr uint32_t kContentDisplayName = 0x8;
 constexpr uint32_t kDisplayNameChars = 128;
 constexpr uint32_t kContentFileName = 0x108;
 constexpr uint32_t kFileNameChars = 42;
-// XamContentCreateEx disposition in the low byte of its flags, and what it reports
+// XamContentCreateEx disposition in the low four bits of its flags, transfer flags such as 0x10 above,
+// and what it reports
 enum : uint32_t { kCreateNew = 1, kCreateAlways = 2, kOpenExisting = 3, kOpenAlways = 4, kTruncateExisting = 5 };
+constexpr uint32_t kDispositionMask = 0xF;
 constexpr uint32_t kCreated = 1;
 constexpr uint32_t kOpened = 2;
 
@@ -166,7 +168,7 @@ uint32_t CreateContent(const Args& a, uint32_t overlapped) {
     uint32_t reported = 0;
     std::string display = DisplayNameOf(a[2]);
     if (display.empty()) display = ReadPackage(folder).display;  // opened by its file name alone
-    uint32_t result = Create(host, a[3] & 0xFF, fs::exists(host, ec), reported);
+    uint32_t result = Create(host, a[3] & kDispositionMask, fs::exists(host, ec), reported);
     if (result != kErrorSuccess) return Complete(overlapped, result);
     std::ofstream(folder / kContentInfo) << display << "\n" << FileNameOf(a[2]) << "\n";
     fs::remove(LegacyName(folder), ec);

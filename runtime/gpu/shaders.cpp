@@ -445,6 +445,8 @@ private:
 
     std::string Source(const Alu& a, int n, bool force_const);
     std::string VectorExpr(const Alu& a);
+    std::string CompareHook(const Alu& a);
+    std::string Sampler(uint32_t t) const;
     std::string ScalarExpr(const Alu& a);
     std::string Reg(uint32_t index, bool rel) const;
     uint32_t Binding(const Fetch& f);
@@ -459,6 +461,11 @@ private:
     std::string body_;
     int indent_ = 0;
     bool index_written_ = false;  // vertex: r0.x, where the vertex's index arrives, written
+    // pixel: per register the flagged texture plus one its last 2D fetch read, 0 none (CompareSite)
+    uint8_t fetched_[64] = {};
+    uint32_t coords_kept_ = 0;  // textures whose fetches keep their coordinates in g_tc<i>
+    bool weighted_ = false;     // a getWeights of a flagged texture came before
+    bool hooked_ = false;       // ShaderHooks::Compare replaced a compare
 };
 
 std::string Translator::Reg(uint32_t index, bool rel) const {
@@ -487,6 +494,27 @@ std::string Translator::Source(const Alu& a, int n, bool force_const) {
     for (int i = 0; i < 4; i++) swizzle += kComp[(Bits(a.Swizzle(n), 2 * i, 2) + i) & 3];
     if (swizzle != ".xyzw") s += swizzle;
     return a.Negate(n) ? "-" + s : s;
+}
+
+std::string Translator::Sampler(uint32_t t) const {
+    if (!opt_.sampler_heap) return F("s%u", t);
+    return F("g_samplers[g_%s_samplers[%u].%c]", Pixel() ? "ps" : "vs", (t & 31) / 4, "xyzw"[t % 4]);
+}
+
+// a CompareSite handed to ShaderHooks::Compare, empty when it is none: s1 one value, s2 the fetches' register as read
+std::string Translator::CompareHook(const Alu& a) {
+    uint32_t op = a.VectorOp();
+    if (!Pixel() || !weighted_ || (op != kSetGt && op != kSetGte)) return {};
+    if (!a.IsReg(2) || (a.Reg(2) & 0xC0) || a.Negate(2) || !fetched_[a.Reg(2) & 63]) return {};
+    uint32_t swizzle = a.Swizzle(1);
+    for (int i = 1; i < 4; i++) {
+        if (((Bits(swizzle, 2 * i, 2) + i) & 3) != Bits(swizzle, 0, 2)) return {};
+    }
+    uint32_t t = fetched_[a.Reg(2) & 63] - 1u;
+    CompareSite site{t, opt_.tex_flags[t], Sampler(t), F("g_tc%u", t), "s1.x"};
+    std::string hooked = Hooks().Compare(site);
+    hooked_ = hooked_ || !hooked.empty();
+    return hooked;
 }
 
 std::string Translator::VectorExpr(const Alu& a) {
@@ -617,7 +645,8 @@ void Translator::EmitAlu(const Alu& a) {
         }
     }
     if (vector) {
-        Line(F("float4 vt = %s;", VectorExpr(a).c_str()));
+        std::string compare = CompareHook(a);
+        Line(F("float4 vt = %s;", compare.empty() ? VectorExpr(a).c_str() : compare.c_str()));
         if (a.VectorClamp()) Line("vt = saturate(vt);");
     }
     if (scalar) {
@@ -629,6 +658,8 @@ void Translator::EmitAlu(const Alu& a) {
     } else {
         static const char* kMasks[16] = {"",   "x",   "y",   "xy",   "z",   "xz",   "yz",   "xyz",
                                          "w",  "xw",  "yw",  "xyw",  "zw",  "xzw",  "yzw",  "xyzw"};
+        if (a.VectorMask() && !a.VectorDestRel()) fetched_[a.VectorDest() & 63] = 0;
+        if (a.ScalarMask() && !a.ScalarDestRel()) fetched_[a.ScalarDest() & 63] = 0;
         if (a.VectorMask()) {
             const char* m = kMasks[a.VectorMask()];
             Line(F("%s.%s = vt.%s;", Reg(a.VectorDest(), a.VectorDestRel()).c_str(), m, m));
@@ -763,10 +794,7 @@ void Translator::EmitTextureFetch(const Fetch& f) {
                         : F("uv += float2(%d, %d) * 0.5 / size;", ox, oy));
         }
         std::string at = cube ? "CubeDir(tc)" : "uv";
-        std::string smp = F("s%u", t);
-        if (opt_.sampler_heap) {
-            smp = F("g_samplers[g_%s_samplers[%u].%c]", Pixel() ? "ps" : "vs", (t & 31) / 4, "xyzw"[t % 4]);
-        }
+        std::string smp = Sampler(t);
         std::string fetch;
         if (op == kGetWeights) {
             fetch = cube ? "float4(frac((tc.xy - 1) * size - 0.5), 0, 0)"
@@ -788,6 +816,13 @@ void Translator::EmitTextureFetch(const Fetch& f) {
             fetch = F("t%u.Sample(%s, %s)", t, smp.c_str(), at.c_str());
         }
         Line("float4 ft = " + fetch + ";");
+        bool flagged = Pixel() && dim == kDim2D && !f.Unnormalized() && t < 32 && opt_.tex_flags[t];
+        weighted_ = weighted_ || (flagged && op == kGetWeights);
+        if (!f.DstRel()) fetched_[f.Dst() & 63] = flagged && op == kTextureFetch ? uint8_t(t + 1) : 0;
+        if (flagged && op == kTextureFetch) {
+            Line(F("g_tc%u = tc;", t));
+            coords_kept_ |= 1u << t;
+        }
         std::string fetched = op == kTextureFetch ? Hooks().Fetched(t, opt_.tex_flags[t & 31]) : std::string();
         if (!fetched.empty()) Line(fetched);
         EmitWrite(Reg(f.Dst(), f.DstRel()), f.DstSwizzle(), "ft");
@@ -964,6 +999,10 @@ void CommitAlu() {
     s += Pixel() ? "float Kill(bool c) { if (c) discard; return c ? 1 : 0; }\n"
                  : "float Kill(bool c) { return c ? 1 : 0; }\n";
     if (opt_.sampler_heap) s += F("SamplerState g_samplers[%u] : register(s0, space1);\n", kSamplerHeapSlots);
+    for (uint32_t i = 0; i < 32; i++) {
+        if (coords_kept_ >> i & 1) s += F("static float3 g_tc%u;\n", i);
+    }
+    if (hooked_) s += "static float2 g_pixel;\n" + Hooks().Helpers();
     for (uint32_t i = 0; i < info_.textures.size(); i++) {
         static const char* kTypes[4] = {"Texture2D", "Texture2D", "Texture3D", "TextureCube"};
         uint32_t dim = opt_.flat[i & 31] ? kDim2D : info_.textures[i].dimension & 3;
@@ -1033,6 +1072,7 @@ POut main(PIn i) {
         s += "    float2 vpos = floor(i.pos.xy * g_vpos_scale);\n";
         s += F("    r[%d] = float4(i.front ? vpos.x : -vpos.x, vpos.y, 0, 0);\n", opt_.vpos_reg & 63);
     }
+    if (hooked_) s += "    g_pixel = i.pos.xy;\n";
     s += "    Run();\n";
     s += Hooks().Output();
     if (opt_.alpha_test) {

@@ -57,6 +57,16 @@ constexpr uint32_t kSamplerHeapSlots = 2048;  // D3D12's most shader visible sam
 constexpr uint32_t kMotionTarget = 4;  // past the title's four
 
 
+// a pixel shader's set greater (or equal) of one value against a register its last 2D fetches from a flagged texture
+// wrote, after a getWeights of a flagged texture: a percentage closer filter's compare, as ShaderHooks::Compare sees it
+struct CompareSite {
+    uint32_t texture = 0;  // ShaderInfo::textures index of the fetches
+    uint8_t flags = 0;     // ShaderOptions::tex_flags
+    std::string sampler;
+    std::string coords;  // float3, the last of those fetches' coordinates
+    std::string value;   // float, what the fetched values are compared against
+};
+
 // what a renderer extension adds to every translated shader
 struct ShaderHooks {
     virtual ~ShaderHooks() = default;
@@ -64,6 +74,10 @@ struct ShaderHooks {
     virtual std::string Constants() const { return "    float4 g_ext;\n"; }
     // after a fetch from texture i with the flags Sampled gave it: the result in ft
     virtual std::string Fetched(uint32_t /*i*/, uint8_t /*flags*/) const { return {}; }
+    // a float4 in place of a CompareSite's compare, which may read g_pixel; empty keeps it
+    virtual std::string Compare(const CompareSite&) const { return {}; }
+    // ahead of a shader whose compare Compare replaced
+    virtual std::string Helpers() const { return {}; }
     // the vertex position in pos before the host maps it
     virtual std::string Position() const { return {}; }
     // the colours in oC[0..3] before the alpha test

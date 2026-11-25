@@ -91,7 +91,8 @@ struct DrawConstants {
     float ext[4];      // a renderer extension's, declared by ShaderHooks::Constants
     float clip[6][4];  // the user clip planes PA_CL_CLIP_CNTL enables, 0 for the others
     int32_t base_vertex;  // added to each index before the shader sees it, as on the console
-    int32_t unused[3];  // cbuffer arrays start on 16 bytes
+    float input_shift;    // host pixels a pixel shader reads its inputs up and left of its centre
+    int32_t unused[2];  // cbuffer arrays start on 16 bytes
     uint32_t vs_samplers[32];  // each texture's sampler in the heap, with ShaderOptions::sampler_heap
     uint32_t ps_samplers[32];
 };

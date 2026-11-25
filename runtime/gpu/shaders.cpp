@@ -289,6 +289,7 @@ cbuffer Draw : register(b2) {
 )";
 const char* kPreludeEnd = R"(    float4 g_clip[6];
     int g_base_vertex;
+    float g_input_shift;
     uint4 g_vs_samplers[8];
     uint4 g_ps_samplers[8];
 };
@@ -1023,6 +1024,9 @@ struct POut {
 
 POut main(PIn i) {
     [unroll] for (uint k = 0; k < 16; k++) r[k] = i.v[k];
+    if (g_input_shift != 0) {
+        [unroll] for (uint k = 0; k < 16; k++) r[k] -= (ddx_fine(i.v[k]) + ddy_fine(i.v[k])) * g_input_shift;
+    }
 )";
     // VPOS as whole pixels, VFACE in the sign of x as the console hands them over
     if (opt_.vpos_reg >= 0) {

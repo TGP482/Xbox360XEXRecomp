@@ -2443,12 +2443,15 @@ void D3D12Backend::FillDrawConstants(const State& s, const Bound& b, DrawConstan
         xo += float(SignedBits(wo, 0, 15));
         yo += float(SignedBits(wo, 16, 15));
     }
-    // Direct3D 9 pixel centres sit on whole coordinates, the host's half a pixel in
-    if (!Bits(s.Reg(kPaSuVtxCntl), 0, 1)) {
-        xo += 0.5f;
-        yo += 0.5f;
+    // Direct3D 9 pixel centres sit on whole coordinates: positions move half a host pixel, so an edge through a title
+    // pixel centre covers that whole title pixel, and pixel shaders read their inputs the rest of the way back
+    bool whole_centres = !Bits(s.Reg(kPaSuVtxCntl), 0, 1);
+    if (whole_centres) {
+        xo += 0.5f / b.scale;
+        yo += 0.5f / b.scale;
     }
     c = {};
+    if (whole_centres) c.input_shift = (b.scale - 1) / 2;
     c.ndc_scale[0] = xs * 2 / w;
     c.ndc_scale[1] = -ys * 2 / h;
     c.ndc_scale[2] = zs;

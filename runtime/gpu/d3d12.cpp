@@ -857,6 +857,15 @@ private:
     uint64_t sampler_fences_[kSamplerHeaps] = {};
     uint32_t sampler_at_ = 0;
     uint32_t sampler_switches_ = 0;
+    // a stage slot's last texture readied in a batch, so the draws after it with the same fetch skip the lookups
+    struct PreparedSlot {
+        const TextureBinding* binding = nullptr;
+        uint32_t fetch[6] = {};
+        uint32_t heap = 0;  // sampler_switches_ once its sampler was made
+        ID3D12Resource* res = nullptr;
+        D3D12_RESOURCE_STATES* state = nullptr;
+    };
+    PreparedSlot prepared_[2][kPsTextures];
     std::ofstream pipeline_cache_;  // each pipeline appended as it is made
     // async shaders: pipelines on the build threads and those they made
     std::unordered_set<uint64_t> building_;
@@ -2859,15 +2868,31 @@ void D3D12Backend::PrepareTextures(const State& s, const ShaderInfo& info, Shade
         const TextureBinding& b = info.textures[i];
         uint32_t fetch[6];
         ReadFetch(s, b.fetch, fetch);
+        PreparedSlot& p = prepared_[stage == ShaderStage::Vertex ? 0 : 1][i];
+        bool same_fetch = std::memcmp(p.fetch, fetch, sizeof(fetch)) == 0;
+        if (p.binding == &b && p.heap == sampler_switches_ && same_fetch) {
+            if (p.res) Transition(p.res, *p.state, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+            continue;
+        }
         xenos::TextureFetch t = xenos::DecodeTextureFetch(fetch);
+        ID3D12Resource* res = nullptr;
+        D3D12_RESOURCE_STATES* state = nullptr;
         if (Resolved* r = FindResolved(t, b, stage, i)) {
-            Transition(r->res.Get(), r->state, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+            res = r->res.Get();
+            state = &r->state;
         } else if (Texture* tex = FrameTexture(fetch, t)) {
             if (tex->swap) tex = tex->swap;
-            if (tex->res) Transition(tex->res.Get(), tex->state, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+            res = tex->res.Get();
+            state = &tex->state;
         }
+        if (res) Transition(res, *state, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
         D3D12_SAMPLER_DESC d = SamplerDesc(b, fetch);
         SamplerRun(&d, 1);
+        p.binding = &b;
+        std::copy(fetch, fetch + 6, p.fetch);
+        p.heap = sampler_switches_;
+        p.res = res;
+        p.state = state;
     }
 }
 
@@ -2890,6 +2915,8 @@ void D3D12Backend::DrawBatch(size_t count, const DrawSource& get) {
         return;
     }
     batch_.resize(count);
+    // textures and resolves may have changed since the last batch
+    for (auto& stage : prepared_) std::fill(std::begin(stage), std::end(stage), PreparedSlot{});
     for (size_t i = 0; i < count; i++) {
         get(i, batch_[i].first, batch_[i].second);
         Prepare(*batch_[i].first);

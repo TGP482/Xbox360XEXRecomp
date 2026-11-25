@@ -691,6 +691,7 @@ private:
     void ClearTarget(Target& t, uint32_t flags, const float color[4], float z, uint8_t stencil, const D3D12_RECT* rects,
                      uint32_t count);
     void ClearSpan(const Target& cleared, uint32_t flags, const float color[4], float z, uint8_t stencil);
+    void ApplySpanClear(Target& t);
 
     // shaders and pipelines
     Variant* EnsureVariant(Shader* s, const ShaderOptions& opt);
@@ -817,6 +818,14 @@ private:
     Extension* ext_ = nullptr;
 
     std::unordered_map<uint64_t, Target> targets_;
+    // a clear of a target's EDRAM range, held until the target is next drawn to, read or cleared
+    struct SpanClear {
+        uint32_t flags = 0;
+        float color[4] = {};
+        float z = 0;
+        uint8_t stencil = 0;
+    };
+    std::unordered_map<const Target*, SpanClear> span_clears_;
     std::unordered_map<uint64_t, Texture> textures_;
     std::unordered_map<uint64_t, Texture> pack_textures_;  // by pack key, shared by the textures drawing them
     std::unordered_map<std::array<uint32_t, 6>, Texture*, FetchHash> frame_textures_;  // by fetch constant, this frame
@@ -1324,6 +1333,7 @@ Target* D3D12Backend::EnsureTarget(const Surface& sf, bool depth, uint32_t width
     if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, t.state, &cv, IID_PPV_ARGS(&t.res)))) {
         LOGE("D3D12: target %ux%u format %u failed", t.w, t.h, sf.format);
         if (old.res) (depth ? free_dsv_ : free_rtv_).push_back(old.view);
+        span_clears_.erase(&t);
         targets_.erase(map_key);
         return nullptr;
     }
@@ -1384,6 +1394,7 @@ uint32_t D3D12Backend::Samples(uint32_t want) {
 void D3D12Backend::DropTargets() {
     for (auto& [key, t] : targets_) (t.depth ? free_dsv_ : free_rtv_).push_back(t.view);
     targets_.clear();
+    span_clears_.clear();
     cap_rt_ = nullptr;
     Unbind();
 }
@@ -1429,6 +1440,16 @@ uint32_t D3D12Backend::SpanTiles(const Target& t) const {
 
 void D3D12Backend::ClearTarget(Target& t, uint32_t flags, const float color[4], float z, uint8_t stencil,
                                const D3D12_RECT* rects, uint32_t count) {
+    // a whole clear replaces the held span clear where it reaches, a rect clear lands on it
+    if (auto held = span_clears_.find(&t); held != span_clears_.end()) {
+        if (count) {
+            ApplySpanClear(t);
+        } else {
+            uint32_t colors = flags & kClearColors ? kClearColors : 0;
+            held->second.flags &= ~(t.depth ? flags & (kClearZ | kClearStencil) : colors);
+            if (!held->second.flags) span_clears_.erase(held);
+        }
+    }
     if (t.depth) {
         D3D12_CLEAR_FLAGS f = D3D12_CLEAR_FLAGS(((flags & kClearZ) ? D3D12_CLEAR_FLAG_DEPTH : 0) |
                                                 ((flags & kClearStencil) ? D3D12_CLEAR_FLAG_STENCIL : 0));
@@ -1449,8 +1470,20 @@ void D3D12Backend::ClearSpan(const Target& cleared, uint32_t flags, const float 
     for (auto& [key, t] : targets_) {
         uint32_t base = t.surface.base;
         if (&t == &cleared || t.depth != cleared.depth || base < first || base >= last) continue;
-        ClearTarget(t, flags, color, z, stencil, nullptr, 0);
+        SpanClear& held = span_clears_[&t];
+        held.flags |= flags;
+        if (flags & kClearColors) std::copy_n(color, 4, held.color);
+        if (flags & kClearZ) held.z = z;
+        if (flags & kClearStencil) held.stencil = stencil;
     }
+}
+
+void D3D12Backend::ApplySpanClear(Target& t) {
+    auto held = span_clears_.find(&t);
+    if (held == span_clears_.end()) return;
+    SpanClear c = held->second;
+    span_clears_.erase(held);
+    ClearTarget(t, c.flags, c.color, c.z, c.stencil, nullptr, 0);
 }
 
 // Shaders and pipelines
@@ -2179,6 +2212,7 @@ bool D3D12Backend::BindTargets(const State& s, const ShaderInfo& ps, PipelineKey
         if (!(ps.exports >> i & 1) || !Bits(s.Reg(kRbColorMask), 4 * i, 4)) continue;
         Target* t = ColorTarget(s, i, height);
         if (!t) continue;
+        ApplySpanClear(*t);
         Transition(t->res.Get(), t->state, D3D12_RESOURCE_STATE_RENDER_TARGET);
         if (!b.rt) b.rt = t;
         k.rt_formats[i] = t->fmt;
@@ -2192,6 +2226,7 @@ bool D3D12Backend::BindTargets(const State& s, const ShaderInfo& ps, PipelineKey
     if (Bits(s.Reg(kRbDepthControl), 0, 3)) {
         ds = DepthTarget(s, height);
         if (ds) {
+            ApplySpanClear(*ds);
             Transition(ds->res.Get(), ds->state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
             k.ds_format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
         }
@@ -2737,6 +2772,7 @@ void D3D12Backend::Resolve(const State& s, const ResolveArgs& r) {
     g_perf.resolves++;
     uint32_t height = std::max<uint32_t>(TargetHeight(s), uint32_t(r.rect.y2));
     Target* src = r.source < 4 ? ColorTarget(s, r.source, height) : DepthTarget(s, height);
+    if (src) ApplySpanClear(*src);
     const xenos::FormatInfo& fi = xenos::Info(xenos::TexFormat(r.dst_format));
     if (src && src->range != 1 && ext_) ext_->Resolve(*this, *src);
     if (src && cap_) {

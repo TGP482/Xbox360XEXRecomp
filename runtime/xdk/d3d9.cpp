@@ -645,9 +645,44 @@ struct Recorded {
     std::vector<uint8_t> vertices;  // a BeginVertices draw's copy of what the title wrote
     std::vector<uint8_t> indices;   // and a BeginIndexedVertices draw's indices
     std::vector<GpuLoad> loads;     // read again each time it runs, as the GPU does
+
+    // as constructed, keeping what the vectors hold allocated
+    void Reset() {
+        op = RecordedOp::Draw;
+        // every path sets the registers the title keeps; recorded draws leave the clip planes alone
+        std::fill(&state.clip_planes[0][0], &state.clip_planes[0][0] + 6 * 4, 0.0f);
+        banks = false;
+        draw = {};
+        flags = 0;
+        std::fill(std::begin(color), std::end(color), 0.0f);
+        z = 1;
+        stencil = 0;
+        rect = {};
+        has_rect = false;
+        resolve = {};
+        streams.clear();
+        vertices.clear();
+        indices.clear();
+        loads.clear();
+    }
 };
 
-using Commands = std::vector<Recorded>;
+// a list's commands; slots stay made when a recording starts over, so recording allocates nothing once warm
+struct Commands {
+    std::vector<Recorded> slots;
+    size_t used = 0;
+
+    Recorded& Add() {
+        if (used == slots.size()) slots.emplace_back();
+        Recorded& r = slots[used++];
+        r.Reset();
+        return r;
+    }
+    void DropLast() { used--; }
+    void Clear() { used = 0; }
+    size_t size() const { return used; }
+    Recorded& operator[](size_t i) { return slots[i]; }
+};
 
 // a command buffer's commands; a run hands the render thread its list, so the next recording takes another
 struct RecordedList {
@@ -663,7 +698,7 @@ struct RecordedList {
         }
         if (at == lists.size()) lists.push_back(std::make_shared<Commands>());
         std::atomic_thread_fence(std::memory_order_acquire);
-        Now().clear();
+        Now().Clear();
     }
 };
 
@@ -738,9 +773,9 @@ void RecordDraw(uint32_t dev, uint32_t buffer, const gpu::DrawArgs& a, uint32_t 
         FlushVertices(dev);
         list = &g_buffers[buffer].Now();
     }
-    Recorded& r = list->emplace_back();
+    Recorded& r = list->Add();
     if (!Snapshot(dev, a, up_data, up_bytes, up_stride, r)) {
-        list->pop_back();
+        list->DropLast();
         return;
     }
     if (up_stride) KeepUserData(r, up_data, up_bytes);
@@ -827,7 +862,7 @@ void FlushVertices(uint32_t dev) {
         if (sf.data) sf.data = p.draw.vertices.data();
     }
     if (p.buffer) {
-        g_buffers[p.buffer].Now().push_back(std::move(p.draw));
+        g_buffers[p.buffer].Now().Add() = std::move(p.draw);
     } else {
         RunRecorded(Backend(), p.draw, TilingNow(), 0);
     }
@@ -850,7 +885,7 @@ void Replay(uint32_t dev, uint32_t buffer) {
     }
     for (uint32_t d : recording) FlushVertices(d);
     auto it = g_buffers.find(buffer);
-    if (it == g_buffers.end() || it->second.Now().empty()) return;
+    if (it == g_buffers.end() || it->second.Now().size() == 0) return;
     std::shared_ptr<Commands> list = it->second.lists[it->second.at];
     size_t size = list->size();
     RunTiling tiling = TilingNow();
@@ -915,7 +950,7 @@ void PassFence(uint32_t writeback, uint32_t fence) {
         for (uint32_t i = 0; i < 4; i++) rgba[i] = GF(color + i * 4);
     }
     if (uint32_t buffer = RecordingTo(dev)) {
-        Recorded& r = g_buffers[buffer].Now().emplace_back();
+        Recorded& r = g_buffers[buffer].Now().Add();
         r.op = RecordedOp::Clear;
         r.state = s;
         r.flags = flags;
@@ -980,7 +1015,7 @@ void ResolveTo(uint32_t dev, const ResolveCall& c) {
     r.clear_z = c.z;
     r.clear_stencil = c.stencil;
     if (uint32_t buffer = RecordingTo(dev)) {
-        Recorded& rec = g_buffers[buffer].Now().emplace_back();
+        Recorded& rec = g_buffers[buffer].Now().Add();
         rec.op = RecordedOp::Resolve;
         rec.state = s;
         rec.resolve = r;

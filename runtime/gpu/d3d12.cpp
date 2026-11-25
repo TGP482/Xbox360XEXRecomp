@@ -673,6 +673,7 @@ private:
     Alloc Upload(uint64_t size, uint64_t align);
     Alloc UploadTexels(uint64_t size);
     D3D12_GPU_VIRTUAL_ADDRESS UploadConstants(const void* data, uint32_t size);
+    D3D12_GPU_VIRTUAL_ADDRESS HeldConstants(uint32_t root, const void* data, uint32_t size);
     uint32_t AllocViews(uint32_t n);
     D3D12_CPU_DESCRIPTOR_HANDLE ViewCpu(uint32_t i) const;
     D3D12_GPU_DESCRIPTOR_HANDLE ViewGuest(uint32_t i) const;
@@ -853,6 +854,7 @@ private:
     // the last constant blocks bound, skipped when unchanged; no address means upload again
     uint8_t const_last_[kRootCount][kConstBytes] = {};
     D3D12_GPU_VIRTUAL_ADDRESS const_gpu_[kRootCount] = {};
+    uint32_t const_size_[kRootCount] = {};  // HeldConstants: bytes of the upload
     uint64_t const_held_[kRootCount][2] = {};  // the float constant blocks const_gpu_ holds, as ShaderInfo::constants
 
     // what the last draw set on the command list, set again only where a draw differs; Unbind forgets it
@@ -874,6 +876,11 @@ private:
             uint32_t table = 0;
             D3D12_GPU_DESCRIPTOR_HANDLE samplers{};
         } stages[2];
+        // the view table the raw vertex view was last written into, and its chunk
+        struct RawView {
+            uint64_t table = 0;
+            ID3D12Resource* chunk = nullptr;
+        } raw;
     } binds_;
     // true where now differs from what the last draw set, which keeps it
     template <class T>
@@ -1238,6 +1245,16 @@ D3D12_GPU_VIRTUAL_ADDRESS D3D12Backend::UploadConstants(const void* data, uint32
     Alloc a = Upload(size, kCbAlign);
     std::memcpy(a.cpu, data, size);
     return a.gpu;
+}
+
+// host order constants for root: the last draw's upload again while the bytes are the same
+D3D12_GPU_VIRTUAL_ADDRESS D3D12Backend::HeldConstants(uint32_t root, const void* data, uint32_t size) {
+    bool same = const_gpu_[root] && const_size_[root] == size && std::memcmp(const_last_[root], data, size) == 0;
+    if (same) return const_gpu_[root];
+    std::memcpy(const_last_[root], data, size);
+    const_size_[root] = size;
+    const_gpu_[root] = UploadConstants(data, size);
+    return const_gpu_[root];
 }
 
 uint32_t D3D12Backend::AllocViews(uint32_t n) {
@@ -2512,7 +2529,7 @@ D3D12_GPU_VIRTUAL_ADDRESS D3D12Backend::UploadStreams(const DrawArgs& a, const S
         c.address += it->second;
         fetch[k] = c;
     }
-    return UploadConstants(fetch.data(), uint32_t(fetch.size() * sizeof(VertexFetchConstant)));
+    return HeldConstants(kRootFetch, fetch.data(), uint32_t(fetch.size() * sizeof(VertexFetchConstant)));
 }
 
 // float constants come big endian from the title's banks: swapped as they go up, skipped when unchanged
@@ -2557,8 +2574,9 @@ void D3D12Backend::BindConstants(const State& s, D3D12_GPU_VIRTUAL_ADDRESS fetch
     std::memcpy(flow, s.bools, 32);
     std::memcpy(flow + 32, s.loops, 128);
     bind(kRootFlow, flow, sizeof(flow));
-    cl_->SetGraphicsRootConstantBufferView(kRootDraw, UploadConstants(&c, sizeof(c)));
-    cl_->SetGraphicsRootConstantBufferView(kRootFetch, fetch);
+    D3D12_GPU_VIRTUAL_ADDRESS draw = HeldConstants(kRootDraw, &c, sizeof(c));
+    if (Latch(binds_.roots[kRootDraw], draw)) cl_->SetGraphicsRootConstantBufferView(kRootDraw, draw);
+    if (Latch(binds_.roots[kRootFetch], fetch)) cl_->SetGraphicsRootConstantBufferView(kRootFetch, fetch);
 }
 
 // a stage's float constants: only the blocks its shader reads are compared and swapped into the ring; an upload is
@@ -2601,10 +2619,13 @@ void D3D12Backend::BindViews(const State& s, const ShaderInfo& vs, const ShaderI
     const UploadChunks& ring = CurrentFrame().ring;
     const UploadChunk& chunk = ring.list[ring.at];
     vertex_chunk_ = chunk.res.Get();
-    if (ring.at == 0) {
+    // a kept vertex table already holds the view
+    Binds::RawView raw_at{vs_views, vertex_chunk_};
+    bool fresh = Latch(binds_.raw, raw_at);
+    if (fresh && ring.at == 0) {
         uint32_t raw = kPsTextures + uint32_t(frame_ % kFrames);
         dev_->CopyDescriptorsSimple(1, ViewCpu(vs_views), CopyView(raw), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    } else {
+    } else if (fresh) {
         D3D12_SHADER_RESOURCE_VIEW_DESC raw = RawView(chunk);
         dev_->CreateShaderResourceView(vertex_chunk_, &raw, ViewCpu(vs_views));
     }
@@ -2693,7 +2714,7 @@ void D3D12Backend::Draw(const State& s, const DrawArgs& a) {
     if (!pso) return;
     g_perf.draws++;
 
-    DrawConstants c;
+    DrawConstants c{};
     FillDrawConstants(s, bound, c);
     c.base_vertex = a.base_vertex;
     // the source factor of colour 0, 1 without blending

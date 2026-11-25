@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -60,7 +61,7 @@ constexpr size_t kWakeBatch = 32;
 constexpr size_t kRunBatch = 32;  // commands the render thread takes per lock
 constexpr uint32_t kSpins = 4096;  // pauses before a fence wait yields, about what a batch takes
 
-enum class Op { Draw, Clear, Resolve, Copy, Present, BeginQuery, EndQuery, Poll, Signal };
+enum class Op { Draw, Clear, Resolve, Copy, Present, BeginQuery, EndQuery, Poll, Signal, Job };
 
 struct Command {
     Op op = Op::Draw;
@@ -84,6 +85,7 @@ struct Command {
     uint64_t ended = 0;  // Poll: the EndQuery it asks about
     uint32_t* where = nullptr;  // Signal
     uint32_t value = 0;
+    std::function<void(Backend&, uint64_t)> job;
 };
 
 // State's fields after regs
@@ -429,7 +431,13 @@ public:
         }
         Push(std::move(c));
     }
-    // queued draws copy what they read now, so the title never waits on the render thread behind it
+    void Run(std::function<void(Backend&, uint64_t)> job) override {
+        std::unique_ptr<Command> c = New(Op::Job);
+        c->job = std::move(job);
+        Push(std::move(c));
+    }
+    // queued draws copy what they read now, so the title never waits on the render thread behind it; a queued job
+    // can't, so it is waited for
     void PassSignals() override {
         uint32_t* where;
         uint32_t value;
@@ -438,12 +446,14 @@ public:
         {
             std::lock_guard lock(queue_lock_);
             if (!signal_where_) return;
+            uint64_t job = 0;
             for (std::unique_ptr<Command>& c : queue_) {
                 if (c->op == Op::Draw && c->draw.fenced) Detach(*c, inner_->Info(c->state.vs).fetch_anywhere);
+                if (c->op == Op::Job) job = c->seq;
             }
             where = signal_where_;
             value = signal_value_;
-            reading = reading_;
+            reading = std::max(reading_, job);
         }
         // the running batch ends sooner than a sleep and its wake would
         for (uint32_t spins = 0; ran_.load(std::memory_order_acquire) < reading; spins++) {
@@ -516,6 +526,10 @@ private:
                 fences_.fetch_add(1, std::memory_order_release);
                 PassFence(c.where, c.value);
                 break;
+            case Op::Job:
+                c.job(*inner_, fences_.load(std::memory_order_acquire));
+                c.job = nullptr;  // what it holds is the title's again
+                break;
         }
     }
 
@@ -556,7 +570,7 @@ private:
         while (batch.size() < kRunBatch && !queue_.empty()) {
             std::unique_ptr<Command>& c = batch.emplace_back(std::move(queue_.front()));
             queue_.pop_front();
-            if (c->op == Op::Draw && c->draw.fenced) reading_ = c->seq;
+            if ((c->op == Op::Draw && c->draw.fenced) || c->op == Op::Job) reading_ = c->seq;
             if (c->op == Op::Present) break;
         }
     }

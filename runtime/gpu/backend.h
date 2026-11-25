@@ -1,6 +1,7 @@
 #pragma once
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 
 #include "gpu/state.h"
@@ -37,6 +38,9 @@ public:
     virtual void Signal(uint32_t* where, uint32_t value) { *where = value; }
     // the title waits on a fence: every one signalled so far passes now
     virtual void PassSignals() {}
+    // job runs on the renderer after the commands before it, with the fences passed by then; it may read the title's
+    // fenced buffers, so a fence wait waits for it
+    virtual void Run(std::function<void(Backend&, uint64_t)> job) { job(*this, 0); }
 };
 
 std::unique_ptr<Backend> CreateBackend();

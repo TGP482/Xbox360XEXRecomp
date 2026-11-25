@@ -647,7 +647,27 @@ struct Recorded {
     std::vector<GpuLoad> loads;     // read again each time it runs, as the GPU does
 };
 
-std::unordered_map<uint32_t, std::vector<Recorded>> g_buffers;  // by command buffer, under g_lock
+using Commands = std::vector<Recorded>;
+
+// a command buffer's commands; a run hands the render thread its list, so the next recording takes another
+struct RecordedList {
+    std::vector<std::shared_ptr<Commands>> lists{std::make_shared<Commands>()};
+    size_t at = 0;  // the list recording
+
+    Commands& Now() { return *lists[at]; }
+    // a recording starts in a list the render thread is done with, a new one when it holds them all
+    void Clear() {
+        at = lists.size();
+        for (size_t i = 0; i < lists.size() && at == lists.size(); i++) {
+            if (lists[i].use_count() == 1) at = i;
+        }
+        if (at == lists.size()) lists.push_back(std::make_shared<Commands>());
+        std::atomic_thread_fence(std::memory_order_acquire);
+        Now().clear();
+    }
+};
+
+std::unordered_map<uint32_t, RecordedList> g_buffers;  // by command buffer, under g_lock
 
 uint32_t RecordingTo(uint32_t dev) {
     if constexpr (kDevCommandBuffer == xdk::kUnknown) return 0;
@@ -695,28 +715,59 @@ bool Snapshot(uint32_t dev, const gpu::DrawArgs& a, uint32_t up_data, uint32_t u
 
 void FlushVertices(uint32_t dev);
 
+// user pointer data copied as it is recorded, as the library copies it into the command buffer
+void KeepUserData(Recorded& r, uint32_t data, uint32_t bytes) {
+    const uint8_t* from = static_cast<const uint8_t*>(HostPtr(data));
+    r.vertices.assign(from, from + bytes);
+    for (gpu::StreamFetch& sf : r.streams) {
+        if (sf.data) sf.data = r.vertices.data();
+    }
+    if (!r.draw.indices) return;
+    size_t index_bytes = size_t(r.draw.count) * (r.draw.index32 ? 4 : 2);
+    r.indices.assign(r.draw.indices, r.draw.indices + index_bytes);
+    r.draw.indices = r.indices.data();
+}
+
 // a draw on a recording device; the buffers it reads stay the title's until the command buffer ran, as on the console.
 // Built in its list, as a Recorded is 14 KB; the list is the recording thread's until the buffer runs.
 void RecordDraw(uint32_t dev, uint32_t buffer, const gpu::DrawArgs& a, uint32_t up_data, uint32_t up_bytes,
                 uint32_t up_stride) {
-    std::vector<Recorded>* list = nullptr;
+    Commands* list = nullptr;
     {
         std::lock_guard lock(g_lock);
         FlushVertices(dev);
-        list = &g_buffers[buffer];
+        list = &g_buffers[buffer].Now();
     }
-    if (!Snapshot(dev, a, up_data, up_bytes, up_stride, list->emplace_back())) list->pop_back();
+    Recorded& r = list->emplace_back();
+    if (!Snapshot(dev, a, up_data, up_bytes, up_stride, r)) {
+        list->pop_back();
+        return;
+    }
+    if (up_stride) KeepUserData(r, up_data, up_bytes);
 }
 
-// a recorded command on the renderer, tiled as the title's device is now
-void RunRecorded(gpu::Backend* backend, Recorded& r) {
+// the device's tiling a recorded command runs in, read under g_lock
+struct RunTiling {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    gpu::Rect predicated{};
+};
+
+RunTiling TilingNow() {
+    if (!g_tiling.on) return {};
+    return {uint32_t(g_tiling.extent.x2), uint32_t(g_tiling.extent.y2), SelectedTiles()};
+}
+
+// a recorded command on the renderer
+void RunRecorded(gpu::Backend* backend, Recorded& r, const RunTiling& tiling, uint64_t fences) {
     ApplyLoads(r.loads, r.bank_bytes.data());
     if (r.banks) PointBanks(r);
-    r.state.tiled_width = g_tiling.on ? uint32_t(g_tiling.extent.x2) : 0;
-    r.state.tiled_height = g_tiling.on ? uint32_t(g_tiling.extent.y2) : 0;
-    r.state.predicated = g_tiling.on ? SelectedTiles() : gpu::Rect{};
+    r.state.tiled_width = tiling.width;
+    r.state.tiled_height = tiling.height;
+    r.state.predicated = tiling.predicated;
     if (r.op == RecordedOp::Draw) {
         r.draw.streams = r.streams.empty() ? nullptr : r.streams.data();
+        r.draw.fences = fences;
         backend->Draw(r.state, r.draw);
     } else if (r.op == RecordedOp::Clear) {
         backend->Clear(r.state, r.flags, r.color, r.z, r.stencil, r.has_rect ? &r.rect : nullptr);
@@ -776,9 +827,9 @@ void FlushVertices(uint32_t dev) {
         if (sf.data) sf.data = p.draw.vertices.data();
     }
     if (p.buffer) {
-        g_buffers[p.buffer].push_back(std::move(p.draw));
+        g_buffers[p.buffer].Now().push_back(std::move(p.draw));
     } else {
-        RunRecorded(Backend(), p.draw);
+        RunRecorded(Backend(), p.draw, TilingNow(), 0);
     }
 }
 
@@ -788,7 +839,8 @@ bool VerticesEnded(uint32_t dev) {
     return it != g_pending.end() && R32(dev + kDevRingWrite) != it->second.ring_at;
 }
 
-// a command buffer's list on the renderer, in order, after the BeginVertices draws its recording left
+// a command buffer's list on the render thread, in order, after the BeginVertices draws its recording left; the
+// title goes on as the GPU's commands would run behind it
 void Replay(uint32_t dev, uint32_t buffer) {
     std::lock_guard lock(g_lock);
     FlushVertices(dev);
@@ -798,9 +850,13 @@ void Replay(uint32_t dev, uint32_t buffer) {
     }
     for (uint32_t d : recording) FlushVertices(d);
     auto it = g_buffers.find(buffer);
-    if (it == g_buffers.end()) return;
-    gpu::Backend* backend = Backend();
-    for (Recorded& r : it->second) RunRecorded(backend, r);
+    if (it == g_buffers.end() || it->second.Now().empty()) return;
+    std::shared_ptr<Commands> list = it->second.lists[it->second.at];
+    size_t size = list->size();
+    RunTiling tiling = TilingNow();
+    Backend()->Run([list, size, tiling](gpu::Backend& renderer, uint64_t fences) {
+        for (size_t i = 0; i < size; i++) RunRecorded(&renderer, (*list)[i], tiling, fences);
+    });
 }
 
 void Draw(uint32_t dev, gpu::DrawArgs& a, uint32_t up_data = 0, uint32_t up_bytes = 0, uint32_t up_stride = 0) {
@@ -859,7 +915,7 @@ void PassFence(uint32_t writeback, uint32_t fence) {
         for (uint32_t i = 0; i < 4; i++) rgba[i] = GF(color + i * 4);
     }
     if (uint32_t buffer = RecordingTo(dev)) {
-        Recorded& r = g_buffers[buffer].emplace_back();
+        Recorded& r = g_buffers[buffer].Now().emplace_back();
         r.op = RecordedOp::Clear;
         r.state = s;
         r.flags = flags;
@@ -924,7 +980,7 @@ void ResolveTo(uint32_t dev, const ResolveCall& c) {
     r.clear_z = c.z;
     r.clear_stencil = c.stencil;
     if (uint32_t buffer = RecordingTo(dev)) {
-        Recorded& rec = g_buffers[buffer].emplace_back();
+        Recorded& rec = g_buffers[buffer].Now().emplace_back();
         rec.op = RecordedOp::Resolve;
         rec.state = s;
         rec.resolve = r;
@@ -1265,7 +1321,7 @@ PPC_FUNC(GUEST(D3DDevice_BeginCommandBuffer)) {
     }
     GUEST_ORIG(D3DDevice_BeginCommandBuffer)(ctx, base);
     std::lock_guard lock(g_lock);
-    g_buffers[buffer].clear();
+    g_buffers[buffer].Clear();
 }
 #endif
 

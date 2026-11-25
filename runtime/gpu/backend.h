@@ -1,5 +1,6 @@
 #pragma once
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -21,6 +22,16 @@ public:
     virtual Shader* CreateShader(ShaderStage stage, const uint32_t* code, size_t dwords) = 0;
     virtual const ShaderInfo& Info(const Shader* s) const = 0;
     virtual void Draw(const State& s, const DrawArgs& a) = 0;
+    // count draws in order, which the renderer may record on several threads; get fills draw i, once each
+    using DrawSource = std::function<void(size_t, const State*&, const DrawArgs*&)>;
+    virtual void DrawBatch(size_t count, const DrawSource& get) {
+        for (size_t i = 0; i < count; i++) {
+            const State* s = nullptr;
+            const DrawArgs* a = nullptr;
+            get(i, s, a);
+            Draw(*s, *a);
+        }
+    }
     // flags kClear*; rect in the target's pixels, null for the whole target, either within the scissor
     virtual void Clear(const State& s, uint32_t flags, const float color[4], float z, uint32_t stencil,
                        const Rect* rect) = 0;

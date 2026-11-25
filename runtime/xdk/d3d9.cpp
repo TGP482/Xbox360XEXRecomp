@@ -814,15 +814,21 @@ RunTiling TilingNow() {
 }
 
 // a recorded command on the renderer
-void RunRecorded(gpu::Backend* backend, Recorded& r, const RunTiling& tiling, uint64_t fences) {
+// a recorded command's constant loads, banks, tiling and fences as it runs
+void Ready(Recorded& r, const RunTiling& tiling, uint64_t fences) {
     ApplyLoads(r.loads, r.bank_bytes.data());
     if (r.banks) PointBanks(r);
     r.state.tiled_width = tiling.width;
     r.state.tiled_height = tiling.height;
     r.state.predicated = tiling.predicated;
+    if (r.op != RecordedOp::Draw) return;
+    r.draw.streams = r.streams.empty() ? nullptr : r.streams.data();
+    r.draw.fences = fences;
+}
+
+void RunRecorded(gpu::Backend* backend, Recorded& r, const RunTiling& tiling, uint64_t fences) {
+    Ready(r, tiling, fences);
     if (r.op == RecordedOp::Draw) {
-        r.draw.streams = r.streams.empty() ? nullptr : r.streams.data();
-        r.draw.fences = fences;
         backend->Draw(r.state, r.draw);
     } else if (r.op == RecordedOp::Clear) {
         backend->Clear(r.state, r.flags, r.color, r.z, r.stencil, r.has_rect ? &r.rect : nullptr);
@@ -910,7 +916,22 @@ void Replay(uint32_t dev, uint32_t buffer) {
     size_t size = list->size();
     RunTiling tiling = TilingNow();
     Backend()->Run([list, size, tiling](gpu::Backend& renderer, uint64_t fences) {
-        for (size_t i = 0; i < size; i++) RunRecorded(&renderer, (*list)[i], tiling, fences);
+        // a run of draws goes as one batch, which the renderer may record on several threads
+        for (size_t i = 0; i < size;) {
+            size_t end = i;
+            while (end < size && (*list)[end].op == RecordedOp::Draw) end++;
+            if (end == i) {
+                RunRecorded(&renderer, (*list)[i++], tiling, fences);
+                continue;
+            }
+            renderer.DrawBatch(end - i, [&, first = i](size_t k, const gpu::State*& s, const gpu::DrawArgs*& a) {
+                Recorded& r = (*list)[first + k];
+                Ready(r, tiling, fences);
+                s = &r.state;
+                a = &r.draw;
+            });
+            i = end;
+        }
     });
 }
 

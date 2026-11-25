@@ -57,16 +57,40 @@ XAM_EXPORT(0x250, XamEnumerate) {
     return Complete(a[5], count ? kErrorSuccess : kErrorNoMoreFiles, count);
 }
 
+namespace {
+
+constexpr uint32_t kPrivateHeader = 0x18;  // titles write their extra data past it
+
+// an app's enumerator keeps a block in guest memory for the title's extra data
+struct AppEnumerator : Enumerator {
+    uint32_t block = 0;
+    ~AppEnumerator() override {
+        if (block) mem::FreeSystem(block);
+    }
+};
+
+}  // namespace
+
 // (user, app, open message, close message, extra size, item count, flags, handle out): an app's enumerator, empty
 XAM_EXPORT(0x24E, XamCreateEnumeratorHandle) {
     LOGR("XamCreateEnumeratorHandle app %08X message %08X", a[1], a[2]);
-    auto e = std::make_shared<Enumerator>();
+    auto e = std::make_shared<AppEnumerator>();
     e->item_size = std::max(a[4], 1u);
+    e->block = mem::AllocSystem(kPrivateHeader + a[4]);
+    if (!e->block) return kNoMemory;
+    std::memset(HostPtr(e->block), 0, kPrivateHeader + a[4]);
     W32(a[7], NewEnumerator(e));
     return kErrorSuccess;
 }
 
-XAM_EXPORT(0x24F, XamGetPrivateEnumStructureFromHandle) { return kErrorNotFound; }
+// (handle, block out): the block XamCreateEnumeratorHandle made
+XAM_EXPORT(0x24F, XamGetPrivateEnumStructureFromHandle) {
+    ObjectRef o = FromHandle(a[0]);
+    auto* e = dynamic_cast<AppEnumerator*>(o.get());
+    if (!e) return kInvalidHandle;
+    W32(a[1], e->block);
+    return kErrorSuccess;
+}
 
 // memory: small blocks from the system pool, large ones as their own virtual allocation
 

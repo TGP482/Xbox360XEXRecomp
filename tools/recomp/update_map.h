@@ -20,11 +20,13 @@ public:
     void Set(uint32_t base, uint32_t updated);  // a match given by hand
 
 private:
-    // one image's code: each instruction's address, masked word and the address it completes, 0 for none
+    // one image's code: each instruction's address, masked word, the address it completes and where it branches,
+    // 0 for none
     struct Words {
         std::vector<uint32_t> va;
         std::vector<uint32_t> word;
         std::vector<uint32_t> formed;
+        std::vector<uint32_t> branch;
     };
 
     Words a_;  // base
@@ -32,12 +34,19 @@ private:
     std::vector<int32_t> link_;   // per base instruction, its match in the update, -1 for none
     std::vector<int32_t> blink_;  // the same back
     std::map<uint32_t, uint32_t> data_;
+    std::unordered_map<uint32_t, uint32_t> calls_;  // a branch target to the one matched branches go to instead
+    std::unordered_map<uint32_t, uint32_t> calls_back_;
     std::unordered_map<uint32_t, uint32_t> manual_;
     std::unordered_map<uint32_t, uint32_t> manual_back_;
 
     void Match(size_t a0, size_t a1, size_t b0, size_t b1, int depth);
+    void DropShortRuns();
+    void SplitAtEntries(const xex::Image& base);
+    void MatchMoved();
+    void Grow();
     void Link(size_t a, size_t b);
     void PairData();
+    void PairCalls();
 };
 
 // the config's addresses moved to where the update keeps them; false after listing the ones with no match

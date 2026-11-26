@@ -1,5 +1,6 @@
 #pragma once
 #include <cmath>
+#include <csetjmp>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -264,7 +265,7 @@ PPC_HOST_API uint64_t ppc_timebase();
 // after FPSCR changes: its rounding mode goes to the host
 PPC_HOST_API void ppc_fpscr_changed(PPCContext& ctx);
 // xdk/setjmp.cpp: the host buffer of the frame calling the guest's setjmp on its guest buffer
-PPC_HOST_API void ppc_jump_mark(uint32_t buffer, void** frame);
+PPC_HOST_API void ppc_jump_mark(uint32_t buffer, jmp_buf* frame);
 
 // a call through a code pointer: the runtime's table of functions, one slot a code word from code_base
 inline void ppc_call(PPCContext& ctx, uint8_t* base, uint32_t target, uint32_t code_base, uint32_t words) {

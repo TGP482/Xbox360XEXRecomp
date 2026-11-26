@@ -7,11 +7,11 @@
 
 namespace {
 
-thread_local std::unordered_map<uint32_t, void**> t_frames;  // guest buffer to the host buffer that took it last
+thread_local std::unordered_map<uint32_t, jmp_buf*> t_frames;  // guest buffer to the host buffer that took it last
 
 }  // namespace
 
-void ppc_jump_mark(uint32_t buffer, void** frame) { t_frames[buffer] = frame; }
+void ppc_jump_mark(uint32_t buffer, jmp_buf* frame) { t_frames[buffer] = frame; }
 
 #if HAS_Crt_LongJmp
 PPC_EXTERN_FUNC(GUEST_ORIG(Crt_LongJmp));
@@ -22,6 +22,6 @@ PPC_FUNC(GUEST(Crt_LongJmp)) {
     GUEST_ORIG(Crt_LongJmp)(ctx, base);
     auto frame = t_frames.find(buffer);
     if (frame == t_frames.end()) ppc_trap(ctx, buffer, "longjmp to a buffer no setjmp took");
-    __builtin_longjmp(frame->second, 1);
+    longjmp(*frame->second, 1);
 }
 #endif

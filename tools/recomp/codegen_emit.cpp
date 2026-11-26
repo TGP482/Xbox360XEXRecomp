@@ -261,7 +261,7 @@ std::string CodeGen::Declarations() const {
     if (used_.ca) add("uint8_t", "xer_ca", "ctx.xer_ca");
     if (used_.ov) add("uint8_t", "xer_ov", "ctx.xer_ov");
     if (used_.so) add("uint8_t", "xer_so", "ctx.xer_so");
-    for (uint32_t at : jumps_) s += Fmt("\tvoid* jump_%08X[5];\n", at);
+    for (uint32_t at : jumps_) s += Fmt("\tjmp_buf jump_%08X;\n", at);
     return s;
 }
 
@@ -314,11 +314,11 @@ void CodeGen::EmitCall(const Insn& i, uint32_t target) {
     Line(Fmt("\t%s = 0x%Xull;", LrW().c_str(), i.addr + 4));
     auto jmp = an_.cfg.symbols.find("Crt_SetJmp");
     if (jmp != an_.cfg.symbols.end() && jmp->second == target) {
-        // the guest longjmp restores the context from its buffer, then lands here through the host's
+        // the guest longjmp restores the context, then the CRT's lands here (clang's builtin loses offset frames)
         jumps_.insert(i.addr);
         callees_.push_back(target);
-        Line(Fmt("\tPPC_SPILL; ppc_jump_mark(uint32_t(ctx.r[3]), jump_%08X); sub_%08X(ctx, base); "
-                 "__builtin_setjmp(jump_%08X); PPC_RELOAD;",
+        Line(Fmt("\tPPC_SPILL; ppc_jump_mark(uint32_t(ctx.r[3]), &jump_%08X); sub_%08X(ctx, base); "
+                 "setjmp(jump_%08X); PPC_RELOAD;",
                  i.addr, target, i.addr));
     } else if (f == an_.functions.end()) {
         unknown_calls_ = true;

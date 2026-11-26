@@ -90,6 +90,23 @@ static bool LoadAddresses(const toml::table& t, Update& update) {
     return true;
 }
 
+// [update.data] name = value, a [data] value the update changes
+static bool LoadUpdateData(const toml::table& t, Update& update) {
+    for (auto& [k, v] : t) {
+        auto value = v.value<int64_t>();
+        if (!value) return false;
+        update.data[std::string(k.str())] = uint32_t(*value);
+    }
+    return true;
+}
+
+// entries naming the same package, such as one per included file, merge
+static Update& UpdateFor(Config& cfg, const std::string& sha1) {
+    for (Update& u : cfg.updates)
+        if (u.sha1 == sha1) return u;
+    return cfg.updates.emplace_back(Update{sha1, {}, {}});
+}
+
 static bool LoadUpdates(const toml::table& t, Config& cfg) {
     auto a = t["update"].as_array();
     if (!a) return true;
@@ -97,10 +114,11 @@ static bool LoadUpdates(const toml::table& t, Config& cfg) {
         auto u = e.as_table();
         auto sha1 = u ? (*u)["sha1"].value<std::string>() : std::nullopt;
         if (!sha1) return false;
-        Update update{*sha1, {}};
+        Update& update = UpdateFor(cfg, *sha1);
         auto addresses = (*u)["addresses"].as_table();
         if (addresses && !LoadAddresses(*addresses, update)) return false;
-        cfg.updates.push_back(update);
+        auto data = (*u)["data"].as_table();
+        if (data && !LoadUpdateData(*data, update)) return false;
     }
     return true;
 }
@@ -164,7 +182,8 @@ static bool LoadOverrides(const toml::table& t, Config& cfg) {
 //   [[function]] at, end  an entry decoded no further than end (exclusive)
 //   [[switch]] at, targets  the targets of a bctr, replacing table detection
 //   [xex] xdk = build  includes <--xdk folder>/<build>/layout.toml
-//   [[update]] sha1, [update.addresses]  a title update package the image may be built patched with (--update)
+//   [[update]] sha1, [update.addresses], [update.data]  a title update package the image may be built patched with
+//     (--update); [update.data] replaces [data] values the update changed, which addresses cannot show
 static bool LoadConfig(const fs::path& path, Config& cfg, const fs::path& xdk_dir) {
     toml::table t;
     try {
@@ -312,6 +331,13 @@ static bool BuildUpdated(const Analysis& base, const Update& update, const std::
     for (auto& [from, to] : update.addresses) map.Set(from, to);
     Config cfg;
     if (!Translate(base.cfg, base.img, map, cfg)) return false;
+    for (auto& [name, value] : update.data) {
+        if (!cfg.data.count(name)) {
+            std::fprintf(stderr, "update: [update.data] %s is not in [data]\n", name.c_str());
+            return false;
+        }
+        cfg.data[name] = value;
+    }
     Analysis an(updated, cfg);
     an.Run();
     if (!CheckOverrides(an)) return false;

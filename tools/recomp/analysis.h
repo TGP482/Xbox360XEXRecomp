@@ -31,6 +31,7 @@ struct Hook {
 struct Update {
     std::string sha1;  // the package's
     std::map<uint32_t, uint32_t> addresses;  // base to update
+    std::map<std::string, uint32_t> data;     // [data] values it changes, such as class field offsets
 };
 
 struct Config {

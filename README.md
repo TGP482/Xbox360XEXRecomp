@@ -24,7 +24,7 @@ This tool was originally created for porting [Far Cry Instincts: Predator](https
 ## Game Setup
 
 1. Copy `templates/game` to a new repository and put this SDK in it as `sdk/`. Set `GAME_TITLE`, `GAME_XEX` and `GAME_EXE` at the top of `build.bat` (`GAME_EXE` in `release.bat` too), and the target and xex in `add_xex_image` in `CMakeLists.txt`.
-2. Put the game's XEX and its data folders in the `assets` folder. No game files, keys or generated code belong in any repository. A title update goes in `assets` as its package, as the console downloads it (`TU_...`). The config keeps the base image's addresses: `[[update]]` with `sha1 = "<the package's SHA-1>"` lets the code also be built patched by that update, and `[update.addresses]` gives `base = update` for any address the recompiler cannot match. `xex_symbols --image assets\default.xex --update assets\<package> --out image.bin` writes the updated image for Ghidra.
+2. Put the game's XEX and its data folders in the `assets` folder. No game files, keys or generated code belong in any repository. A title update goes in `assets` as its package, as the console downloads it (`TU_...`). The config keeps the base image's addresses: `[[update]]` with `sha1 = "<the package's SHA-1>"` lets the code also be built patched by that update, `[update.addresses]` gives `base = update` for any address the recompiler cannot match, and `[update.data]` gives `name = value` for a `[data]` value the update changed, such as a class field offset. `xex_symbols --image assets\default.xex --update assets\<package> --out image.bin` writes the updated image for Ghidra.
 3. Run `xex_symbols`, which `build.bat` does on the first build:
    ```
    xex_symbols assets\default.xex sdk\xdk --library MyGame.dll --out config\game.toml

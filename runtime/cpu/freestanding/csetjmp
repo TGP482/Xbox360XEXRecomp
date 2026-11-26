@@ -1,0 +1,11 @@
+#pragma once
+// the C runtime's x64 jump buffer; clang passes _setjmp the frame, and the executable forwards it to vcruntime
+
+struct alignas(16) _SETJMP_FLOAT128 {
+    unsigned long long Part[2];
+};
+typedef _SETJMP_FLOAT128 _JBTYPE;
+typedef _JBTYPE jmp_buf[16];
+
+extern "C" int __cdecl _setjmp(jmp_buf buffer);
+#define setjmp _setjmp

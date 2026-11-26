@@ -29,6 +29,7 @@
 #pragma comment(linker, "/EXPORT:memcpy=vcruntime140.memcpy")
 #pragma comment(linker, "/EXPORT:memmove=vcruntime140.memmove")
 #pragma comment(linker, "/EXPORT:memset=vcruntime140.memset")
+#pragma comment(linker, "/EXPORT:_setjmp=vcruntime140.__intrinsic_setjmp")
 #pragma comment(linker, "/EXPORT:fma=ucrtbase.fma")
 #pragma comment(linker, "/EXPORT:fmaf=ucrtbase.fmaf")
 #pragma comment(linker, "/EXPORT:exp2f=ucrtbase.exp2f")

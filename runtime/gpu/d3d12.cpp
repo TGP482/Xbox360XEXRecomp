@@ -2243,9 +2243,11 @@ D3D12_SAMPLER_DESC D3D12Backend::SamplerDesc(const TextureBinding& b, const uint
     uint32_t mag = b.mag != kFilterFromFetch ? b.mag : t.mag_filter;
     uint32_t min = b.min != kFilterFromFetch ? b.min : t.min_filter;
     uint32_t mip = b.mip != kFilterFromFetch ? b.mip : t.mip_filter;
-    uint32_t aniso = b.aniso != kAnisoFromFetch ? b.aniso : t.aniso;
-    // the setting replaces the title's: 0 off, else 2 to 16 as a level of 2 to 5
-    aniso = std::min<uint32_t>(std::bit_width(std::max(app::Get().aniso, 1u)), 5);
+    // the setting, on linear mipped textures only: depth maps and resolves keep their own filter
+    bool mipped = t.mip_base && t.mip_max && mip != 2;
+    // 0 off, else 2 to 16 as a level of 2 to 5
+    uint32_t level = std::min<uint32_t>(std::bit_width(std::max(app::Get().aniso, 1u)), 5);
+    uint32_t aniso = (min & 1) && mipped ? level : 0;
     D3D12_SAMPLER_DESC d{};
     if (aniso > 1) {
         d.Filter = D3D12_FILTER_ANISOTROPIC;

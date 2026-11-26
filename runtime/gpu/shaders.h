@@ -88,6 +88,15 @@ inline const ShaderHooks* g_shader_hooks = nullptr;
 std::string TranslateShader(ShaderStage stage, const uint32_t* code, size_t dwords, const ShaderOptions& opt,
                             ShaderInfo& info);
 
+// what a pixel shader's first instruction fetches its first texture at: an interpolator and two of its components, reg
+// -1 when that instruction is no such fetch. A ray tracer runs a draw's alpha test on that texture alone
+struct FirstFetch {
+    int8_t reg = -1;
+    uint8_t x = 0;
+    uint8_t y = 1;
+};
+FirstFetch FindFirstFetch(const uint32_t* code, size_t dwords);
+
 // b1, shared by both stages: one bool bank of 256 and 32 loop constants (count, start, step bytes)
 struct FlowConstants {
     uint32_t bools[8];

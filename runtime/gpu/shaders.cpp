@@ -1118,4 +1118,20 @@ std::string TranslateShader(ShaderStage stage, const uint32_t* code, size_t dwor
     return Translator(stage, code, dwords, opt, info).Translate();
 }
 
+FirstFetch FindFirstFetch(const uint32_t* code, size_t dwords) {
+    for (const Cf& cf : ParseControlFlow(code, dwords)) {
+        if (cf.Branches()) return {};
+        if (!cf.IsExec()) continue;
+        bool plain = cf.Op() == kCfExec || cf.Op() == kCfExecEnd;
+        if (!plain || !cf.Count() || !(cf.Serialize() & 1) || size_t(cf.Address()) * 3 + 3 > dwords) return {};
+        const uint32_t* w = code + cf.Address() * 3;
+        Fetch f{w[0], w[1], w[2]};
+        bool interpolated = f.Src() < kInterpolators && !f.SrcRel();
+        bool plain_2d = f.Dimension() == kDim2D && !f.Unnormalized() && !f.Predicated();
+        if (f.Op() != kTextureFetch || !interpolated || !plain_2d) return {};
+        return {int8_t(f.Src()), uint8_t(f.CoordComponent(0)), uint8_t(f.CoordComponent(1))};
+    }
+    return {};
+}
+
 }  // namespace gpu

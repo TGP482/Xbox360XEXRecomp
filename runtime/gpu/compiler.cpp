@@ -236,14 +236,18 @@ uint64_t Hash64(const void* data, size_t n, uint64_t seed) {
     return h ^ (h >> 32);
 }
 
+HlslKey KeyHlsl(const std::string& hlsl, const wchar_t* profile) { return {KeyOf(hlsl, profile), CheckOf(hlsl)}; }
+
 bool FindHlsl(const std::string& hlsl, const wchar_t* profile, std::vector<uint8_t>& dxil) {
-    uint64_t key = KeyOf(hlsl, profile);
-    uint64_t check = CheckOf(hlsl);
+    return FindDxil(KeyHlsl(hlsl, profile), dxil);
+}
+
+bool FindDxil(const HlslKey& k, std::vector<uint8_t>& dxil) {
     Shaders& s = S();
     std::lock_guard lock(s.lock);
     if (!s.opened) Open(s);
-    auto it = s.index.find(key);
-    if (it == s.index.end() || it->second.check != check) return false;
+    auto it = s.index.find(k.key);
+    if (it == s.index.end() || it->second.check != k.check) return false;
     const uint8_t* p = s.data.data() + it->second.offset;
     dxil.assign(p, p + it->second.size);
     return true;

@@ -12,6 +12,14 @@ bool CompileHlsl(const std::string& hlsl, const wchar_t* profile, std::vector<ui
 // the cached DXIL only: false when the compiler is needed
 bool FindHlsl(const std::string& hlsl, const wchar_t* profile, std::vector<uint8_t>& dxil);
 
+// a translation's place in cache\shaders.bin, so its DXIL is found again without the HLSL
+struct HlslKey {
+    uint64_t key = 0;
+    uint64_t check = 0;
+};
+HlslKey KeyHlsl(const std::string& hlsl, const wchar_t* profile);
+bool FindDxil(const HlslKey& k, std::vector<uint8_t>& dxil);
+
 // runs job on a shader build thread
 void Post(std::function<void()> job);
 

@@ -161,27 +161,44 @@ bool RecordFailure(const std::wstring& what) {
 struct Target {
     const Image* image = nullptr;
     std::vector<uint8_t> xex;
+    std::vector<uint8_t> update;  // the title update package the xex is patched with, if any
     std::string stamp;
 };
 
-// a DLL serves the executable it was linked against and the xex it was translated from
-bool StampFor(const Image& image, const std::vector<uint8_t>& xex, std::string& stamp) {
+// a DLL serves the executable it was linked against and the xex and update it was translated from
+bool StampFor(const Image& image, const std::vector<uint8_t>& xex, const std::vector<uint8_t>& update,
+              std::string& stamp) {
     WIN32_FILE_ATTRIBUTE_DATA exe{};
     fs::path path = ExeDir() / (image.exe + L".exe");
     if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &exe)) return false;
     uint64_t size = (uint64_t(exe.nFileSizeHigh) << 32) | exe.nFileSizeLow;
     uint64_t time = (uint64_t(exe.ftLastWriteTime.dwHighDateTime) << 32) | exe.ftLastWriteTime.dwLowDateTime;
     stamp = std::to_string(size) + " " + std::to_string(time) + " " + Sha1(xex);
+    if (!update.empty()) stamp += " " + Sha1(update);
     return true;
 }
 
-// build.bat's DLL has no stamp: it is current when newer than the executable it was linked against
+// the SHA-1 of the title update package a DLL was built with, "" for none
+std::string BuiltUpdate(const fs::path& dll) {
+    HMODULE m = LoadLibraryExW(dll.c_str(), nullptr, DONT_RESOLVE_DLL_REFERENCES);
+    if (!m) return {};
+    auto* sha1 = reinterpret_cast<const char*>(GetProcAddress(m, "PPCUpdate"));
+    std::string built = sha1 ? sha1 : "";
+    FreeLibrary(m);
+    return built;
+}
+
+// build.bat's DLL has no stamp: it is current when newer than the executable it was linked against and built with
+// the title update the game has, or none
 bool Current(const Target& target) {
     std::error_code ec;
     fs::file_time_type built = fs::last_write_time(CodeDll(*target.image), ec);
     if (ec) return false;
     std::ifstream f(StampFile(*target.image));
-    if (!f) return built > fs::last_write_time(ExeDir() / (target.image->exe + L".exe"), ec);
+    if (!f) {
+        if (built <= fs::last_write_time(ExeDir() / (target.image->exe + L".exe"), ec)) return false;
+        return BuiltUpdate(CodeDll(*target.image)) == (target.update.empty() ? "" : Sha1(target.update));
+    }
     std::string line;
     return std::getline(f, line) && line == target.stamp;
 }
@@ -209,7 +226,8 @@ std::vector<Target> StaleTargets(const GameFiles& game, const std::vector<Image>
             LOGR("Game code: no %s in the game files, %ls is not built", image.xex.c_str(), image.exe.c_str());
             continue;
         }
-        if (!StampFor(image, target.xex, target.stamp) || Current(target)) continue;
+        target.update = game.update;
+        if (!StampFor(image, target.xex, target.update, target.stamp) || Current(target)) continue;
         stale.push_back(std::move(target));
     }
     return stale;
@@ -336,7 +354,14 @@ bool Translate(std::vector<Target>& targets, Processes& run) {
         fs::path xex = work / target.image->xex;
         std::ofstream(xex, std::ios::binary).write(reinterpret_cast<const char*>(target.xex.data()), target.xex.size());
         std::wstring command = Quote(CompilerDir() / "xex_recomp.exe") + L" " + Quote(target.image->config);
-        command += L" " + Quote(xex) + L" " + Quote(work) + L" --xdk " + Quote(CompilerDir() / "xdk");
+        command += L" " + Quote(xex) + L" " + Quote(work);
+        command += L" --xdk " + Quote(CompilerDir() / "xdk");
+        if (!target.update.empty()) {
+            fs::path update = work / "title_update";
+            std::ofstream(update, std::ios::binary)
+                .write(reinterpret_cast<const char*>(target.update.data()), target.update.size());
+            command += L" --update " + Quote(update);
+        }
         HANDLE process = run.Start(command, work);
         if (!process) return RecordFailure(L"xex_recomp.exe could not be started.");
         processes.push_back(process);

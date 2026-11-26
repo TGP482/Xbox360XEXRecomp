@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 
+#include "xex/package.h"
 #include "xex/xex.h"
 
 namespace fs = std::filesystem;
@@ -48,7 +49,8 @@ struct Image {
     std::vector<Function> functions;  // by address
     std::vector<uint64_t> hashes;     // of each function's masked words
 
-    bool Load(const fs::path& path) {
+    // with a title update package, the image that update makes
+    bool Load(const fs::path& path, const fs::path& update = {}) {
         std::ifstream f(path, std::ios::binary);
         std::vector<uint8_t> file((std::istreambuf_iterator<char>(f)), {});
         std::string err;
@@ -56,8 +58,21 @@ struct Image {
             std::fprintf(stderr, "%s: %s\n", path.string().c_str(), file.empty() ? "cannot read" : err.c_str());
             return false;
         }
+        if (!update.empty() && !LoadUpdate(path, update)) return false;
         ReadPdata();
         for (const Function& fn : functions) hashes.push_back(Hash(Masked(*this, fn)));
+        return true;
+    }
+
+    bool LoadUpdate(const fs::path& path, const fs::path& update) {
+        std::ifstream f(update, std::ios::binary);
+        std::vector<uint8_t> file((std::istreambuf_iterator<char>(f)), {});
+        xex::Package package;
+        std::string err;
+        if (!package.Load(file, err) || !xex::ApplyUpdate(package, path.filename().string(), x, err)) {
+            std::fprintf(stderr, "%s: %s\n", update.string().c_str(), file.empty() ? "cannot read" : err.c_str());
+            return false;
+        }
         return true;
     }
 
@@ -517,9 +532,9 @@ int Scan(const ScanArgs& args) {
 }
 
 // the loaded image for xex2pe.py: base and entry as little endian words, then the memory from base
-int WriteImage(const fs::path& xex, const fs::path& out) {
+int WriteImage(const fs::path& xex, const fs::path& update, const fs::path& out) {
     Image img;
-    if (!img.Load(xex)) return 1;
+    if (!img.Load(xex, update)) return 1;
     std::ofstream f(out, std::ios::binary);
     for (uint32_t v : {img.x.base, img.x.entry})
         for (int i = 0; i < 4; i++) f.put(char(v >> (8 * i)));
@@ -541,14 +556,15 @@ int main(int argc, char** argv) {
     std::string out = opt("--out");
     std::string name = opt("--name");
     std::string library = opt("--library");
+    std::string update = opt("--update");
     if (!a.empty() && a[0] == "--sign" && a.size() >= 2 && !out.empty())
         return Sign(out, std::vector<fs::path>(a.begin() + 1, a.end()));
-    if (a.size() == 2 && a[0] == "--image" && !out.empty()) return WriteImage(a[1], out);
+    if (a.size() == 2 && a[0] == "--image" && !out.empty()) return WriteImage(a[1], update, out);
     if (a.size() != 2 || library.empty()) {
         std::fprintf(stderr,
                      "usage: xex_symbols <game.xex> <sdk>/xdk --library <exe>.dll [--out config/game.toml] [--name game]\n"
                      "       xex_symbols --sign <config.toml>... --out signatures.toml\n"
-                     "       xex_symbols --image <game.xex> --out image.bin\n");
+                     "       xex_symbols --image <game.xex> [--update <title update package>] --out image.bin\n");
         return 1;
     }
     return Scan({a[0], a[1], out, name.empty() ? "game" : name, library});

@@ -41,14 +41,24 @@ struct Summary {
     std::vector<uint32_t> callees;
 };
 
+// A build patched by a title update. The executable's side is the base image's: its symbols by base name, its stubs
+// over the base functions. The updated functions that are moved base functions keep the base names.
+struct Canonical {
+    const Analysis* base = nullptr;
+    std::string sha1;  // the update's package
+    std::unordered_map<uint32_t, uint32_t> names;  // updated entry to its base entry
+};
+
 class CodeGen {
 public:
-    CodeGen(const Analysis& an, std::filesystem::path out) : an_(an), out_(std::move(out)) {}
+    CodeGen(const Analysis& an, std::filesystem::path out, const Canonical* canon = nullptr)
+        : an_(an), out_(std::move(out)), canon_(canon) {}
     bool Run();
 
 private:
     const Analysis& an_;
     std::filesystem::path out_;
+    const Canonical* canon_;
     std::map<uint32_t, uint32_t> import_slots_;  // import thunk to its index in PPCImports
     uint32_t code_base_ = 0;
     uint32_t code_words_ = 0;
@@ -107,6 +117,8 @@ private:
     std::string OvW();
 
     // functions and their files
+    std::string Sub(uint32_t entry) const;  // sub_X, a function as the executable names it
+    const Config& SymbolConfig() const;     // the config the executable's symbols come from
     void Summarize(const std::vector<uint32_t>& funcs);
     const Summary* Exact(uint32_t target) const;
     bool BeginFunction(uint32_t entry);
@@ -125,9 +137,11 @@ private:
     void WriteSymbols(std::vector<uint32_t>& absent) const;
     void WriteShared(const std::vector<uint32_t>& funcs, const std::vector<uint32_t>& absent) const;
     void WritePartitions(const std::vector<uint32_t>& funcs);
-    void WriteMapping(const std::vector<uint32_t>& funcs, const std::vector<uint32_t>& absent) const;
+    void WriteMapping(const std::vector<uint32_t>& funcs, const std::vector<uint32_t>& stubs,
+                      const std::vector<uint32_t>& absent) const;
+    std::string SymbolTable(const std::vector<uint32_t>& absent) const;
     void WriteDefs() const;
-    void WriteHostBodies(const std::vector<uint32_t>& funcs, const std::vector<uint32_t>& absent) const;
+    void WriteHostBodies(const std::vector<uint32_t>& stubs, const std::vector<uint32_t>& absent) const;
 
     // control flow
     void EmitInsn(const ppc::Insn& i);

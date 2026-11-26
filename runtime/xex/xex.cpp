@@ -11,6 +11,7 @@ namespace {
 // optional header keys
 constexpr uint32_t kResourceInfo = 0x000002FF;
 constexpr uint32_t kFileFormat = 0x000003FF;
+constexpr uint32_t kDeltaPatch = 0x000005FF;
 constexpr uint32_t kEntryPoint = 0x00010100;
 constexpr uint32_t kImageBase = 0x00010201;
 constexpr uint32_t kImportLibraries = 0x000103FF;
@@ -34,7 +35,18 @@ constexpr uint32_t kLoadAddress = 0x110;
 constexpr uint32_t kFileKey = 0x150;
 
 enum Encryption : uint16_t { kPlain = 0, kEncrypted = 1 };
-enum Compression : uint16_t { kStored = 0, kBasic = 1, kNormal = 2 };
+enum Compression : uint16_t { kStored = 0, kBasic = 1, kNormal = 2, kDelta = 3 };
+
+constexpr uint32_t kPatchDeltaFlag = 0x40;  // module flag of a title update's xexp
+
+// delta patch descriptor, the 0x5FF header
+struct DeltaHeader {
+    static constexpr uint32_t kSize = 0x00;
+    static constexpr uint32_t kTargetHeadersSize = 0x30;
+    static constexpr uint32_t kHeadersSource = 0x34;  // offset, size, then where the target keeps it
+    static constexpr uint32_t kImageSource = 0x40;    // the same for the image
+    static constexpr uint32_t kHeadersPatch = 0x4C;  // its delta records, up to kSize
+};
 
 constexpr uint8_t kRetailKey[16] = {0x20, 0xB1, 0x85, 0xA5, 0x9D, 0x28, 0xFD, 0xC3,
                                     0x40, 0x58, 0x3F, 0xBB, 0x08, 0x96, 0xBF, 0x91};
@@ -247,6 +259,12 @@ bool Inflate(const Reader& r, const FileFormat& ff, const std::vector<uint8_t>& 
     return LzxDecompress(stream.data(), stream.size(), window, image_size, out);
 }
 
+// the header's file key decrypted with key, which the image data is encrypted with
+void SessionKey(const Reader& r, const uint8_t key[16], uint8_t session[16]) {
+    std::memcpy(session, r.At(r.U32(kSecurityOffset) + kFileKey), 16);
+    Aes128(key).DecryptBlock(session);
+}
+
 // a PE image starts with MZ; a wrong key leaves noise
 bool Decode(const Reader& r, const FileFormat& ff, const uint8_t key[16], std::vector<uint8_t>& out,
             std::string& error) {
@@ -254,8 +272,7 @@ bool Decode(const Reader& r, const FileFormat& ff, const uint8_t key[16], std::v
     std::vector<uint8_t> data(r.At(data_off), r.At(0) + r.Size());
     if (ff.encryption == kEncrypted) {
         uint8_t session[16];
-        std::memcpy(session, r.At(r.U32(kSecurityOffset) + kFileKey), 16);
-        Aes128(key).DecryptBlock(session);
+        SessionKey(r, key, session);
         Aes128(session).DecryptCbc(data.data(), data.size());
     }
     out.clear();
@@ -378,7 +395,167 @@ void ReadFields(const Reader& r, Image& img) {
     }
 }
 
+// the header's fields and what the loaded image's headers describe
+void ReadImage(const Reader& r, Image& img) {
+    uint32_t security = r.U32(kSecurityOffset);
+    img.module_flags = r.U32(kModuleFlags);
+    img.image_flags = r.U32(security + kImageFlags);
+    img.base = r.U32(security + kLoadAddress);
+    r.Header(kImageBase, img.base);
+    ReadSections(img);
+    ReadLibraries(r, img);
+    ReadImports(r, img);
+    ReadResources(r, img);
+    ReadFields(r, img);
+}
+
+// A delta record, as the title update loader applies them in order: offsets in the source and the target, a length,
+// then a packed size: 0 clears the target, 1 copies the source there, else that many bytes of LZX made against the
+// source. Records of zeros end a list.
+bool ApplyDeltas(const uint8_t* p, size_t size, uint32_t window, std::vector<uint8_t>& target) {
+    constexpr size_t kRecord = 12;
+    for (size_t o = 0; o + kRecord <= size;) {
+        uint32_t from = Be32(p + o);
+        uint32_t to = Be32(p + o + 4);
+        uint32_t length = Be16(p + o + 8);
+        uint32_t packed = Be16(p + o + 10);
+        o += kRecord;
+        if (!length && !packed) break;
+        if (uint64_t(from) + length > target.size() || uint64_t(to) + length > target.size()) return false;
+        if (packed == 0) {
+            std::memset(target.data() + to, 0, length);
+        } else if (packed == 1) {
+            std::memmove(target.data() + to, target.data() + from, length);
+        } else {
+            std::vector<uint8_t> out;
+            if (o + packed > size) return false;
+            if (!LzxDecompress(p + o, packed, window, target.data() + from, length, length, out)) return false;
+            std::memcpy(target.data() + to, out.data(), length);
+            o += packed;
+        }
+    }
+    return true;
+}
+
+constexpr size_t kBlockHeader = 24;  // the next block's size and hash
+
+// the patch data is a chain of blocks as normal compression's, each opening with the next one's size
+bool BlockChain(const std::vector<uint8_t>& data, size_t first_size) {
+    size_t block = 0;
+    size_t size = first_size;
+    while (size) {
+        if (size < kBlockHeader || block + size > data.size()) return false;
+        size_t next = Be32(data.data() + block);
+        block += size;
+        size = next;
+    }
+    return true;
+}
+
+// each block holds its own list of delta records
+bool ApplyImageDeltas(const std::vector<uint8_t>& data, size_t first_size, uint32_t window,
+                      std::vector<uint8_t>& image) {
+    size_t block = 0;
+    size_t size = first_size;
+    while (size) {
+        if (!ApplyDeltas(data.data() + block + kBlockHeader, size - kBlockHeader, window, image)) return false;
+        size_t next = Be32(data.data() + block);
+        block += size;
+        size = next;
+    }
+    return true;
+}
+
+// the descriptor's range of the source copied to where the target keeps it, before the records run
+bool CopyRange(const Reader& r, uint32_t range, const std::vector<uint8_t>& source, std::vector<uint8_t>& target) {
+    uint32_t from = r.U32(range);
+    uint32_t size = r.U32(range + 4);
+    uint32_t to = r.U32(range + 8);
+    if (uint64_t(from) + size > source.size() || uint64_t(to) + size > target.size()) return false;
+    std::memcpy(target.data() + to, source.data() + from, size);
+    return true;
+}
+
+// the target headers: the source's copied in, then the descriptor's own delta records
+bool PatchHeaders(const Reader& r, uint32_t delta, uint32_t window, const std::vector<uint8_t>& source,
+                  std::vector<uint8_t>& target) {
+    target.resize(r.U32(delta + DeltaHeader::kTargetHeadersSize));
+    const uint8_t* records = r.At(delta + DeltaHeader::kHeadersPatch);
+    size_t records_size = r.U32(delta + DeltaHeader::kSize) - DeltaHeader::kHeadersPatch;
+    return CopyRange(r, delta + DeltaHeader::kHeadersSource, source, target) &&
+           ApplyDeltas(records, records_size, window, target);
+}
+
+// The patch data is encrypted with the xexp's file key, decrypted by the patched headers' file key under the retail or
+// devkit key. The key whose data forms a block chain is the right one.
+bool DecryptPatchData(const Reader& patch, const Reader& target, const FileFormat& ff, std::vector<uint8_t>& data) {
+    data.assign(patch.At(patch.U32(kDataOffset)), patch.At(0) + patch.Size());
+    size_t first_size = patch.U32(ff.info + 4);
+    if (ff.encryption != kEncrypted) return BlockChain(data, first_size);
+    for (const uint8_t* key : {kRetailKey, kDevkitKey}) {
+        uint8_t target_session[16];
+        uint8_t session[16];
+        SessionKey(target, key, target_session);
+        SessionKey(patch, target_session, session);
+        std::vector<uint8_t> plain = data;
+        Aes128(session).DecryptCbc(plain.data(), plain.size());
+        if (!BlockChain(plain, first_size)) continue;
+        data = std::move(plain);
+        return true;
+    }
+    return false;
+}
+
 }  // namespace
+
+bool Image::Patch(const std::vector<uint8_t>& file, std::string& error) {
+    Reader r(file);
+    FileFormat ff;
+    uint32_t delta = 0;
+    if (file.size() < kHeaders || std::memcmp(file.data(), "XEX2", 4) || !(r.U32(kModuleFlags) & kPatchDeltaFlag)) {
+        error = "not an XEX2 delta patch";
+        return false;
+    }
+    bool header_ok = r.Has(r.U32(kSecurityOffset), kFileKey + 16) && r.Has(r.U32(kDataOffset), 0) &&
+                     ReadFileFormat(r, ff) && r.Header(kDeltaPatch, delta) && r.Has(delta, DeltaHeader::kHeadersPatch);
+    if (!header_ok || !r.Has(delta, r.U32(delta + DeltaHeader::kSize))) {
+        error = "patch header is cut short";
+        return false;
+    }
+    if (ff.compression != kDelta) {
+        error = "unknown patch compression " + std::to_string(ff.compression);
+        return false;
+    }
+    uint32_t window = r.U32(ff.info);
+
+    Image patched;
+    if (r.U32(delta + DeltaHeader::kSize) < DeltaHeader::kHeadersPatch ||
+        !PatchHeaders(r, delta, window, header, patched.header)) {
+        error = "patch does not fit this image's headers";
+        return false;
+    }
+    Reader t(patched.header);
+    if (patched.header.size() < kHeaders || std::memcmp(patched.header.data(), "XEX2", 4) ||
+        !t.Has(t.U32(kSecurityOffset), kFileKey + 16)) {
+        error = "patched headers are not XEX2, the patch is for another release";
+        return false;
+    }
+
+    std::vector<uint8_t> data;
+    if (!DecryptPatchData(r, t, ff, data)) {
+        error = "patch data did not decrypt with the retail or devkit key, the patch is for another release";
+        return false;
+    }
+    patched.memory.resize(t.U32(t.U32(kSecurityOffset) + kImageSize));
+    if (!CopyRange(r, delta + DeltaHeader::kImageSource, memory, patched.memory) ||
+        !ApplyImageDeltas(data, r.U32(ff.info + 4), window, patched.memory)) {
+        error = "patch does not fit this image";
+        return false;
+    }
+    ReadImage(t, patched);
+    *this = std::move(patched);
+    return true;
+}
 
 bool Image::Load(const std::vector<uint8_t>& file, std::string& error) {
     Reader r(file);
@@ -393,21 +570,13 @@ bool Image::Load(const std::vector<uint8_t>& file, std::string& error) {
         return false;
     }
     header.assign(file.begin(), file.begin() + r.U32(kDataOffset));
-    module_flags = r.U32(kModuleFlags);
-    image_flags = r.U32(security + kImageFlags);
-    base = r.U32(security + kLoadAddress);
-    r.Header(kImageBase, base);
     if (!Decode(r, ff, kRetailKey, memory, error) && error.empty() && !Decode(r, ff, kDevkitKey, memory, error)) {
         if (error.empty()) error = "image did not decrypt and decompress with the retail or devkit key";
         return false;
     }
     if (!error.empty()) return false;
     memory.resize(r.U32(security + kImageSize));
-    ReadSections(*this);
-    ReadLibraries(r, *this);
-    ReadImports(r, *this);
-    ReadResources(r, *this);
-    ReadFields(r, *this);
+    ReadImage(r, *this);
     return true;
 }
 

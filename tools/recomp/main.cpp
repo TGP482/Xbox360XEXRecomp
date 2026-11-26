@@ -8,6 +8,9 @@
 
 #include "analysis.h"
 #include "codegen.h"
+#include "kernel/crypto.h"
+#include "update_map.h"
+#include "xex/package.h"
 
 namespace fs = std::filesystem;
 
@@ -73,6 +76,35 @@ static void LoadNames(const toml::table& t, Config& cfg) {
             if (auto i = v.value<int64_t>()) cfg.layout[std::string(k.str())] = uint32_t(*i);
 }
 
+// [update.addresses] base = update, for what the recompiler cannot match
+static bool LoadAddresses(const toml::table& t, Update& update) {
+    for (auto& [k, v] : t) {
+        auto to = v.value<int64_t>();
+        if (!to) return false;
+        try {
+            update.addresses[ParseAddr(k.str())] = uint32_t(*to);
+        } catch (...) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool LoadUpdates(const toml::table& t, Config& cfg) {
+    auto a = t["update"].as_array();
+    if (!a) return true;
+    for (auto& e : *a) {
+        auto u = e.as_table();
+        auto sha1 = u ? (*u)["sha1"].value<std::string>() : std::nullopt;
+        if (!sha1) return false;
+        Update update{*sha1, {}};
+        auto addresses = (*u)["addresses"].as_table();
+        if (addresses && !LoadAddresses(*addresses, update)) return false;
+        cfg.updates.push_back(update);
+    }
+    return true;
+}
+
 static bool LoadHooks(const toml::table& t, Config& cfg) {
     if (auto a = t["hook"].as_array())
         for (auto& e : *a) {
@@ -132,6 +164,7 @@ static bool LoadOverrides(const toml::table& t, Config& cfg) {
 //   [[function]] at, end  an entry decoded no further than end (exclusive)
 //   [[switch]] at, targets  the targets of a bctr, replacing table detection
 //   [xex] xdk = build  includes <--xdk folder>/<build>/layout.toml
+//   [[update]] sha1, [update.addresses]  a title update package the image may be built patched with (--update)
 static bool LoadConfig(const fs::path& path, Config& cfg, const fs::path& xdk_dir) {
     toml::table t;
     try {
@@ -155,8 +188,8 @@ static bool LoadConfig(const fs::path& path, Config& cfg, const fs::path& xdk_di
                 if (!LoadConfig(path.parent_path() / *s, cfg, xdk_dir)) return false;
     LoadXex(t, cfg);
     LoadNames(t, cfg);
-    if (!LoadHooks(t, cfg) || !LoadOverrides(t, cfg)) {
-        std::fprintf(stderr, "%s: bad [[hook]], [[function]] or [[switch]] entry\n", path.string().c_str());
+    if (!LoadHooks(t, cfg) || !LoadOverrides(t, cfg) || !LoadUpdates(t, cfg)) {
+        std::fprintf(stderr, "%s: bad [[hook]], [[function]], [[switch]] or [[update]] entry\n", path.string().c_str());
         return false;
     }
     for (auto& [name, va] : cfg.symbols)
@@ -202,13 +235,19 @@ static void FindOverrides(const fs::path& src, const fs::path& list, Config& cfg
     }
 }
 
-static bool ReadImage(const fs::path& path, xex::Image& img) {
+static bool ReadFile(const fs::path& path, std::vector<uint8_t>& data) {
     std::ifstream f(path, std::ios::binary);
     if (!f) {
         std::fprintf(stderr, "cannot open %s\n", path.string().c_str());
         return false;
     }
-    std::vector<uint8_t> data((std::istreambuf_iterator<char>(f)), {});
+    data.assign(std::istreambuf_iterator<char>(f), {});
+    return true;
+}
+
+static bool ReadImage(const fs::path& path, xex::Image& img) {
+    std::vector<uint8_t> data;
+    if (!ReadFile(path, data)) return false;
     std::string err;
     if (!img.Load(data, err)) {
         std::fprintf(stderr, "%s: %s\n", path.string().c_str(), err.c_str());
@@ -217,17 +256,85 @@ static bool ReadImage(const fs::path& path, xex::Image& img) {
     return true;
 }
 
+static std::string Sha1(const std::vector<uint8_t>& data) {
+    alignas(8) uint8_t ctx[128];
+    uint8_t digest[20];
+    crypto::ShaInit(ctx);
+    crypto::ShaUpdate(ctx, data.data(), data.size());
+    crypto::ShaFinal(ctx, digest);
+    std::string hex;
+    for (uint8_t b : digest) hex += Fmt("%02x", b);
+    return hex;
+}
+
+// the [[update]] naming the package, null when none does
+static const Update* FindUpdate(const std::vector<uint8_t>& package, const Config& cfg) {
+    std::string sha1 = Sha1(package);
+    for (const Update& u : cfg.updates)
+        if (u.sha1 == sha1) return &u;
+    return nullptr;
+}
+
+// each updated function that is a moved base function keeps the base name, so the host overrides still bind
+static bool NameFunctions(const Analysis& base, const Analysis& updated, const UpdateMap& map,
+                          std::unordered_map<uint32_t, uint32_t>& names) {
+    std::set<uint32_t> named;
+    for (auto& [va, f] : updated.functions) {
+        std::optional<uint32_t> from = map.BaseCode(va);
+        if (!from || !base.functions.count(*from)) continue;
+        names[va] = *from;
+        named.insert(*from);
+    }
+    bool ok = true;
+    for (uint32_t va : base.cfg.overridden) {
+        if (!base.functions.count(va) || named.count(va)) continue;
+        std::fprintf(stderr, "update: host override sub_%08X has no function in the update, give it in "
+                             "[update.addresses]\n", va);
+        ok = false;
+    }
+    return ok;
+}
+
+// The image as the console runs it with the title update installed, recompiled from the base image's config: its
+// addresses moved where the update keeps them, the executable's side unchanged.
+static bool BuildUpdated(const Analysis& base, const Update& update, const std::vector<uint8_t>& data,
+                         const fs::path& path, const fs::path& xex_path, const fs::path& out_dir) {
+    xex::Package package;
+    xex::Image updated = base.img;
+    std::string err;
+    if (!package.Load(data, err) || !xex::ApplyUpdate(package, xex_path.filename().string(), updated, err)) {
+        std::fprintf(stderr, "%s: %s\n", path.string().c_str(), err.c_str());
+        return false;
+    }
+    std::fprintf(stderr, "%s: title update %s, entry %08X\n", xex_path.filename().string().c_str(),
+                 path.filename().string().c_str(), updated.entry);
+    UpdateMap map(base.img, updated);
+    for (auto& [from, to] : update.addresses) map.Set(from, to);
+    Config cfg;
+    if (!Translate(base.cfg, base.img, map, cfg)) return false;
+    Analysis an(updated, cfg);
+    an.Run();
+    if (!CheckOverrides(an)) return false;
+    Canonical canon{&base, update.sha1, {}};
+    if (!NameFunctions(base, an, map, canon.names)) return false;
+    return CodeGen(an, out_dir, &canon).Run();
+}
+
 int main(int argc, char** argv) {
     std::vector<std::string> args;
     fs::path xdk_dir;
+    fs::path update_path;
     bool usage = false;
     for (int i = 1; i < argc; i++) {
-        if (std::strcmp(argv[i], "--xdk")) args.push_back(argv[i]);
-        else if (++i < argc) xdk_dir = argv[i];
-        else usage = true;
+        bool xdk = !std::strcmp(argv[i], "--xdk");
+        bool update = !std::strcmp(argv[i], "--update");
+        if (!xdk && !update) args.push_back(argv[i]);
+        else if (++i >= argc) usage = true;
+        else (xdk ? xdk_dir : update_path) = argv[i];
     }
     if (args.empty() || usage) {
-        std::fprintf(stderr, "usage: xex_recomp <config.toml> [xex override] [out override] [--xdk <SDK xdk folder>]\n");
+        std::fprintf(stderr, "usage: xex_recomp <config.toml> [xex override] [out override] [--xdk <SDK xdk folder>] "
+                             "[--update <title update package>]\n");
         return 1;
     }
     Config cfg;
@@ -259,5 +366,12 @@ int main(int argc, char** argv) {
     fs::create_directories(out_dir);
     std::ofstream list(out_dir / "overrides.txt");
     for (uint32_t va : cfg.overridden) list << std::hex << va << "\n";
+    std::vector<uint8_t> package;
+    if (!update_path.empty() && !ReadFile(update_path, package)) return 1;
+    const Update* update = package.empty() ? nullptr : FindUpdate(package, cfg);
+    if (update) return BuildUpdated(an, *update, package, update_path, xex_path, out_dir) ? 0 : 1;
+    if (!package.empty())
+        std::fprintf(stderr, "%s: not a title update the config names in [[update]], built without it\n",
+                     update_path.string().c_str());
     return CodeGen(an, out_dir).Run() ? 0 : 1;
 }

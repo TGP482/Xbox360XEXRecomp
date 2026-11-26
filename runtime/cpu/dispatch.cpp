@@ -48,12 +48,14 @@ const PPCFuncMapping* g_mappings = nullptr;
 const PPCImport* g_import_list = nullptr;
 PPCFunc* const* g_bodies = nullptr;
 const uint8_t* g_exact = nullptr;
+const uint32_t* g_symbols = nullptr;
 uint32_t g_entry = 0;
 #else
 // the headless harness links them in
 const PPCFuncMapping* g_mappings = PPCFuncMappings;
 const PPCImport* g_import_list = PPCImports;
 PPCFunc* const* g_bodies = PPCBodies;
+const uint32_t* g_symbols = PPCSymbols;
 uint32_t g_entry = PPCEntryPoint;
 #endif
 
@@ -146,7 +148,8 @@ bool Load(const std::filesystem::path& dll) {
     auto* entry = reinterpret_cast<const uint32_t*>(GetProcAddress(m, "PPCEntryPoint"));
     g_bodies = reinterpret_cast<PPCFunc* const*>(GetProcAddress(m, "PPCBodies"));
     g_exact = reinterpret_cast<const uint8_t*>(GetProcAddress(m, "PPCExactCallees"));
-    if (!g_mappings || !g_import_list || !lo || !hi || !entry || !g_bodies || !g_exact) return false;
+    g_symbols = reinterpret_cast<const uint32_t*>(GetProcAddress(m, "PPCSymbols"));
+    if (!g_mappings || !g_import_list || !lo || !hi || !entry || !g_bodies || !g_exact || !g_symbols) return false;
     g_lo = *lo;
     g_hi = *hi;
     g_entry = *entry;
@@ -170,7 +173,7 @@ void Init() {
         if (InCode(m->guest)) g_table[(m->guest - g_lo) / 4] = m->host;
 #ifdef _WIN32
         // the recompiler stored and reloaded around calls to it by what the body touches
-        if (g_exact[n] && m->host != g_bodies[n]) {
+        if (g_exact[n] && m->host != m->body) {
             LOGE("dispatch: sub_%08X has a host override the recompiler did not see, name it in [symbols]", m->guest);
             std::abort();
         }
@@ -181,6 +184,8 @@ void Init() {
 }
 
 PPCFunc* Body(uint32_t index) { return g_bodies[index]; }
+
+uint32_t Symbol(uint32_t index) { return g_symbols[index]; }
 
 PPCFunc* Find(uint32_t guest) {
     if (!InCode(guest) || (guest & 3)) return nullptr;

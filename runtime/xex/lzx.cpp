@@ -135,8 +135,9 @@ int SlotCount(uint32_t window) {
 
 class Decoder {
 public:
+    // out may already hold reference bytes, which matches reach back into
     Decoder(const uint8_t* in, size_t size, int slots, std::vector<uint8_t>& out)
-        : in_(in, size), data_(in), size_(size), slots_(slots), out_(out) {}
+        : in_(in, size), data_(in), size_(size), slots_(slots), start_(out.size()), out_(out) {}
 
     bool Run(size_t out_size) {
         if (in_.Read(1)) translation_ = in_.Read(32);
@@ -152,6 +153,7 @@ private:
     const uint8_t* data_;
     size_t size_;
     int slots_;
+    size_t start_;
     std::vector<uint8_t>& out_;
     uint8_t main_len_[kMainMax] = {};
     uint8_t length_len_[kLengthSize] = {};
@@ -216,7 +218,7 @@ private:
             size_t before = out_.size();
             if (!DecodeElement(type == kAligned, out_size)) return false;
             remaining -= int64_t(out_.size() - before);
-            if (before / kFrame != out_.size() / kFrame) in_.Align();
+            if ((before - start_) / kFrame != (out_.size() - start_) / kFrame) in_.Align();
         }
         return true;
     }
@@ -285,14 +287,14 @@ private:
     // E8 call translation: absolute targets back to relative, per frame
     void Translate() {
         if (!translation_) return;
-        for (size_t frame = 0; frame < kTranslationFrames && frame * kFrame < out_.size(); frame++) {
-            size_t start = frame * kFrame;
+        for (size_t frame = 0; frame < kTranslationFrames && start_ + frame * kFrame < out_.size(); frame++) {
+            size_t start = start_ + frame * kFrame;
             size_t end = std::min(start + kFrame, out_.size());
             for (size_t i = start; end - start > 10 && i < end - 10; i++) {
                 if (out_[i] != 0xE8) continue;
                 uint8_t* p = out_.data() + i + 1;
                 int32_t abs = int32_t(p[0] | p[1] << 8 | p[2] << 16 | uint32_t(p[3]) << 24);
-                int32_t cur = int32_t(i);
+                int32_t cur = int32_t(i - start_);
                 if (abs >= -cur && abs < int32_t(translation_)) {
                     int32_t rel = abs >= 0 ? abs - cur : abs + int32_t(translation_);
                     for (int b = 0; b < 4; b++) p[b] = uint8_t(uint32_t(rel) >> (8 * b));
@@ -311,6 +313,20 @@ bool LzxDecompress(const uint8_t* in, size_t size, uint32_t window, size_t out_s
     out.clear();
     out.reserve(out_size);
     return Decoder(in, size, slots, out).Run(out_size);
+}
+
+bool LzxDecompress(const uint8_t* in, size_t size, uint32_t window, const uint8_t* reference, size_t reference_size,
+                   size_t out_size, std::vector<uint8_t>& out) {
+    int slots = SlotCount(window);
+    if (!slots) return false;
+    // the window starts zeroed with reference at its end
+    size_t kept = std::min<size_t>(reference_size, window);
+    out.assign(window - kept, 0);
+    out.insert(out.end(), reference + reference_size - kept, reference + reference_size);
+    out.reserve(window + out_size);
+    if (!Decoder(in, size, slots, out).Run(window + out_size)) return false;
+    out.erase(out.begin(), out.begin() + window);
+    return true;
 }
 
 }  // namespace xex

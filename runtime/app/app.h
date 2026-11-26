@@ -75,6 +75,7 @@ std::filesystem::path ExeDir();
 struct GameFiles {
     std::filesystem::path dir;
     std::vector<uint8_t> xex;
+    std::vector<uint8_t> update;  // a title update package the config names, when assets holds one
 };
 bool FindGame(GameFiles& game);
 std::string Sha1(const std::vector<uint8_t>& data);  // lower case hex

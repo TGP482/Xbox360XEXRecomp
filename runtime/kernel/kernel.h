@@ -245,9 +245,10 @@ constexpr uint32_t kCriticalSectionSize = 0x1C;
 void InitCriticalSection(uint32_t cs);  // as RtlInitializeCriticalSection
 uint32_t XexHeaderField(uint32_t key);  // as RtlImageXexHeaderField on the title's header, 0 when absent
 
-// boot: the image into guest memory, its imports bound, its first thread started
-bool Boot(const std::vector<uint8_t>& xex, const std::string& xex_name, const std::string& game_dir,
-          const std::string& data_dir);
+// boot: the image, patched by the title update package when there is one, into guest memory, its imports bound, its
+// first thread started
+bool Boot(const std::vector<uint8_t>& xex, const std::vector<uint8_t>& update, const std::string& xex_name,
+          const std::string& game_dir, const std::string& data_dir);
 const xex::Image& LoadedImage();
 [[noreturn]] void Shutdown(int code);
 // XamLoaderLaunchTitle: the executable named exe beside this one takes over (app::HandOver), this one when exe is

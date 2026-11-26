@@ -13,11 +13,13 @@
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 
 #include "app/app.h"
 #include "cpu/dispatch.h"
 #include "kernel/kernel.h"
 #include "xam/xam.h"
+#include "xex/package.h"
 
 namespace kernel {
 
@@ -49,17 +51,46 @@ void LogImage(const xex::Image& img) {
         LOGR("boot: library %-8s %u.%u.%u", l.name.c_str(), l.major, l.minor, l.build);
 }
 
+bool SameBytes(const std::filesystem::path& path, const std::vector<uint8_t>& data) {
+    std::error_code ec;
+    if (std::filesystem::file_size(path, ec) != data.size()) return false;
+    std::ifstream f(path, std::ios::binary);
+    std::vector<uint8_t> have((std::istreambuf_iterator<char>(f)), {});
+    return have == data;
+}
+
+// update:, the title update's files as the console mounts them for the title, written out beside the hard disk
+void MountUpdate(const xex::Package& update, const std::string& data_dir) {
+    std::filesystem::path dir = std::filesystem::path(data_dir) / "update";
+    for (const xex::Package::File& file : update.files) {
+        std::string name = file.name;
+        std::replace(name.begin(), name.end(), '\\', '/');
+        std::filesystem::path host = dir / name;
+        if (SameBytes(host, file.data)) continue;
+        std::error_code ec;
+        std::filesystem::create_directories(host.parent_path(), ec);
+        std::ofstream(host, std::ios::binary).write(reinterpret_cast<const char*>(file.data.data()), file.data.size());
+    }
+    MountFolder("\\Device\\Update", dir.string());
+    CreateSymbolicLink("\\??\\update:", "\\Device\\Update");
+}
+
 }  // namespace
 
 const xex::Image& LoadedImage() { return g_image; }
 
-bool Boot(const std::vector<uint8_t>& xex, const std::string& xex_name, const std::string& game_dir,
-          const std::string& data_dir) {
+bool Boot(const std::vector<uint8_t>& xex, const std::vector<uint8_t>& update, const std::string& xex_name,
+          const std::string& game_dir, const std::string& data_dir) {
     if (!mem::Init()) return false;
     g_base = mem::Base();
     std::string err;
+    xex::Package package;
     if (!g_image.Load(xex, err)) {
         LOGE("boot: %s: %s", xex_name.c_str(), err.c_str());
+        return false;
+    }
+    if (!update.empty() && (!package.Load(update, err) || !xex::ApplyUpdate(package, xex_name, g_image, err))) {
+        LOGE("boot: title update: %s", err.c_str());
         return false;
     }
     const xex::Image& img = g_image;
@@ -77,6 +108,7 @@ bool Boot(const std::vector<uint8_t>& xex, const std::string& xex_name, const st
     dispatch::Init();
     BindImportVariables(img);
     MountDefaults(game_dir, data_dir);
+    if (!update.empty()) MountUpdate(package, data_dir);
     SetTlsTemplate(img.tls.raw_data, img.tls.raw_size, img.tls.data_size);
 
     ThreadStart start;

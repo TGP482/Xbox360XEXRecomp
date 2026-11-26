@@ -11,12 +11,14 @@
 #include <algorithm>
 #include <cwctype>
 #include <fstream>
+#include <string_view>
 
 #include "app/app.h"
 #include "core/log.h"
 #include "image_symbols.h"
 #include "kernel/crypto.h"
 #include "kernel/disc.h"
+#include "xex/package.h"
 
 extern const char kImageSha1[];  // the xex recompiled into this executable, written by CMake
 
@@ -43,6 +45,22 @@ bool ReadHostFile(const fs::path& path, std::vector<uint8_t>& out) {
     if (!f) return false;
     out.assign(std::istreambuf_iterator<char>(f), {});
     return true;
+}
+
+// a title update package in assets that the config names, under any name; the game runs without one
+void AddUpdate(const fs::path& assets, GameFiles& game) {
+    if (!*IMAGE_UPDATES) return;
+    for (const fs::path& path : xex::PackagesIn(assets)) {
+        std::vector<uint8_t> file;
+        if (!ReadHostFile(path, file)) continue;
+        std::string sha = Sha1(file);
+        bool supported = std::string_view(IMAGE_UPDATES).find(sha) != std::string_view::npos;
+        LOGR("Game: package %s, sha1 %s%s", path.filename().string().c_str(), sha.c_str(),
+             supported ? ", the title update" : ", not a title update this build knows");
+        if (!supported) continue;
+        game.update = std::move(file);
+        return;
+    }
 }
 
 }  // namespace
@@ -95,7 +113,10 @@ bool FindGame(GameFiles& game) {
     };
 
     std::vector<uint8_t> xex;
-    if (!assets.empty() && ReadHostFile(assets / IMAGE_XEX, xex) && consider(assets, std::move(xex), nullptr)) return true;
+    if (!assets.empty() && ReadHostFile(assets / IMAGE_XEX, xex) && consider(assets, std::move(xex), nullptr)) {
+        AddUpdate(assets, game);
+        return true;
+    }
     for (const fs::path& iso : isos) {
         auto disc = std::make_unique<kernel::Disc>();
         std::string error;
@@ -107,7 +128,9 @@ bool FindGame(GameFiles& game) {
             LOGR("game: %s has no %s", iso.string().c_str(), IMAGE_XEX);
             continue;
         }
-        if (consider(iso, std::move(xex), std::move(disc))) return true;
+        if (!consider(iso, std::move(xex), std::move(disc))) continue;
+        AddUpdate(assets, game);
+        return true;
     }
 
     if (other_name.empty()) {

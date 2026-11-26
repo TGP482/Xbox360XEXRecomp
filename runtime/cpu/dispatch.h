@@ -16,6 +16,7 @@ uint32_t EntryPoint();
 bool InCode(uint32_t va);
 PPCFunc* Find(uint32_t guest);
 PPCFunc* Body(uint32_t index);  // a recompiled body by its place in the DLL's PPCBodies
+uint32_t Symbol(uint32_t index);  // a config symbol's address by its place in the DLL's PPCSymbols
 PPCFunc* const* Table();  // for PPCContext::table
 PPCFunc* const* Imports();  // for PPCContext::imports
 uint32_t HostThunk(PPCFunc* fn);

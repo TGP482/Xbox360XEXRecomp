@@ -56,7 +56,8 @@ add_custom_target(compiler_files ALL
     VERBATIM)
 
 # PowerPC to C++ recompiler, with the runtime's XEX loader
-file(GLOB XEX_RECOMP_SOURCES CONFIGURE_DEPENDS ${XEX_SDK_DIR}/tools/recomp/*.cpp ${XEX_SDK_DIR}/runtime/xex/*.cpp)
+file(GLOB XEX_RECOMP_SOURCES CONFIGURE_DEPENDS ${XEX_SDK_DIR}/tools/recomp/*.cpp ${XEX_SDK_DIR}/runtime/xex/*.cpp
+    ${XEX_SDK_DIR}/runtime/kernel/crypto.cpp)
 add_executable(xex_recomp ${XEX_RECOMP_SOURCES})
 set_target_properties(xex_recomp PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${XEX_COMPILER_DIR})
 target_include_directories(xex_recomp PRIVATE ${XEX_SDK_DIR}/runtime ${XEX_SDK_DIR}/tools/recomp)
@@ -65,7 +66,7 @@ target_link_libraries(xex_recomp PRIVATE tomlplusplus::tomlplusplus)
 
 # XDK signature scanner that writes a new title's config
 add_executable(xex_symbols ${XEX_SDK_DIR}/tools/symbols/main.cpp ${XEX_SDK_DIR}/runtime/xex/xex.cpp
-    ${XEX_SDK_DIR}/runtime/xex/lzx.cpp)
+    ${XEX_SDK_DIR}/runtime/xex/lzx.cpp ${XEX_SDK_DIR}/runtime/xex/package.cpp)
 target_include_directories(xex_symbols PRIVATE ${XEX_SDK_DIR}/runtime)
 target_compile_definitions(xex_symbols PRIVATE _CRT_SECURE_NO_WARNINGS)
 target_link_libraries(xex_symbols PRIVATE tomlplusplus::tomlplusplus)
@@ -105,9 +106,17 @@ set_source_files_properties(${XEX_SDK_DIR}/runtime/audio/xma_decoder.cpp PROPERT
 # loads: built here from config/<config> (partitions as that config sets them, library = "<target>.dll"), while a
 # release leaves it out and the executable builds it from the player's xex (runtime/app/game_code.cpp, which compiles
 # with the same flags). Expects assets/<xex> and the config's out = "generated/<game_dir>". At run time the game may be
-# a disc image instead.
+# a disc image instead. A title update package in assets (TU_*) that the config names in [[update]] builds the code
+# patched by it; the executable is the same either way.
 function(add_xex_image target xex config partitions game_dir)
     set(GEN ${CMAKE_CURRENT_SOURCE_DIR}/generated/${game_dir})
+    file(GLOB update_file CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/assets/TU_*)
+    list(SORT update_file)
+    list(SUBLIST update_file 0 1 update_file)
+    set(update_arg)
+    if(update_file)
+        set(update_arg --update ${update_file})
+    endif()
     set(GEN_SOURCES ${GEN}/ppc_func_mapping.cpp)
     math(EXPR last "${partitions} - 1")
     foreach(i RANGE ${last})
@@ -119,14 +128,14 @@ function(add_xex_image target xex config partitions game_dir)
         OUTPUT ${GEN}/codegen.stamp
         BYPRODUCTS ${GEN_SOURCES} ${GEN}/host_bodies.cpp ${GEN}/ppc_recomp_shared.h ${GEN}/image_symbols.h
                    ${GEN}/hook_exports.h ${GEN}/exports.def ${GEN}/imports.def ${GEN}/code.lib ${GEN}/overrides.txt
-        COMMAND xex_recomp config/${config} --xdk ${XEX_SDK_DIR}/xdk
+        COMMAND xex_recomp config/${config} --xdk ${XEX_SDK_DIR}/xdk ${update_arg}
         # the executable's own recompile has no src to find overrides in
         COMMAND ${CMAKE_COMMAND} -E make_directory ${XEX_COMPILER_DIR}/config
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${GEN}/overrides.txt
                 ${XEX_COMPILER_DIR}/config/${config_name}.overrides
         COMMAND ${XEX_LLVM_BIN}/lld-link.exe /lib /machine:x64 /def:${GEN}/imports.def /out:${GEN}/code.lib
         COMMAND ${CMAKE_COMMAND} -E touch ${GEN}/codegen.stamp
-        DEPENDS xex_recomp ${configs} ${CMAKE_CURRENT_SOURCE_DIR}/assets/${xex}
+        DEPENDS xex_recomp ${configs} ${CMAKE_CURRENT_SOURCE_DIR}/assets/${xex} ${update_file}
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
         COMMENT "Recompiling ${xex}"
         VERBATIM)

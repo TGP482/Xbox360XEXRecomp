@@ -24,7 +24,7 @@ This tool was originally created for porting [Far Cry Instincts: Predator](https
 ## Game Setup
 
 1. Copy `templates/game` to a new repository and put this SDK in it as `sdk/`. Set `GAME_TITLE`, `GAME_XEX` and `GAME_EXE` at the top of `build.bat` (`GAME_EXE` in `release.bat` too), and the target and xex in `add_xex_image` in `CMakeLists.txt`.
-2. Put the game's XEX and its data folders in the `assets` folder. No game files, keys or generated code belong in any repository.
+2. Put the game's XEX and its data folders in the `assets` folder. No game files, keys or generated code belong in any repository. A title update goes in `assets` as its package, as the console downloads it (`TU_...`). The config keeps the base image's addresses: `[[update]]` with `sha1 = "<the package's SHA-1>"` lets the code also be built patched by that update, and `[update.addresses]` gives `base = update` for any address the recompiler cannot match. `xex_symbols --image assets\default.xex --update assets\<package> --out image.bin` writes the updated image for Ghidra.
 3. Run `xex_symbols`, which `build.bat` does on the first build:
    ```
    xex_symbols assets\default.xex sdk\xdk --library MyGame.dll --out config\game.toml
@@ -51,6 +51,7 @@ A new XDK build needs `xdk/<build>/layout.toml` and signatures made from titles 
 
 ### CPU and Kernel
 - **XEX Loading** - Reads retail XEX2 files, decrypted and decompressed by the tool's own code, with imports by ordinal and TLS.
+- **Title Updates** - Applies a title update's delta patch to the XEX as the console's loader does, from its package in the `assets` folder, and mounts its files as `update:`. The game code is rebuilt patched by the update, the config's addresses moved by matching the base and updated code, and rebuilt without it when it is removed, so the game plays with or without it.
 - **Kernel and XAM** - Implements threads, waits, objects, files, memory, crypto, content and the signed in profile, with game files read from host folders or a disc image.
 - **Image Switching** - Starts the matching executable when the game launches another XEX, handing over the last frame so the picture stays on screen.
 - **Launch Choice** - Asks the player a question at launch, such as which mode to start, with `app::Choose` from `GameInfo::init`.

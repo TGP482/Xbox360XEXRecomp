@@ -40,7 +40,8 @@ struct alignas(64) PPCContext {
 
 struct PPCFuncMapping {
     uint32_t guest;
-    PPCFunc* host;
+    PPCFunc* host;  // the executable's override, else body
+    PPCFunc* body;
 };
 
 // an import the runtime binds to its host implementation, by library and ordinal
@@ -59,3 +60,5 @@ extern "C" const uint32_t PPCImageEnd;
 extern "C" const uint32_t PPCEntryPoint;
 extern "C" PPCFunc* const PPCBodies[];  // each recompiled body, in the order the executable's stubs index
 extern "C" const uint8_t PPCExactCallees[];  // per mapping: calls rely on the body, so it must not be overridden
+extern "C" const uint32_t PPCSymbols[];  // the addresses image_symbols.h names, as a title update moved them
+extern "C" const char PPCUpdate[];       // the SHA-1 of the title update package the code was built with, or ""

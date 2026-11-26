@@ -78,6 +78,8 @@ struct Image {
     Tls tls;
 
     bool Load(const std::vector<uint8_t>& file, std::string& error);
+    // a title update's delta patch (.xexp) applied to the loaded image, as the console loader does
+    bool Patch(const std::vector<uint8_t>& xexp, std::string& error);
 
     bool Contains(uint32_t va, uint32_t size = 1) const {
         return va >= base && uint64_t(va - base) + size <= memory.size();

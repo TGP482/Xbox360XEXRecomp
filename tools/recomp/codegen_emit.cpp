@@ -289,7 +289,7 @@ std::string CodeGen::TailCall(uint32_t to) {
         return Fmt("{ PPC_SPILL; ppc_icall(ctx, base, 0x%Xu); return; }", to);
     if (f->second.kind == Kind::Import)
         return Fmt("{ PPC_SPILL; ppc_import(ctx, base, %u); return; }", import_slots_.at(to));
-    return Fmt("{ PPC_SPILL; [[clang::musttail]] return sub_%08X(ctx, base); }", to);
+    return Fmt("{ PPC_SPILL; [[clang::musttail]] return %s(ctx, base); }", Sub(to).c_str());
 }
 
 // BO: 0x10 skips the condition, 0x08 is the value it must have, 0x04 skips the counter, 0x02 branches on zero
@@ -317,9 +317,9 @@ void CodeGen::EmitCall(const Insn& i, uint32_t target) {
         // the guest longjmp restores the context, then the CRT's lands here (clang's builtin loses offset frames)
         jumps_.insert(i.addr);
         callees_.push_back(target);
-        Line(Fmt("\tPPC_SPILL; ppc_jump_mark(uint32_t(ctx.r[3]), &jump_%08X); sub_%08X(ctx, base); "
+        Line(Fmt("\tPPC_SPILL; ppc_jump_mark(uint32_t(ctx.r[3]), &jump_%08X); %s(ctx, base); "
                  "setjmp(jump_%08X); PPC_RELOAD;",
-                 i.addr, target, i.addr));
+                 i.addr, Sub(target).c_str(), i.addr));
     } else if (f == an_.functions.end()) {
         unknown_calls_ = true;
         Line(Fmt("\tPPC_SPILL; ppc_icall(ctx, base, 0x%Xu); PPC_RELOAD;", target));
@@ -329,15 +329,15 @@ void CodeGen::EmitCall(const Insn& i, uint32_t target) {
     } else {
         callees_.push_back(target);
         if (!Exact(target) || sync_.all || !reachable_) {
-            Line(Fmt("\tPPC_SPILL; sub_%08X(ctx, base); PPC_RELOAD;", target));
+            Line(Fmt("\tPPC_SPILL; %s(ctx, base); PPC_RELOAD;", Sub(target).c_str()));
             return;
         }
         reloads_.insert(target);
         exact_called_.insert(target);
         callee_ = target;
         // never overridden, so the body itself or this partition's copy, which the host compiler may inline
-        const char* body = local_.count(target) ? "local" : "__imp_";
-        Line(Fmt("\tPPC_SPILL; %s_sub_%08X(ctx, base); PPC_RELOAD_%08X;", body, target, target));
+        const char* body = local_.count(target) ? "local_" : "__imp__";
+        Line(Fmt("\tPPC_SPILL; %s%s(ctx, base); PPC_RELOAD_%08X;", body, Sub(target).c_str(), target));
         callee_ = 0;
     }
 }
@@ -590,16 +590,17 @@ std::string CodeGen::EmitFunction(uint32_t entry) {
         std::string loads = RegisterBlock(Both(summaries_.at(c).written, used_), false);
         out += Fmt("#define PPC_RELOAD_%08X%s\n", c, loads.c_str());
     }
-    out += Fmt("PPC_FUNC(__imp__sub_%08X) {\n", entry);
+    std::string name = Sub(entry);
+    out += Fmt("PPC_FUNC(__imp__%s) {\n", name.c_str());
     out += Declarations();
     if (!entry_first) out += Fmt("\tgoto loc_%08X;\n", entry);
     out += body_;
     out += "}\n#undef PPC_SPILL\n#undef PPC_RELOAD\n";
     for (uint32_t c : reloads_) out += Fmt("#undef PPC_RELOAD_%08X\n", c);
     if (an_.cfg.trace.count(entry))
-        out += Fmt("PPC_TRACED_FUNC(sub_%08X, __imp__sub_%08X, 0x%Xu)\n\n", entry, entry, entry);
+        out += Fmt("PPC_TRACED_FUNC(%s, __imp__%s, 0x%Xu)\n\n", name.c_str(), name.c_str(), entry);
     else
-        out += Fmt("PPC_WEAK_FUNC(sub_%08X, __imp__sub_%08X)\n\n", entry, entry);
+        out += Fmt("PPC_WEAK_FUNC(%s, __imp__%s)\n\n", name.c_str(), name.c_str());
     return out;
 }
 
@@ -616,15 +617,17 @@ std::string CodeGen::EmitLocalCopy(uint32_t entry) {
     std::string out = EmitFunction(entry);
     insn_count_ = insn_count;
     unimpl_ = unimpl;
-    std::string head = Fmt("PPC_FUNC(__imp__sub_%08X) {", entry);
+    std::string name = Sub(entry);
+    std::string head = Fmt("PPC_FUNC(__imp__%s) {", name.c_str());
     out.replace(out.find(head), head.size(),
-                Fmt("static void local_sub_%08X(PPCContext& __restrict ctx, uint8_t* base) {", entry));
-    out.erase(out.find(Fmt("PPC_WEAK_FUNC(sub_%08X,", entry)));
+                Fmt("static void local_%s(PPCContext& __restrict ctx, uint8_t* base) {", name.c_str()));
+    out.erase(out.find(Fmt("PPC_WEAK_FUNC(%s,", name.c_str())));
     return out + "\n";
 }
 
 std::string CodeGen::EmitImport(uint32_t entry, uint32_t slot) {
-    std::string out = Fmt("PPC_FUNC(__imp__sub_%08X) { ppc_import(ctx, base, %u); }\n", entry, slot);
-    out += Fmt("PPC_WEAK_FUNC(sub_%08X, __imp__sub_%08X)\n\n", entry, entry);
+    std::string name = Sub(entry);
+    std::string out = Fmt("PPC_FUNC(__imp__%s) { ppc_import(ctx, base, %u); }\n", name.c_str(), slot);
+    out += Fmt("PPC_WEAK_FUNC(%s, __imp__%s)\n\n", name.c_str(), name.c_str());
     return out;
 }

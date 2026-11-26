@@ -13,6 +13,7 @@
 #include "core/log.h"
 #include "image_symbols.h"
 #include "kernel/kernel.h"
+#include "xex/package.h"
 
 int main(int argc, char** argv) {
     std::string game;
@@ -34,7 +35,14 @@ int main(int argc, char** argv) {
     std::string hdd = app::Instance() > 1 ? "hdd" + std::to_string(app::Instance()) : "hdd";
     std::ifstream f(game + "/" + IMAGE_XEX, std::ios::binary);
     std::vector<uint8_t> xex((std::istreambuf_iterator<char>(f)), {});
-    if (!kernel::Boot(xex, IMAGE_XEX, game, (app::ExeDir() / hdd).string())) return 1;
+    // the first title update package in the game folder, which Boot rejects when it has no patch for the xex
+    std::vector<uint8_t> update;
+    std::vector<std::filesystem::path> packages = xex::PackagesIn(game);
+    if (!packages.empty()) {
+        std::ifstream p(packages[0], std::ios::binary);
+        update.assign(std::istreambuf_iterator<char>(p), {});
+    }
+    if (!kernel::Boot(xex, update, IMAGE_XEX, game, (app::ExeDir() / hdd).string())) return 1;
     for (;;) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
         logx::Flush();

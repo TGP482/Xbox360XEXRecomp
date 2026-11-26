@@ -295,7 +295,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     std::wstring hdd = app::Instance() > 1 ? L"hdd" + std::to_wstring(app::Instance()) : L"hdd";
     if (app::Instance())
         SetWindowTextW(app::g_hwnd, (std::wstring(app::kGame.title) + L" [" + std::to_wstring(app::Instance()) + L"]").c_str());
-    if (!kernel::Boot(game.xex, IMAGE_XEX, game.dir.string(), (app::ExeDir() / hdd).string())) {
+    if (!kernel::Boot(game.xex, game.update, IMAGE_XEX, game.dir.string(), (app::ExeDir() / hdd).string())) {
         MessageBoxW(app::g_hwnd, L"The game failed to start, see the log in the logs folder.", app::kGame.short_title,
                     MB_ICONERROR);
         return 1;

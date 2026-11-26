@@ -26,8 +26,16 @@ struct Hook {
     bool Returns() const { return on_true.set || on_false.set; }
 };
 
+// a title update the image may be built patched with: the config's addresses stay the base image's, the recompiler
+// finds where the update moved them, with a list for the ones it cannot
+struct Update {
+    std::string sha1;  // the package's
+    std::map<uint32_t, uint32_t> addresses;  // base to update
+};
+
 struct Config {
     std::string xex_path;
+    std::vector<Update> updates;
     uint32_t title = 0;  // the image xex_symbols wrote the config for, 0 = unchecked
     uint32_t entry = 0;
     std::set<uint32_t> trace;  // functions whose calls and results are logged

@@ -2498,8 +2498,10 @@ Rect D3D12Backend::GuestScissor(const State& s, uint32_t w, uint32_t h) const {
     return {clamp(x1, w), clamp(y1, h), clamp(x2, w), clamp(y2, h)};
 }
 
+// a pixel is in the rect when its centre is, as the scaled geometry rasterizes, so tiles meet without a gap
 D3D12_RECT D3D12Backend::HostRect(const Rect& r, float scale) const {
-    return {LONG(r.x1 * scale), LONG(r.y1 * scale), LONG(r.x2 * scale), LONG(r.y2 * scale)};
+    auto edge = [scale](int32_t v) { return LONG(std::ceil(v * scale - 0.5f)); };
+    return {edge(r.x1), edge(r.y1), edge(r.x2), edge(r.y2)};
 }
 
 // the topology of a primitive type the host draws as the title gives it; false for the ones made lists
@@ -3342,11 +3344,17 @@ void D3D12Backend::CopyResolve(Target& src, Resolved& dst, const ResolveArgs& r)
     Transition(src.res.Get(), src.state, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
     dev_->CreateShaderResourceView(src.res.Get(), &v, ViewCpu(views));
     Transition(dst.res.Get(), dst.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    // source in its own host pixels, destination at the render scale
+    // source in its own host pixels; destination in whole host pixels by HostRect's rule, so tiled resolves meet
     float ss = src.scale;
+    float k = ss / scale_;
+    Rect span{r.dst_x, r.dst_y, r.dst_x + r.rect.x2 - r.rect.x1, r.dst_y + r.rect.y2 - r.rect.y1};
+    D3D12_RECT to = HostRect(span, scale_);
     float bias = src.depth ? 1.0f : std::exp2(float(r.exp_bias));
-    float cb[8] = {r.rect.x1 * ss, r.rect.y1 * ss, (r.rect.x2 - r.rect.x1) * ss, (r.rect.y2 - r.rect.y1) * ss,
-                   float(src.samples), src.depth ? 1.0f : 0.0f, 0, bias};
+    float sx = r.rect.x1 * ss + (to.left - r.dst_x * scale_) * k;
+    float sy = r.rect.y1 * ss + (to.top - r.dst_y * scale_) * k;
+    float sw = (to.right - to.left) * k;
+    float sh = (to.bottom - to.top) * k;
+    float cb[8] = {sx, sy, sw, sh, float(src.samples), src.depth ? 1.0f : 0.0f, 0, bias};
     D3D12_GPU_VIRTUAL_ADDRESS addr = UploadConstants(cb, sizeof(cb));
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = Rtv(dst.view);
     if (dst.faces > 1) {
@@ -3358,9 +3366,7 @@ void D3D12Backend::CopyResolve(Target& src, Resolved& dst, const ResolveArgs& r)
         dev_->CreateRenderTargetView(dst.res.Get(), &face, rtv);
     }
     L().cl->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-    float dw = (r.rect.x2 - r.rect.x1) * scale_;
-    float dh = (r.rect.y2 - r.rect.y1) * scale_;
-    D3D12_VIEWPORT vp{r.dst_x * scale_, r.dst_y * scale_, dw, dh, 0, 1};
+    D3D12_VIEWPORT vp{float(to.left), float(to.top), float(to.right - to.left), float(to.bottom - to.top), 0, 1};
     D3D12_RECT sc{0, 0, LONG(std::ceil(dst.width * scale_)), LONG(std::ceil(dst.height * scale_))};
     L().cl->RSSetViewports(1, &vp);
     L().cl->RSSetScissorRects(1, &sc);

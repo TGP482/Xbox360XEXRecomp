@@ -6,6 +6,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#undef CreateSymbolicLink  // windows.h's would rename kernel::CreateSymbolicLink
 #else
 #include <unistd.h>
 #endif

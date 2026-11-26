@@ -301,6 +301,8 @@ static bool NameFunctions(const Analysis& base, const Analysis& updated, const U
     for (auto& [va, f] : updated.functions) {
         std::optional<uint32_t> from = map.BaseCode(va);
         if (!from || !base.functions.count(*from)) continue;
+        // only the copy the base function moved to: another may merely start with the same instructions
+        if (map.Code(*from) != va) continue;
         names[va] = *from;
         named.insert(*from);
     }

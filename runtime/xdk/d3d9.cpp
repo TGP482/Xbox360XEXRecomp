@@ -1306,16 +1306,30 @@ HLE_FUNC(D3DDevice_EndTiling) {
 #ifdef SUB_D3DDevice_QueryBufferSpace
 PPC_EXTERN_FUNC(GUEST_ORIG(D3DDevice_QueryBufferSpace));
 
+constexpr uint32_t kRecordedBytes = 0x100;  // about what a recorded command's packets take on the console
+
 // (device, used out, remaining out): while tiling the console counts the ring the GPU has yet to read, and titles skip
-// draws when that is short (Saints Row's sky under 64 KB); nothing reads the host's ring, so all of it is free
+// draws when that is short (Saints Row's sky under 64 KB); nothing reads the host's ring, so all of it is free.
+// A recording's commands are the host's, so the library sees its command buffer empty; titles that begin a buffer
+// again while it reports nothing used would drop what it holds (Saints Row's light jobs, 8218DA88)
 PPC_FUNC(GUEST(D3DDevice_QueryBufferSpace)) {
     uint32_t dev = uint32_t(ctx.r[3]);
+    uint32_t used = uint32_t(ctx.r[4]);
+    uint32_t remaining = uint32_t(ctx.r[5]);
+    if (uint32_t buffer = RecordingTo(dev)) {
+        GUEST_ORIG(D3DDevice_QueryBufferSpace)(ctx, base);
+        std::lock_guard lock(g_lock);
+        auto it = g_buffers.find(buffer);
+        uint32_t commands = it == g_buffers.end() ? 0 : uint32_t(it->second.Now().size());
+        W32(used, std::max(R32(used), commands * kRecordedBytes));
+        return;
+    }
     if (!(R8(dev + kDevTilingFlags) & kTilingOn)) {
         GUEST_ORIG(D3DDevice_QueryBufferSpace)(ctx, base);
         return;
     }
-    W32(uint32_t(ctx.r[4]), 0);
-    W32(uint32_t(ctx.r[5]), R32(dev + kDevRingEnd) - R32(dev + kDevRingBase));
+    W32(used, 0);
+    W32(remaining, R32(dev + kDevRingEnd) - R32(dev + kDevRingBase));
 }
 #endif
 

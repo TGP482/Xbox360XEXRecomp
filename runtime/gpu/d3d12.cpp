@@ -284,7 +284,7 @@ struct PipelineKey {
 };
 
 // cache/pipelines.bin: the header, then per pipeline its record, the shaders' DXIL and the driver's blob
-constexpr uint32_t kPipelineCacheMagic = 0x31505358;
+constexpr uint32_t kPipelineCacheMagic = 0x32505358;
 struct PipelineRecord {
     PipelineKey key;
     uint32_t vs_size = 0;
@@ -722,6 +722,7 @@ private:
     Shown FillTextureView(const TextureBinding& b, const uint32_t fetch[6], D3D12_CPU_DESCRIPTOR_HANDLE at,
                           ShaderStage stage, uint32_t slot);
     Texture* EnsureTexture(const xenos::TextureFetch& t);
+    ComPtr<ID3D12Resource> PlaceTexture(const D3D12_RESOURCE_DESC& d, D3D12_RESOURCE_STATES state);
     Texture* FrameTexture(const uint32_t fetch[6], const xenos::TextureFetch& t);
     void HashAhead();
     uint64_t NextHash(Texture& tex);
@@ -838,6 +839,9 @@ private:
         uint8_t stencil = 0;
     };
     std::unordered_map<const Target*, SpanClear> span_clears_;
+    // before textures_, so their placed resources go first
+    std::vector<ComPtr<ID3D12Heap>> texture_heaps_;
+    uint64_t texture_heap_used_ = 0;
     std::unordered_map<uint64_t, Texture> textures_;
     std::unordered_map<uint64_t, Texture> pack_textures_;  // by pack key, shared by the textures drawing them
     std::unordered_map<std::array<uint32_t, 6>, Texture*, FetchHash> frame_textures_;  // by fetch constant, this frame
@@ -1908,6 +1912,32 @@ DXGI_FORMAT HostTextureFormat(const xenos::TextureFetch& t) {
     return is_signed && fi.host_signed != DXGI_FORMAT_UNKNOWN ? fi.host_signed : fi.host;
 }
 
+// a committed resource per texture cost ~0.25 ms on the render thread, hundreds a frame while the title streams
+constexpr uint64_t kTextureHeapSize = 128ull << 20;
+
+ComPtr<ID3D12Resource> D3D12Backend::PlaceTexture(const D3D12_RESOURCE_DESC& d, D3D12_RESOURCE_STATES state) {
+    ComPtr<ID3D12Resource> res;
+    D3D12_RESOURCE_ALLOCATION_INFO info = dev_->GetResourceAllocationInfo(0, 1, &d);
+    if (info.SizeInBytes > kTextureHeapSize) {
+        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+        dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, state, nullptr, IID_PPV_ARGS(&res));
+        return res;
+    }
+    uint64_t at = (texture_heap_used_ + info.Alignment - 1) & ~(info.Alignment - 1);
+    if (texture_heaps_.empty() || at + info.SizeInBytes > kTextureHeapSize) {
+        D3D12_HEAP_DESC hd{kTextureHeapSize, {D3D12_HEAP_TYPE_DEFAULT}, 0, D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES};
+        ComPtr<ID3D12Heap> heap;
+        if (FAILED(dev_->CreateHeap(&hd, IID_PPV_ARGS(&heap)))) return res;
+        texture_heaps_.push_back(heap);
+        at = 0;
+    }
+    if (FAILED(dev_->CreatePlacedResource(texture_heaps_.back().Get(), at, &d, state, nullptr, IID_PPV_ARGS(&res)))) {
+        return res;
+    }
+    texture_heap_used_ = at + info.SizeInBytes;
+    return res;
+}
+
 Texture* D3D12Backend::EnsureTexture(const xenos::TextureFetch& t) {
     if (!t.base || xenos::Info(t.format).convert == xenos::Convert::Unsupported) return nullptr;
     std::vector<xenos::Level> levels = xenos::Levels(t);
@@ -1925,10 +1955,9 @@ Texture* D3D12Backend::EnsureTexture(const xenos::TextureFetch& t) {
         uint32_t w = (t.width + block - 1) / block * block;
         uint32_t h = (t.height + block - 1) / block * block;
         D3D12_RESOURCE_DESC d = TextureDesc(tex.format, w, h, t.depth, tex.levels, volume);
-        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
         tex.state = D3D12_RESOURCE_STATE_COPY_DEST;
-        if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, tex.state, nullptr,
-                                                 IID_PPV_ARGS(&tex.res)))) {
+        tex.res = PlaceTexture(d, tex.state);
+        if (!tex.res) {
             textures_.erase(key);
             return nullptr;
         }
@@ -2370,13 +2399,21 @@ uint32_t D3D12Backend::BindTextures(const State& s, const ShaderInfo& info, Shad
 
 // Draws
 
+// RB_DEPTHCONTROL bits the pipeline reads; the unread ones made a pipeline per value
+uint32_t PipelineDepthControl(uint32_t c) {
+    uint32_t used = 0;
+    if (Bits(c, 1, 1)) used |= 0x76;
+    if (Bits(c, 0, 1)) used |= Bits(c, 7, 1) ? 0xFFFFFF81 : 0x000FFF01;
+    return c & used;
+}
+
 void D3D12Backend::FillKeyStates(const State& s, float scale, PipelineKey& k) const {
     for (uint32_t i = 0; i < 4; i++) k.blend[i] = s.Reg(i == 0 ? kRbBlendControl0 : kRbBlendControl1 + i - 1);
     k.color_mask = s.Reg(kRbColorMask);
     k.color_control = s.Reg(kRbColorControl) & 0x10;
-    k.depth_control = s.Reg(kRbDepthControl);
+    k.depth_control = PipelineDepthControl(s.Reg(kRbDepthControl));
     uint32_t sr = s.Reg(kRbStencilRefMask);
-    k.stencil = Bits(sr, 8, 8) | Bits(sr, 16, 8) << 8;
+    if (Bits(k.depth_control, 0, 1)) k.stencil = Bits(sr, 8, 8) | Bits(sr, 16, 8) << 8;
     k.su_mode = s.Reg(kPaSuScModeCntl) & 0x9FFF;
     if (Bits(k.su_mode, 11, 2)) {
         // the console's slope is per sixteenth of a guest pixel, the host's per host pixel

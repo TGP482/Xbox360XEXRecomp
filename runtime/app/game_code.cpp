@@ -1,8 +1,8 @@
-// The recompiled game code is built on the player's PC, so a release carries none of it: xex_recomp translates each
-// xex of GameInfo::images to C++, clang compiles that and lld links it into <exe>.dll beside the executables, all from
-// the compiler folder. The first start does this behind a progress window. Finished objects are kept, so a closed
-// window or a crash loses only the files in progress and the next start carries on. Choose asks a launch question in
-// the same window's look.
+// The recompiled game code is built on the player's PC, so a release carries none of it: xex_recomp translates the
+// started executable's xex of GameInfo::images to C++, clang compiles that and lld links it into <exe>.dll beside it,
+// all from the compiler folder. Each executable's first start does this behind a progress window. Finished objects
+// are kept, so a closed window or a crash loses only the files in progress and the next start carries on. Choose asks
+// a launch question in the same window's look.
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -95,6 +95,7 @@ std::wstring g_failure;  // the step that failed, written by the build thread be
 HWND g_window = nullptr;
 bool g_start = false;  // the player picked Start once the game was ready
 bool g_delete_compiler = false;  // ticked on the ready page
+bool g_others_unbuilt = false;   // another executable's DLL still needs the compiler folder, so it cannot be deleted
 Palette g_colours;
 // how lit each ready page control is, 0 to 1, fading with the cursor over it
 struct Glow {
@@ -578,6 +579,7 @@ void PaintButton(HDC dc, const RECT& box, const std::wstring& text, float glow) 
 void PaintChoices(HDC dc, const Layout& l, int unit) {
     PaintButton(dc, l.start, Label(L"Start", L"A"), g_glow.start);
     PaintButton(dc, l.exit, Label(L"Exit", L"B"), g_glow.exit);
+    if (g_others_unbuilt) return;
     int middle = (l.delete_toggle.top + l.delete_toggle.bottom) / 2;
     RECT box{l.delete_toggle.left, middle - unit / 2, l.delete_toggle.left + unit, middle + unit / 2};
     FillBox(dc, box, Blend(g_colours.bar_empty, g_colours.bar_full, g_glow.toggle));
@@ -649,6 +651,8 @@ void DeleteCompiler() {
     else LOGR("Game code: compiler folder deleted");
 }
 
+void ToggleDelete() { g_delete_compiler = !g_delete_compiler && !g_others_unbuilt; }
+
 void DestroyWithFont(HWND hwnd) {
     DeleteObject(reinterpret_cast<HFONT>(GetWindowLongPtrW(hwnd, GWLP_USERDATA)));
     DestroyWindow(hwnd);
@@ -669,7 +673,7 @@ void OnClick(HWND hwnd, LPARAM lp) {
     POINT at{short(LOWORD(lp)), short(HIWORD(lp))};
     if (PtInRect(&l.start, at)) CloseWindowWith(hwnd, true);
     else if (PtInRect(&l.exit, at)) CloseWindowWith(hwnd, false);
-    else if (PtInRect(&l.delete_toggle, at)) g_delete_compiler = !g_delete_compiler;
+    else if (PtInRect(&l.delete_toggle, at)) ToggleDelete();
 }
 
 float Approach(float glow, bool lit, float step) {
@@ -702,7 +706,7 @@ void PollController(HWND hwnd) {
     uint16_t pressed = now & ~held;
     held = now;
     if (g_progress.stage != Stage::Ready) return;
-    if (pressed & input::kX) g_delete_compiler = !g_delete_compiler;
+    if (pressed & input::kX) ToggleDelete();
     if (pressed & input::kA) CloseWindowWith(hwnd, true);
     else if (pressed & input::kB) CloseWindowWith(hwnd, false);
 }
@@ -724,7 +728,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             OnClick(hwnd, lp);
             return 0;
         case WM_KEYDOWN:
-            if (ready && wp == VK_SPACE) g_delete_compiler = !g_delete_compiler;
+            if (ready && wp == VK_SPACE) ToggleDelete();
             if (ready && (wp == VK_RETURN || wp == VK_ESCAPE)) CloseWindowWith(hwnd, wp == VK_RETURN);
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
@@ -951,6 +955,10 @@ bool PrepareGameCode(const GameFiles& game) {
     WaitForSingleObject(lock, INFINITE);
     std::vector<Image> images = Images();
     std::vector<Target> stale = StaleTargets(game, images);
+    // only this executable's DLL; the others build when their executable first starts
+    auto others = std::remove_if(stale.begin(), stale.end(), [](const Target& t) { return !IsThisExe(*t.image); });
+    g_others_unbuilt = others != stale.end();
+    stale.erase(others, stale.end());
     for (const Target& target : stale) LOGR("Game code: building %ls.dll", target.image->exe.c_str());
     bool built = stale.empty() || BuildWithWindow(stale);
     ReleaseMutex(lock);
